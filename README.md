@@ -1,4 +1,4 @@
-#  tactIQ  
+# tactIQ
 ### AI Tactical Coach for Player and Match Decisions
 
 tactIQ is a real time tactical assistant that functions like a digital coach for cricket teams.  
@@ -22,7 +22,7 @@ It converts match context and player state into coach like actionable guidance.
 
 ---
 
-##  Player Intelligence System
+## Player Intelligence System
 
 ### Fatigue Awareness
 - Real time fatigue increase and decrease controls  
@@ -51,20 +51,39 @@ The goal is not just to show numbers but to guide decisions.
 
 ---
 
-##  Tech Stack
+## Tech Stack
 
 - Frontend React + TypeScript + Vite  
 - UI Components Radix UI + Tailwind CSS  
 - Icons Lucide React  
-- Logic Layer Real time tactical and fatigue engine  
+- Backend Azure Functions (TypeScript)  
+- Azure OpenAI (optional)  
 
 ---
 
-##  Use Cases
+## Use Cases
 
 - Live tactical coaching support  
 - Player workload management  
 - Substitution decision systems  
 - AI sports assistant platforms  
 - Simulation and strategy tools  
+
+---
+
+## Run locally
+
+1. Install dependencies:
+   - `npm install`
+   - `npm --prefix api install`
+2. Start frontend + Azure Functions API:
+   - `npm run dev`
+
+Frontend runs on `http://localhost:3000` and API runs on `http://localhost:7071`.
+
+## Fatigue Agent endpoint
+
+- `POST http://localhost:7071/api/agents/fatigue`
+- Frontend can call `/api/agents/fatigue` (proxied by Vite in dev).
+
 

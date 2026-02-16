@@ -1,3 +1,5 @@
-node_modules
-dist
+node_modules/
+build/
+dist/
 .env
+api/local.settings.json
