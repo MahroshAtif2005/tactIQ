@@ -46,6 +46,7 @@ jobs:
             package-lock.json
             server.js
             dist/**
+            src/**
             api/package.json
             api/host.json
             api/tsconfig.json
@@ -72,6 +73,11 @@ jobs:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_F3D5D0C8AD6C4867B2C0868BF88B789B }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_FFC5817D9A504E9E819DA8E933650570 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_DDA21A04251548FDB5501A2FF0057F8B }}
+
+      # IMPORTANT:
+      # In Azure App Service Configuration, set:
+      # SCM_DO_BUILD_DURING_DEPLOYMENT=true
+      # This lets Azure install dependencies from package-lock.json during ZIP deploy.
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
