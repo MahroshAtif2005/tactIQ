@@ -29,8 +29,8 @@ import {
   Info
 } from 'lucide-react';
 import { motion, AnimatePresence, useMotionValue, useSpring, useTransform, useMotionTemplate } from 'motion/react';
-import { FatigueAgentResponse } from './types/agents';
-import { ApiClientError, postFatigueAgent } from './lib/apiClient';
+import { FatigueAgentResponse, RiskAgentResponse } from './types/agents';
+import { ApiClientError, postFatigueAgent, postRiskAgent } from './lib/apiClient';
 
 // --- Types ---
 
@@ -109,13 +109,38 @@ interface FatigueAgentPayload {
 
 interface AiAnalysis {
   playerId: string;
-  fatigueIndex: number;
+  fatigueIndex?: number;
+  riskScore?: number;
   injuryRisk: 'LOW' | 'MED' | 'HIGH';
   noBallRisk: 'LOW' | 'MED' | 'HIGH';
+  severity: 'LOW' | 'MED' | 'HIGH' | 'CRITICAL';
   signals: string[];
   explanation: string;
   headline: string;
   recommendation: string;
+}
+
+interface AgentFeedStatus {
+  fatigue: 'idle' | 'loading' | 'done' | 'error';
+  risk: 'idle' | 'loading' | 'done' | 'error';
+}
+
+interface RiskAgentPayload {
+  playerId: string;
+  fatigueIndex: number;
+  injuryRisk: 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
+  noBallRisk: 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
+  oversBowled: number;
+  consecutiveOvers: number;
+  heartRateRecovery?: string;
+  format: string;
+  phase: string;
+  intensity: string;
+  conditions?: string;
+  target?: number;
+  score?: number;
+  over?: number;
+  balls?: number;
 }
 
 interface TelemetrySnapshot {
@@ -511,6 +536,9 @@ export default function App() {
   const [agentState, setAgentState] = useState<'idle' | 'thinking' | 'done' | 'offline' | 'invalid'>('idle');
   const [agentWarning, setAgentWarning] = useState<string | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AiAnalysis | null>(null);
+  const [riskAnalysis, setRiskAnalysis] = useState<AiAnalysis | null>(null);
+  const [agentFeedStatus, setAgentFeedStatus] = useState<AgentFeedStatus>({ fatigue: 'idle', risk: 'idle' });
+  const [analysisRequested, setAnalysisRequested] = useState(false);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
@@ -799,8 +827,12 @@ export default function App() {
     });
   };
 
-  const buildAiAnalysis = (result: FatigueAgentResponse): AiAnalysis | null => {
+  const buildAiAnalysis = (
+    result: FatigueAgentResponse | RiskAgentResponse,
+    agentType: 'fatigue' | 'risk'
+  ): AiAnalysis | null => {
     const fatigueIndex = safeNum(result.echo?.fatigueIndex, NaN);
+    const riskScore = safeNum((result as RiskAgentResponse).riskScore, NaN);
     const normalizeShortRisk = (value: unknown): 'LOW' | 'MED' | 'HIGH' => {
       const upper = String(value || '').toUpperCase();
       if (upper === 'HIGH') return 'HIGH';
@@ -809,20 +841,32 @@ export default function App() {
     };
     const risk = normalizeShortRisk(result.echo?.injuryRisk);
     const noBallRisk = normalizeShortRisk(result.echo?.noBallRisk);
-    const validSeverity = result.severity === 'LOW' || result.severity === 'MED' || result.severity === 'HIGH';
+    const validSeverity =
+      result.severity === 'LOW' ||
+      result.severity === 'MED' ||
+      result.severity === 'HIGH' ||
+      result.severity === 'CRITICAL';
     const validSignals = Array.isArray(result.signals) && result.signals.every((s) => typeof s === 'string');
     const validExplanation = typeof result.explanation === 'string' && result.explanation.trim().length > 0;
     const validHeadline = typeof result.headline === 'string' && result.headline.trim().length > 0;
     const validRecommendation = typeof result.recommendation === 'string' && result.recommendation.trim().length > 0;
-    if (!Number.isFinite(fatigueIndex) || !validSeverity || !validSignals || !validExplanation || !validHeadline || !validRecommendation) {
+    if (!validSeverity || !validSignals || !validExplanation || !validHeadline || !validRecommendation) {
+      return null;
+    }
+    if (agentType === 'fatigue' && !Number.isFinite(fatigueIndex)) {
+      return null;
+    }
+    if (agentType === 'risk' && !Number.isFinite(riskScore)) {
       return null;
     }
 
     return {
       playerId: String(result.echo?.playerId || ''),
-      fatigueIndex,
+      fatigueIndex: Number.isFinite(fatigueIndex) ? fatigueIndex : undefined,
+      riskScore: Number.isFinite(riskScore) ? riskScore : undefined,
       injuryRisk: risk,
       noBallRisk,
+      severity: result.severity,
       signals: result.signals,
       explanation: result.explanation.trim(),
       headline: result.headline.trim(),
@@ -851,8 +895,19 @@ export default function App() {
     a.agentFatigueOverride === b.agentFatigueOverride &&
     a.agentRiskOverride === b.agentRiskOverride;
 
-  const runAgent = async () => {
+  const runAgent = async (reason: 'button_click' | 'non_button' = 'non_button') => {
+    if (reason !== 'button_click') {
+      if (import.meta.env.DEV) {
+        console.warn('Coach analysis blocked', { reason });
+      }
+      return;
+    }
+    if (import.meta.env.DEV) {
+      console.log('Coach analysis triggered', { reason: 'button_click' });
+    }
+    if (agentState === 'thinking') return;
     if (!currentTelemetry) return;
+    setAnalysisRequested(true);
 
     fatigueAbortRef.current?.abort();
     const controller = new AbortController();
@@ -860,6 +915,8 @@ export default function App() {
     const requestId = ++fatigueRequestSeq.current;
 
     setAiAnalysis(null);
+    setRiskAnalysis(null);
+    setAgentFeedStatus({ fatigue: 'loading', risk: 'idle' });
     setAgentWarning(null);
     setAgentState('thinking');
 
@@ -883,7 +940,25 @@ export default function App() {
       snapshotId,
       matchContext: currentTelemetry.matchContext,
     };
+    const riskPayload: RiskAgentPayload = {
+      playerId: currentTelemetry.playerId,
+      fatigueIndex: currentTelemetry.fatigueIndex,
+      injuryRisk: currentTelemetry.injuryRisk,
+      noBallRisk: currentTelemetry.noBallRisk,
+      oversBowled: currentTelemetry.oversBowled,
+      consecutiveOvers: currentTelemetry.consecutiveOvers,
+      heartRateRecovery: currentTelemetry.heartRateRecovery,
+      format: currentTelemetry.matchContext.format,
+      phase: currentTelemetry.matchContext.phase,
+      intensity: currentTelemetry.matchContext.intensity,
+      conditions: matchContext.weather,
+      target: matchState.target,
+      score: matchState.runs,
+      over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
+      balls: Math.max(0, totalBallsFromOvers(matchState.totalOvers) - matchState.ballsBowled),
+    };
     if (import.meta.env.DEV) {
+      console.log('[agent] calling', '/api/agents/fatigue');
       console.log('Fatigue analyze payload', payload);
     }
 
@@ -893,14 +968,33 @@ export default function App() {
       if (import.meta.env.DEV) {
         console.log('Fatigue analyze response', result);
       }
-      const mapped = buildAiAnalysis(result);
+      const mapped = buildAiAnalysis(result, 'fatigue');
       if (!mapped) {
+        setAgentFeedStatus({ fatigue: 'error', risk: 'idle' });
         setAgentState('invalid');
         setAgentWarning('Invalid AI response');
         return;
       }
 
       setAiAnalysis(mapped);
+      setAgentFeedStatus({ fatigue: 'done', risk: 'loading' });
+      if (import.meta.env.DEV) {
+        console.log('[agent] calling', '/api/agents/risk');
+      }
+      const riskResult = await postRiskAgent(riskPayload, controller.signal);
+      if (requestId !== fatigueRequestSeq.current) return;
+      if (import.meta.env.DEV) {
+        console.log('Risk analyze response', riskResult);
+      }
+      const mappedRisk = buildAiAnalysis(riskResult, 'risk');
+      if (!mappedRisk) {
+        setAgentFeedStatus({ fatigue: 'done', risk: 'error' });
+        setAgentState('invalid');
+        setAgentWarning('Invalid risk response');
+        return;
+      }
+      setRiskAnalysis(mappedRisk);
+      setAgentFeedStatus({ fatigue: 'done', risk: 'done' });
       setAgentState('done');
 
       const currentPlayer = playersRef.current.find((p) => p.id === telemetrySnapshot.playerId);
@@ -932,6 +1026,10 @@ export default function App() {
     } catch (error) {
       if ((error as Error)?.name === 'AbortError') return;
       if (requestId !== fatigueRequestSeq.current) return;
+      setAgentFeedStatus((prev) => ({
+        fatigue: prev.fatigue === 'loading' ? 'error' : prev.fatigue,
+        risk: prev.risk === 'loading' ? 'error' : prev.risk,
+      }));
       if (error instanceof ApiClientError) {
         setAgentWarning(error.message);
       } else {
@@ -942,22 +1040,29 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (page !== 'dashboard' || !currentTelemetry) return;
+    if (page !== 'dashboard') return;
     fatigueAbortRef.current?.abort();
-    setAiAnalysis(null);
-    setAgentWarning(null);
-    setAgentState('thinking');
-    runAgent();
+    if (!analysisRequested) {
+      setAiAnalysis(null);
+      setRiskAnalysis(null);
+      setAgentFeedStatus({ fatigue: 'idle', risk: 'idle' });
+      setAgentWarning(null);
+      setAgentState('idle');
+    }
+    setAnalysisRequested(false);
     return () => {
       fatigueAbortRef.current?.abort();
     };
-  }, [activePlayerId, page, currentTelemetry]);
+  }, [activePlayerId, page]);
 
   const dismissAnalysis = () => {
     fatigueAbortRef.current?.abort();
+    setAnalysisRequested(false);
     setAgentState('idle');
     setAgentWarning(null);
     setAiAnalysis(null);
+    setRiskAnalysis(null);
+    setAgentFeedStatus({ fatigue: 'idle', risk: 'idle' });
   };
 
   const navigateTo = (p: Page) => {
@@ -1144,6 +1249,8 @@ export default function App() {
               agentState={agentState}
               agentWarning={agentWarning}
               aiAnalysis={aiAnalysis}
+              riskAnalysis={riskAnalysis}
+              agentFeedStatus={agentFeedStatus}
               runAgent={runAgent}
               onDismissAnalysis={dismissAnalysis}
               handleAddOver={handleAddOver}
@@ -1393,7 +1500,7 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
 
 function Dashboard({ 
   matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, addPlayer, deletePlayer, movePlayerToSub,
-  agentState, aiAnalysis, agentWarning, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit, onBack 
+  agentState, aiAnalysis, riskAnalysis, agentFeedStatus, agentWarning, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit, onBack 
 }: any) {
   const [isAdding, setIsAdding] = useState(false);
   const [newPlayerName, setNewPlayerName] = useState('');
@@ -1511,6 +1618,39 @@ function Dashboard({
   const boundaryEvents = activePlayer?.boundaryEvents || [];
   const foursCount = boundaryEvents.filter((event) => event === '4').length;
   const sixesCount = boundaryEvents.filter((event) => event === '6').length;
+  const finalDecision = aiAnalysis && riskAnalysis
+    ? {
+        severity: aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
+          ? 'CRITICAL'
+          : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
+          ? 'HIGH'
+          : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
+            ? 'MED'
+            : 'LOW',
+        action:
+          aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
+            ? 'Immediate substitution advised. Remove from active spell now.'
+            : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
+            ? 'Rotate bowler for next over.'
+            : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
+              ? 'No immediate change; manage spell length and monitor trend.'
+              : 'No change, continue and monitor trend.',
+        reasons: [
+          aiAnalysis.headline,
+          riskAnalysis.headline,
+        ],
+      }
+    : null;
+  const fatigueCardTheme = {
+    wrapper: 'p-4 rounded-xl border border-emerald-500/25 border-l-[3px] border-l-emerald-400/80 bg-gradient-to-b from-emerald-500/8 to-[#162032] shadow-[0_0_18px_rgba(16,185,129,0.08)] hover:shadow-[0_0_24px_rgba(16,185,129,0.14)] transition-shadow',
+    badge: 'text-emerald-200 border-emerald-500/45 bg-emerald-900/35',
+    chip: 'text-emerald-100 border-emerald-500/35 bg-emerald-500/10 shadow-[0_0_12px_rgba(16,185,129,0.14)]',
+  };
+  const riskCardTheme = {
+    wrapper: 'p-4 rounded-xl border border-amber-500/25 border-l-[3px] border-l-amber-400/85 bg-gradient-to-b from-amber-500/8 to-[#162032] shadow-[0_0_18px_rgba(245,158,11,0.09)] hover:shadow-[0_0_26px_rgba(245,158,11,0.16)] transition-shadow',
+    badge: 'text-amber-200 border-amber-500/45 bg-amber-900/35',
+    chip: 'text-amber-100 border-amber-500/35 bg-amber-500/10 shadow-[0_0_12px_rgba(245,158,11,0.15)]',
+  };
 
   const handleAddBoundary = (boundary: '4' | '6') => {
     if (!activePlayer) return;
@@ -2139,7 +2279,7 @@ function Dashboard({
 
         {/* RIGHT: COACH AGENT */}
         <div className="lg:col-span-3 flex flex-col gap-4">
-           <div className="bg-[#0F172A] border border-white/5 rounded-2xl flex-1 p-6 relative flex flex-col items-center justify-center text-center overflow-hidden">
+           <div className="bg-[#0F172A] border border-white/5 rounded-2xl flex-1 p-6 relative flex flex-col overflow-hidden">
               <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50" />
               
               <div className="w-full flex items-center justify-between mb-8 absolute top-6 px-6">
@@ -2214,63 +2354,116 @@ function Dashboard({
                     </div>
                  </motion.div>
                )}
-               {agentState === 'idle' && !substitutionRecommendation && (
-                <div className="mt-8">
-                   <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-indigo-500/20 to-purple-500/20 border border-indigo-500/30 flex items-center justify-center mx-auto mb-6 relative">
-                      <div className="absolute inset-0 bg-indigo-500/20 blur-xl rounded-full"></div>
-                      <Shield className="w-8 h-8 text-indigo-400 relative z-10" />
-                   </div>
-                   <h3 className="text-xl font-bold text-white mb-2">Ready to Analyze</h3>
-                   <p className="text-sm text-slate-400 mb-8 max-w-[200px] mx-auto">Run the AI agent to get tactical recommendations based on current telemetry.</p>
-                   
-                   <button 
-                    onClick={runAgent}
-                    className="bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-3 rounded-full font-bold shadow-[0_0_20px_rgba(79,70,229,0.4)] flex items-center gap-2 mx-auto transition-all hover:scale-105"
-                   >
-                     <PlayCircle className="w-5 h-5" /> Run Coach Agent
-                   </button>
-                </div>
-              )}
-
-              {agentState === 'thinking' && (
-                <div className="w-full text-left space-y-6 px-4 mt-8">
-                  <ThinkingStep text="Analyzing biometric load..." delay={0} />
-                  <ThinkingStep text="Comparing against safe spell limit..." delay={0.8} />
-                  <ThinkingStep text="Checking injury probabilities..." delay={1.6} />
-                  <ThinkingStep text="Formulating tactical strategy..." delay={2.4} />
-                </div>
-              )}
-
-              {agentState === 'done' && aiAnalysis && (
-                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full mt-10 text-left">
-                  <div className={`p-5 rounded-xl border mb-6 ${
-                    aiAnalysis.injuryRisk === 'HIGH' ? 'bg-rose-500/10 border-rose-500/30' : aiAnalysis.injuryRisk === 'MEDIUM' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-emerald-500/10 border-emerald-500/30'
-                  }`}>
-                    <div className="flex items-center gap-3 mb-3">
-                       {aiAnalysis.injuryRisk === 'HIGH'
-                         ? <AlertTriangle className="w-6 h-6 text-rose-500" />
-                         : aiAnalysis.injuryRisk === 'MEDIUM'
-                           ? <AlertTriangle className="w-6 h-6 text-amber-400" />
-                           : <CheckCircle2 className="w-6 h-6 text-emerald-500" />
-                       }
-                       <span className={`text-lg font-bold ${aiAnalysis.injuryRisk === 'HIGH' ? 'text-rose-400' : aiAnalysis.injuryRisk === 'MEDIUM' ? 'text-amber-300' : 'text-emerald-400'}`}>
-                         {aiAnalysis.headline}
-                       </span>
+              {/* EMPTY_STATE_MARKER */}
+              {agentState === 'idle' && !substitutionRecommendation && (
+                <div className="h-full w-full flex flex-col items-center justify-center px-6">
+                  <div className="flex flex-col items-center -mt-10">
+                    <div className="w-28 h-28 rounded-3xl flex items-center justify-center bg-gradient-to-br from-indigo-500/25 via-purple-500/20 to-blue-500/15 border border-white/10 shadow-[0_0_40px_rgba(99,102,241,0.25)] backdrop-blur-md mb-8">
+                      <Shield className="w-12 h-12 text-white/90" />
                     </div>
-                    <p className="text-sm text-slate-300 leading-relaxed">
-                      Fatigue index ({aiAnalysis.fatigueIndex.toFixed(1)}) | Injury risk {aiAnalysis.injuryRisk} | No-ball risk {aiAnalysis.noBallRisk}
-                    </p>
-                    <p className="text-sm text-slate-300 leading-relaxed mt-2">
-                      {aiAnalysis.explanation}
-                    </p>
+                    <h3 className="text-2xl font-semibold text-white/95 mb-12 text-center">Ready to Analyze</h3>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Run Coach Agent"
+                    onClick={() => runAgent('button_click')}
+                    className="w-full max-w-[420px] h-14 rounded-full px-10 text-lg font-semibold flex items-center justify-center gap-3 bg-gradient-to-r from-indigo-500 via-purple-500 to-blue-500 shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:brightness-110 hover:shadow-[0_12px_55px_rgba(99,102,241,0.45)] active:scale-[0.99] transition cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
+                  >
+                    <PlayCircle className="w-5 h-5 shrink-0" /> Run Coach Agent
+                  </button>
+                </div>
+              )}
+
+              {(agentState === 'thinking' || agentState === 'done' || agentState === 'offline' || agentState === 'invalid') && (
+                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full mt-10 text-left overflow-y-auto max-h-[62vh] pr-1 space-y-5">
+                  <div className={fatigueCardTheme.wrapper}>
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-sm font-bold text-white">Fatigue Agent</h4>
+                      <span className={`text-[10px] px-2 py-0.5 rounded border ${fatigueCardTheme.badge}`}>
+                        {agentFeedStatus.fatigue === 'loading'
+                          ? 'LOADING'
+                          : agentFeedStatus.fatigue === 'done'
+                            ? `${aiAnalysis?.severity ?? 'LOW'} · F ${safeNum(aiAnalysis?.fatigueIndex, 0).toFixed(1)}`
+                            : agentFeedStatus.fatigue.toUpperCase()}
+                      </span>
+                    </div>
+                    {agentFeedStatus.fatigue === 'loading' && (
+                      <p className="text-xs text-slate-400">Analyzing telemetry...</p>
+                    )}
+                    {agentFeedStatus.fatigue === 'error' && (
+                      <p className="text-xs text-amber-300">Fatigue agent unavailable. Start backend: <span className="font-mono">cd api && func start</span></p>
+                    )}
+                    {agentFeedStatus.fatigue === 'done' && aiAnalysis && (
+                      <>
+                        <p className="text-xs font-semibold text-slate-100 mb-1">{aiAnalysis.headline}</p>
+                        <p className="text-xs text-slate-300 mb-2 line-clamp-3">{aiAnalysis.explanation}</p>
+                        <p className="text-[10px] text-slate-400 mb-2">
+                          Fatigue ({safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1)}) | Injury {aiAnalysis.injuryRisk} | No-ball {aiAnalysis.noBallRisk}
+                        </p>
+                        <div className="flex flex-wrap gap-1.5 mb-2">
+                          {aiAnalysis.signals.map((signal, i) => (
+                            <span key={`${signal}-${i}`} className={`text-[10px] px-2 py-0.5 rounded border ${fatigueCardTheme.chip}`}>{signal}</span>
+                          ))}
+                        </div>
+                        <p className="text-xs text-white">{aiAnalysis.recommendation}</p>
+                      </>
+                    )}
                   </div>
 
-                  <div className="bg-[#162032] p-5 rounded-xl border border-white/5 mb-6">
-                    <h4 className="text-xs font-bold text-slate-500 uppercase mb-3">Recommendation</h4>
-                    <p className="text-white font-medium">
-                      {aiAnalysis.recommendation}
-                    </p>
+                  <div className={riskCardTheme.wrapper}>
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-sm font-bold text-white">{agentFeedStatus.risk === 'error' ? 'Risk Agent (offline)' : 'Risk Agent'}</h4>
+                      <span className={`text-[10px] px-2 py-0.5 rounded border ${
+                        agentFeedStatus.risk === 'error'
+                          ? 'text-rose-300 border-rose-500/40 bg-rose-500/10'
+                          : riskCardTheme.badge
+                      }`}>
+                        {agentFeedStatus.risk === 'loading'
+                          ? 'LOADING'
+                          : agentFeedStatus.risk === 'done'
+                            ? `${riskAnalysis?.severity ?? 'LOW'} · R ${Math.round(safeNum(riskAnalysis?.riskScore, 0))}`
+                            : agentFeedStatus.risk.toUpperCase()}
+                      </span>
+                    </div>
+                    {agentFeedStatus.risk === 'loading' && (
+                      <p className="text-xs text-slate-400">Aggregating risk signals...</p>
+                    )}
+                    {agentFeedStatus.risk === 'error' && (
+                      <p className="text-xs text-amber-300">Risk agent unavailable. Start backend: <span className="font-mono">cd api && func start</span></p>
+                    )}
+                    {agentFeedStatus.risk === 'done' && riskAnalysis && (
+                      <>
+                        <p className="text-xs font-semibold text-slate-100 mb-1">{riskAnalysis.headline}</p>
+                        <p className="text-xs text-slate-300 mb-2 line-clamp-3">{riskAnalysis.explanation}</p>
+                        <p className="text-[10px] text-slate-400 mb-2">
+                          Risk Score ({Math.round(safeNum(riskAnalysis.riskScore, 0))}) | Injury {riskAnalysis.injuryRisk} | No-ball {riskAnalysis.noBallRisk}
+                        </p>
+                        <div className="flex flex-wrap gap-1.5 mb-2">
+                          {riskAnalysis.signals.map((signal, i) => (
+                            <span key={`${signal}-${i}`} className={`text-[10px] px-2 py-0.5 rounded border ${riskCardTheme.chip}`}>{signal}</span>
+                          ))}
+                        </div>
+                        <p className="text-xs text-white">{riskAnalysis.recommendation}</p>
+                      </>
+                    )}
                   </div>
+
+                  {finalDecision && (
+                    <div className={`p-5 rounded-xl border ${
+                      finalDecision.severity === 'CRITICAL'
+                        ? 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
+                        : finalDecision.severity === 'HIGH'
+                        ? 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
+                        : finalDecision.severity === 'MED'
+                          ? 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
+                          : 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
+                    }`}>
+                      <p className="text-[11px] font-bold uppercase tracking-wide text-slate-300 mb-1">Final Analysis / Decision</p>
+                      <h3 className="text-base font-bold text-white mb-2">Final Decision</h3>
+                      <p className="text-sm text-slate-200 mb-2">{finalDecision.action}</p>
+                      <p className="text-xs text-slate-400">Reasons: {finalDecision.reasons[0]}; {finalDecision.reasons[1]}</p>
+                    </div>
+                  )}
 
                   <button 
                     onClick={handleDismissAnalysis}
@@ -2278,20 +2471,6 @@ function Dashboard({
                   >
                     Dismiss Analysis
                   </button>
-                </motion.div>
-              )}
-
-              {(agentState === 'offline' || agentState === 'invalid') && (
-                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full mt-10 text-left">
-                  <div className="p-5 rounded-xl border mb-6 bg-slate-800/50 border-slate-600/40">
-                    <div className="flex items-center gap-3 mb-3">
-                      <AlertTriangle className="w-6 h-6 text-amber-400" />
-                      <span className="text-lg font-bold text-amber-300">AI Offline</span>
-                    </div>
-                    <p className="text-sm text-slate-300 leading-relaxed">
-                      Start backend: <span className="font-mono">cd api && func start</span>
-                    </p>
-                  </div>
                 </motion.div>
               )}
               </>
