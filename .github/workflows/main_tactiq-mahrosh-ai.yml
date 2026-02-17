@@ -77,6 +77,8 @@ jobs:
       # IMPORTANT:
       # Ensure SCM_DO_BUILD_DURING_DEPLOYMENT=true in Azure App Service settings.
       # This makes Oryx install dependencies (e.g., express) during ZIP deployment.
+      # Ensure WEBSITE_RUN_FROM_PACKAGE=1 to run directly from ZIP package
+      # and avoid node_modules move/delete permission issues on App Service.
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
@@ -84,5 +86,5 @@ jobs:
           app-name: 'tactiq-mahrosh-ai'
           slot-name: 'Production'
           package: app.zip
-          clean: true
+          clean: false
           
