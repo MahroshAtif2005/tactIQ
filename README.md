@@ -114,3 +114,49 @@ Quick setup:
 ## Deployment
 Deployed on Azure App Service via GitHub Actions (CI/CD).
 Every push to `main` triggers build + deploy.
+
+flowchart LR
+  %% tactIQ - Multi-Agent AI Sports Fatigue & Substitution Coach
+
+  U[User\n(Coach / Analyst)]
+  UI[Azure App Service\nStatic Vite UI]
+  API[Node.js / Express API]
+  ORCH[Orchestrator / Routing Layer\n- Request validation\n- Agent coordination\n- Model routing\n- Response aggregation]
+  PD[(Player Data\n- Workload history\n- Sleep\n- Stress\n- In-match load)]
+  FA[Fatigue Agent\n- Workload accumulation\n- Recovery signals\n- Match intensity]
+  RA[Risk Agent\n- Injury likelihood\n- Fatigue-overlap risk\n- Contextual risk]
+  TA[Tactical Agent\n- Match phase awareness\n- Readiness-based substitution\n- Rotation optimization]
+  OUT[Explainable Substitution Output\n- Readiness score\n- Risk score\n- Tactical reasoning\n- Clear explanation]
+
+  AOAI[Azure OpenAI Service\n- Lightweight model (classification/routing)\n- Advanced reasoning model\n- Cost-optimized routing]
+
+  GH[GitHub Repo]
+  GA[GitHub Actions CI/CD]
+  HOST[Azure App Service (Hosting)]
+
+  %% User flow
+  U -->|HTTPS| UI
+  UI --> API
+  API --> ORCH
+
+  %% Data + agents
+  PD --> ORCH
+  ORCH --> FA
+  ORCH --> RA
+  ORCH --> TA
+
+  %% Model access (single entry)
+  ORCH --> AOAI
+
+  %% Output
+  FA --> ORCH
+  RA --> ORCH
+  TA --> ORCH
+  ORCH --> OUT
+  OUT --> UI
+  UI --> U
+
+  %% DevOps
+  GH --> GA --> HOST
+  HOST --- UI
+  HOST --- API
