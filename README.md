@@ -79,11 +79,31 @@ The goal is not just to show numbers but to guide decisions.
 2. Start frontend + Azure Functions API:
    - `npm run dev`
 
-Frontend runs on `http://localhost:3000` and API runs on `http://localhost:7071`.
+Frontend runs on `http://localhost:3000` and API runs on `http://localhost:7072`.
 
 ## Fatigue Agent endpoint
 
-- `POST http://localhost:7071/api/agents/fatigue`
+- `POST http://localhost:7072/api/agents/fatigue`
 - Frontend can call `/api/agents/fatigue` (proxied by Vite in dev).
 
+If you change Vite proxy settings, restart the Vite dev server.
 
+## LLM Setup
+
+Fatigue Agent supports two modes:
+- Rule-based fallback (default when Azure env vars are missing)
+- Azure OpenAI LLM analysis (enabled when env vars are present)
+
+Set these in `api/local.settings.json` (or environment):
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_DEPLOYMENT`
+- `AZURE_OPENAI_MODEL` (alternative to deployment name)
+- `AZURE_OPENAI_API_VERSION` (optional, default `2024-06-01`)
+
+The function auto-switches to LLM mode only when all three required values are present.
+
+Quick setup:
+1. Copy `api/local.settings.json.example` to `api/local.settings.json`
+2. Add your Azure OpenAI values
+3. Run `cd api && func start`

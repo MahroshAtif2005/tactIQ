@@ -30,6 +30,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence, useMotionValue, useSpring, useTransform, useMotionTemplate } from 'motion/react';
 import { FatigueAgentResponse } from './types/agents';
+import { ApiClientError, postFatigueAgent } from './lib/apiClient';
 
 // --- Types ---
 
@@ -90,9 +91,14 @@ interface FatigueAgentPayload {
   role: string;
   oversBowled: number;
   consecutiveOvers: number;
+  fatigueIndex: number;
+  injuryRisk: 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
+  noBallRisk: 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
+  heartRateRecovery: string;
   fatigueLimit: number;
   sleepHours: number;
   recoveryMinutes: number;
+  snapshotId: string;
   matchContext: {
     format: string;
     phase: string;
@@ -101,12 +107,26 @@ interface FatigueAgentPayload {
   };
 }
 
-interface AgentLogEntry {
-  ts: number;
-  agent: 'fatigue';
+interface AiAnalysis {
+  playerId: string;
   fatigueIndex: number;
-  injuryRisk: 'LOW' | 'MEDIUM' | 'HIGH';
+  injuryRisk: 'LOW' | 'MED' | 'HIGH';
+  noBallRisk: 'LOW' | 'MED' | 'HIGH';
   signals: string[];
+  explanation: string;
+  headline: string;
+  recommendation: string;
+}
+
+interface TelemetrySnapshot {
+  playerId: string;
+  overs: number;
+  consecutiveOvers: number;
+  fatigue: number;
+  injuryRisk: Player['injuryRisk'];
+  noBallRisk: Player['noBallRisk'];
+  agentFatigueOverride?: number;
+  agentRiskOverride?: Player['agentRiskOverride'];
 }
 
 // --- Mock Data ---
@@ -371,12 +391,8 @@ const computeTelemetry = (player: Player): Partial<Player> => {
 
   if (player.agentFatigueOverride !== undefined || player.agentRiskOverride !== undefined) {
     const overrideFatigue = Math.max(0, Math.min(10, player.agentFatigueOverride ?? player.fatigue));
-    const overrideRisk = player.agentRiskOverride ?? player.injuryRisk;
-    const noBallRisk = overrideRisk === 'High' ? 'High' : overrideRisk === 'Medium' ? 'Medium' : 'Low';
     return {
       fatigue: overrideFatigue,
-      injuryRisk: overrideRisk,
-      noBallRisk,
     };
   }
 
@@ -417,33 +433,15 @@ const computeTelemetry = (player: Player): Partial<Player> => {
   // Clamp Fatigue
   fatigue = Math.min(10, Math.max(0, fatigue));
 
-  // 4. Risks & Recovery
-  let injuryRisk: 'Low' | 'Medium' | 'High' = 'Low';
+  // 4. Recovery-only adjustment (risk dropdowns remain user-controlled)
   let hrRecovery = player.hrRecovery;
-  let noBallRisk: 'Low' | 'Medium' | 'High' = player.noBallRisk;
-
-  // Injury Risk
   const limit = player.baselineFatigue;
-  if (fatigue > limit || player.sleepHours < 5 || player.consecutiveOvers >= 4) {
-    injuryRisk = 'High';
-  } else if (fatigue >= limit - 1) {
-    injuryRisk = 'Medium';
-  }
-
-  // No-ball risk should escalate with the same alert condition.
-  if (injuryRisk === 'High' || fatigue > limit) {
-    noBallRisk = 'High';
-  } else if (injuryRisk === 'Medium') {
-    noBallRisk = 'Medium';
-  } else {
-    noBallRisk = 'Low';
-  }
 
   // HR Recovery Adjustment
   if (player.sleepHours < 6 && hrRecovery === 'Good') hrRecovery = 'Moderate';
   if (fatigue > limit && hrRecovery === 'Good') hrRecovery = 'Moderate';
 
-  return { fatigue, injuryRisk, hrRecovery, noBallRisk };
+  return { fatigue, hrRecovery };
 };
 
 const totalBallsFromOvers = (overs: number): number => {
@@ -510,12 +508,43 @@ export default function App() {
   });
   const [players, setPlayers] = useState<Player[]>(INITIAL_PLAYERS);
   const [activePlayerId, setActivePlayerId] = useState<string>('p1');
-  const [agentState, setAgentState] = useState<'idle' | 'thinking' | 'done'>('idle');
-  const [agentLogs, setAgentLogs] = useState<AgentLogEntry[]>([]);
+  const [agentState, setAgentState] = useState<'idle' | 'thinking' | 'done' | 'offline' | 'invalid'>('idle');
   const [agentWarning, setAgentWarning] = useState<string | null>(null);
+  const [aiAnalysis, setAiAnalysis] = useState<AiAnalysis | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const fatigueRequestSeq = useRef(0);
+  const fatigueAbortRef = useRef<AbortController | null>(null);
+  const playersRef = useRef<Player[]>([]);
+
+  useEffect(() => {
+    playersRef.current = players;
+  }, [players]);
 
   const activePlayer = players.find(p => p.id === activePlayerId) || players[0];
+  const currentTelemetry = React.useMemo(() => {
+    const player = players.find((p) => p.id === activePlayerId);
+    if (!player) return null;
+    return {
+      playerId: player.id.toUpperCase(),
+      playerName: player.name,
+      role: player.role,
+      oversBowled: Math.max(0, safeNum(player.overs, 0)),
+      consecutiveOvers: Math.max(0, safeNum(player.consecutiveOvers, 0)),
+      fatigueIndex: Math.max(0, Math.min(10, safeNum(player.fatigue, 3.0))),
+      injuryRisk: String(player.injuryRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
+      noBallRisk: String(player.noBallRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
+      heartRateRecovery: String(player.hrRecovery || 'Moderate'),
+      fatigueLimit: Math.max(0, safeNum(player.baselineFatigue, 6)),
+      sleepHours: Math.max(0, safeNum(player.sleepHours, 7)),
+      recoveryMinutes: Math.max(0, safeNum(player.recoveryTime, 45)),
+      matchContext: {
+        format: matchContext.format || 'T20',
+        phase: matchContext.phase || 'Middle',
+        over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
+        intensity: matchContext.pitch || 'Medium',
+      },
+    };
+  }, [players, activePlayerId, matchContext, matchState.ballsBowled]);
 
   const updateMatchState = (updates: Partial<MatchState>) => {
     setMatchState(prev => {
@@ -586,13 +615,6 @@ export default function App() {
           const nextFatigue = Number.isFinite(rawNextFatigue)
             ? Math.max(0, Math.min(10, rawNextFatigue))
             : startFatigue;
-          const safeThreshold = Math.max(0, Math.min(10, safeNum(p.baselineFatigue, 6)));
-          const canNormalize = restProgress >= 1 || nextFatigue <= safeThreshold;
-          const normalizedRisk = deriveRiskFromFatigue(nextFatigue);
-          const nextRisk = canNormalize ? normalizedRisk : (p.agentRiskOverride ?? p.injuryRisk);
-          const nextNoBallRisk: 'Low' | 'Medium' | 'High' = canNormalize
-            ? (nextRisk === 'High' ? 'High' : nextRisk === 'Medium' ? 'Medium' : 'Low')
-            : p.noBallRisk;
 
           console.log('isResting:', p.isResting, 'elapsed:', nextElapsedSeconds);
 
@@ -603,16 +625,11 @@ export default function App() {
             ...(p.agentFatigueOverride !== undefined
               ? {
                   agentFatigueOverride: nextFatigue,
-                  agentRiskOverride: nextRisk,
                 }
               : {
                   fatigue: nextFatigue,
-                  injuryRisk: nextRisk,
                 }),
-            noBallRisk: nextNoBallRisk,
-            hrRecovery: canNormalize
-              ? (nextRisk === 'High' ? 'Poor' : nextRisk === 'Medium' ? 'Moderate' : 'Good')
-              : p.hrRecovery,
+            hrRecovery: p.hrRecovery,
           };
         })
       );
@@ -782,98 +799,165 @@ export default function App() {
     });
   };
 
-  async function runFatigueAgent(payload: FatigueAgentPayload): Promise<FatigueAgentResponse> {
-    const response = await fetch('/api/agents/fatigue', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      let message = 'Fatigue Agent unavailable (mock mode)';
-      try {
-        const errorBody = await response.json() as { error?: string };
-        if (errorBody?.error) message = `Fatigue Agent unavailable (mock mode): ${errorBody.error}`;
-      } catch {
-        // fallback message above
-      }
-      throw new Error(message);
+  const buildAiAnalysis = (result: FatigueAgentResponse): AiAnalysis | null => {
+    const fatigueIndex = safeNum(result.echo?.fatigueIndex, NaN);
+    const normalizeShortRisk = (value: unknown): 'LOW' | 'MED' | 'HIGH' => {
+      const upper = String(value || '').toUpperCase();
+      if (upper === 'HIGH') return 'HIGH';
+      if (upper === 'MED' || upper === 'MEDIUM') return 'MED';
+      return 'LOW';
+    };
+    const risk = normalizeShortRisk(result.echo?.injuryRisk);
+    const noBallRisk = normalizeShortRisk(result.echo?.noBallRisk);
+    const validSeverity = result.severity === 'LOW' || result.severity === 'MED' || result.severity === 'HIGH';
+    const validSignals = Array.isArray(result.signals) && result.signals.every((s) => typeof s === 'string');
+    const validExplanation = typeof result.explanation === 'string' && result.explanation.trim().length > 0;
+    const validHeadline = typeof result.headline === 'string' && result.headline.trim().length > 0;
+    const validRecommendation = typeof result.recommendation === 'string' && result.recommendation.trim().length > 0;
+    if (!Number.isFinite(fatigueIndex) || !validSeverity || !validSignals || !validExplanation || !validHeadline || !validRecommendation) {
+      return null;
     }
 
-    const result = await response.json() as FatigueAgentResponse;
-    console.log('Fatigue agent response:', result);
-    return result;
-  }
-
-  const handleRunFatigueAgent = async () => {
-    if (!activePlayer) return;
-
-    const overDisplay = Number(formatOverStr(matchState.ballsBowled));
-    const fallbackSleepHours = 7.0;
-    const fallbackRecoveryMinutes = 45;
-    const sleepHours = Number.isFinite(activePlayer.sleepHours) ? activePlayer.sleepHours : fallbackSleepHours;
-    const recoveryMinutes = Number.isFinite(activePlayer.recoveryTime) ? activePlayer.recoveryTime : fallbackRecoveryMinutes;
-    const usingDefaults = !Number.isFinite(activePlayer.sleepHours) || !Number.isFinite(activePlayer.recoveryTime);
-
-    const payload: FatigueAgentPayload = {
-      playerId: activePlayer.id.toUpperCase(),
-      playerName: activePlayer.name,
-      role: activePlayer.role,
-      oversBowled: activePlayer.overs,
-      consecutiveOvers: activePlayer.consecutiveOvers,
-      fatigueLimit: Number.isFinite(activePlayer.baselineFatigue) ? activePlayer.baselineFatigue : 6,
-      sleepHours,
-      recoveryMinutes,
-      matchContext: {
-        format: matchContext.format || 'T20',
-        phase: matchContext.phase || 'Middle',
-        over: overDisplay,
-        intensity: matchContext.pitch || 'Medium',
-      },
+    return {
+      playerId: String(result.echo?.playerId || ''),
+      fatigueIndex,
+      injuryRisk: risk,
+      noBallRisk,
+      signals: result.signals,
+      explanation: result.explanation.trim(),
+      headline: result.headline.trim(),
+      recommendation: result.recommendation.trim(),
     };
-
-    const result = await runFatigueAgent(payload);
-    const mappedRisk: 'Low' | 'Medium' | 'High' =
-      result.injuryRisk === 'HIGH'
-        ? 'High'
-        : result.injuryRisk === 'MEDIUM'
-          ? 'Medium'
-          : 'Low';
-
-    updatePlayer(activePlayer.id, {
-      agentFatigueOverride: Number(result.fatigueIndex) || 0,
-      agentRiskOverride: mappedRisk,
-    });
-
-    setAgentWarning(usingDefaults ? 'Fatigue Agent used baseline defaults (sleepHours 7.0, recoveryMinutes 45).' : null);
-    setAgentLogs((prev) => [
-      {
-        ts: Date.now(),
-        agent: 'fatigue',
-        fatigueIndex: Number(result.fatigueIndex) || 0,
-        injuryRisk: result.injuryRisk,
-        signals: result.signals || [],
-      },
-      ...prev,
-    ]);
   };
+
+  const captureTelemetrySnapshot = (player: Player): TelemetrySnapshot => ({
+    playerId: player.id,
+    overs: safeNum(player.overs, 0),
+    consecutiveOvers: safeNum(player.consecutiveOvers, 0),
+    fatigue: safeNum(player.fatigue, 0),
+    injuryRisk: player.injuryRisk,
+    noBallRisk: player.noBallRisk,
+    agentFatigueOverride: player.agentFatigueOverride,
+    agentRiskOverride: player.agentRiskOverride,
+  });
+
+  const isTelemetryEqual = (a: TelemetrySnapshot, b: TelemetrySnapshot): boolean =>
+    a.playerId === b.playerId &&
+    a.overs === b.overs &&
+    a.consecutiveOvers === b.consecutiveOvers &&
+    a.fatigue === b.fatigue &&
+    a.injuryRisk === b.injuryRisk &&
+    a.noBallRisk === b.noBallRisk &&
+    a.agentFatigueOverride === b.agentFatigueOverride &&
+    a.agentRiskOverride === b.agentRiskOverride;
 
   const runAgent = async () => {
+    if (!currentTelemetry) return;
+
+    fatigueAbortRef.current?.abort();
+    const controller = new AbortController();
+    fatigueAbortRef.current = controller;
+    const requestId = ++fatigueRequestSeq.current;
+
+    setAiAnalysis(null);
+    setAgentWarning(null);
     setAgentState('thinking');
+
+    const activePlayerState = playersRef.current.find((p) => p.id === activePlayerId);
+    if (!activePlayerState) return;
+    const telemetrySnapshot = captureTelemetrySnapshot(activePlayerState);
+    const snapshotId = `${currentTelemetry.playerId}:${currentTelemetry.fatigueIndex}:${currentTelemetry.oversBowled}:${currentTelemetry.consecutiveOvers}:${Date.now()}`;
+    const payload: FatigueAgentPayload = {
+      playerId: currentTelemetry.playerId,
+      playerName: currentTelemetry.playerName,
+      role: currentTelemetry.role,
+      oversBowled: currentTelemetry.oversBowled,
+      consecutiveOvers: currentTelemetry.consecutiveOvers,
+      fatigueIndex: currentTelemetry.fatigueIndex,
+      injuryRisk: currentTelemetry.injuryRisk,
+      noBallRisk: currentTelemetry.noBallRisk,
+      heartRateRecovery: currentTelemetry.heartRateRecovery,
+      fatigueLimit: currentTelemetry.fatigueLimit,
+      sleepHours: currentTelemetry.sleepHours,
+      recoveryMinutes: currentTelemetry.recoveryMinutes,
+      snapshotId,
+      matchContext: currentTelemetry.matchContext,
+    };
+    if (import.meta.env.DEV) {
+      console.log('Fatigue analyze payload', payload);
+    }
+
     try {
-      setAgentWarning(null);
-      await handleRunFatigueAgent();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Fatigue Agent unavailable (mock mode)';
-      setAgentWarning(message);
-    } finally {
+      const result = await postFatigueAgent(payload, controller.signal);
+      if (requestId !== fatigueRequestSeq.current) return;
+      if (import.meta.env.DEV) {
+        console.log('Fatigue analyze response', result);
+      }
+      const mapped = buildAiAnalysis(result);
+      if (!mapped) {
+        setAgentState('invalid');
+        setAgentWarning('Invalid AI response');
+        return;
+      }
+
+      setAiAnalysis(mapped);
       setAgentState('done');
+
+      const currentPlayer = playersRef.current.find((p) => p.id === telemetrySnapshot.playerId);
+      if (currentPlayer) {
+        const nowSnapshot = captureTelemetrySnapshot(currentPlayer);
+        if (!isTelemetryEqual(telemetrySnapshot, nowSnapshot) && import.meta.env.DEV) {
+          console.error('Telemetry mutated during coach analysis; reverting', {
+            before: telemetrySnapshot,
+            after: nowSnapshot,
+          });
+          setPlayers((prev) =>
+            prev.map((p) =>
+              p.id === telemetrySnapshot.playerId
+                ? {
+                    ...p,
+                    overs: telemetrySnapshot.overs,
+                    consecutiveOvers: telemetrySnapshot.consecutiveOvers,
+                    fatigue: telemetrySnapshot.fatigue,
+                    injuryRisk: telemetrySnapshot.injuryRisk,
+                    noBallRisk: telemetrySnapshot.noBallRisk,
+                    agentFatigueOverride: telemetrySnapshot.agentFatigueOverride,
+                    agentRiskOverride: telemetrySnapshot.agentRiskOverride,
+                  }
+                : p
+            )
+          );
+        }
+      }
+    } catch (error) {
+      if ((error as Error)?.name === 'AbortError') return;
+      if (requestId !== fatigueRequestSeq.current) return;
+      if (error instanceof ApiClientError) {
+        setAgentWarning(error.message);
+      } else {
+        setAgentWarning('AI Offline. Start backend: cd api && func start');
+      }
+      setAgentState('offline');
     }
   };
 
+  useEffect(() => {
+    if (page !== 'dashboard' || !currentTelemetry) return;
+    fatigueAbortRef.current?.abort();
+    setAiAnalysis(null);
+    setAgentWarning(null);
+    setAgentState('thinking');
+    runAgent();
+    return () => {
+      fatigueAbortRef.current?.abort();
+    };
+  }, [activePlayerId, page, currentTelemetry]);
+
   const dismissAnalysis = () => {
+    fatigueAbortRef.current?.abort();
     setAgentState('idle');
     setAgentWarning(null);
+    setAiAnalysis(null);
   };
 
   const navigateTo = (p: Page) => {
@@ -1058,8 +1142,8 @@ export default function App() {
               deletePlayer={deletePlayer}
               movePlayerToSub={movePlayerToSub}
               agentState={agentState}
-              agentLogs={agentLogs}
               agentWarning={agentWarning}
+              aiAnalysis={aiAnalysis}
               runAgent={runAgent}
               onDismissAnalysis={dismissAnalysis}
               handleAddOver={handleAddOver}
@@ -1309,7 +1393,7 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
 
 function Dashboard({ 
   matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, addPlayer, deletePlayer, movePlayerToSub,
-  agentState, agentLogs, agentWarning, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit, onBack 
+  agentState, aiAnalysis, agentWarning, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit, onBack 
 }: any) {
   const [isAdding, setIsAdding] = useState(false);
   const [newPlayerName, setNewPlayerName] = useState('');
@@ -2066,18 +2150,6 @@ function Dashboard({
               
               {activePlayer ? (
               <>
-               {agentLogs?.length > 0 && (
-                 <div className="w-full px-6 mb-4">
-                   <div className="text-[11px] text-slate-400 border border-white/10 bg-slate-900/40 rounded-md px-3 py-2 text-left space-y-1.5">
-                     {agentLogs.slice(0, 3).map((entry: any) => (
-                       <p key={entry.ts}>
-                         Fatigue Agent ✓ fatigueIndex={Number(entry.fatigueIndex).toFixed(1)}, injuryRisk={entry.injuryRisk}
-                         {entry.signals?.length ? `, signals=${entry.signals.join('|')}` : ''}
-                       </p>
-                     ))}
-                   </div>
-                 </div>
-               )}
                {agentWarning && (
                  <div className="w-full px-6 mb-4">
                    <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-3 py-2 text-left">
@@ -2169,35 +2241,34 @@ function Dashboard({
                 </div>
               )}
 
-              {agentState === 'done' && (
+              {agentState === 'done' && aiAnalysis && (
                 <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full mt-10 text-left">
                   <div className={`p-5 rounded-xl border mb-6 ${
-                    activePlayer.fatigue > 6 ? 'bg-rose-500/10 border-rose-500/30' : 'bg-emerald-500/10 border-emerald-500/30'
+                    aiAnalysis.injuryRisk === 'HIGH' ? 'bg-rose-500/10 border-rose-500/30' : aiAnalysis.injuryRisk === 'MEDIUM' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-emerald-500/10 border-emerald-500/30'
                   }`}>
                     <div className="flex items-center gap-3 mb-3">
-                       {activePlayer.fatigue > 6 
-                         ? <AlertTriangle className="w-6 h-6 text-rose-500" /> 
-                         : <CheckCircle2 className="w-6 h-6 text-emerald-500" />
+                       {aiAnalysis.injuryRisk === 'HIGH'
+                         ? <AlertTriangle className="w-6 h-6 text-rose-500" />
+                         : aiAnalysis.injuryRisk === 'MEDIUM'
+                           ? <AlertTriangle className="w-6 h-6 text-amber-400" />
+                           : <CheckCircle2 className="w-6 h-6 text-emerald-500" />
                        }
-                       <span className={`text-lg font-bold ${activePlayer.fatigue > 6 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                         {activePlayer.fatigue > 6 ? 'HIGH RISK DETECTED' : 'OPTIMAL CONDITION'}
+                       <span className={`text-lg font-bold ${aiAnalysis.injuryRisk === 'HIGH' ? 'text-rose-400' : aiAnalysis.injuryRisk === 'MEDIUM' ? 'text-amber-300' : 'text-emerald-400'}`}>
+                         {aiAnalysis.headline}
                        </span>
                     </div>
                     <p className="text-sm text-slate-300 leading-relaxed">
-                      {activePlayer.fatigue > 6 
-                        ? `Fatigue index (${activePlayer.fatigue.toFixed(1)}) exceeds baseline threshold (${activePlayer.baselineFatigue}). Injury risk is elevated in ${matchContext.weather} conditions.`
-                        : `Player is operating within safe workload limits. Fatigue (${activePlayer.fatigue.toFixed(1)}) is below baseline.`
-                      }
+                      Fatigue index ({aiAnalysis.fatigueIndex.toFixed(1)}) | Injury risk {aiAnalysis.injuryRisk} | No-ball risk {aiAnalysis.noBallRisk}
+                    </p>
+                    <p className="text-sm text-slate-300 leading-relaxed mt-2">
+                      {aiAnalysis.explanation}
                     </p>
                   </div>
 
                   <div className="bg-[#162032] p-5 rounded-xl border border-white/5 mb-6">
                     <h4 className="text-xs font-bold text-slate-500 uppercase mb-3">Recommendation</h4>
                     <p className="text-white font-medium">
-                       {activePlayer.fatigue > 6 
-                        ? `🛑 IMMEDIATELY REST. Replace with a spinner for the next 3 overs to allow heart rate recovery.`
-                        : `✅ CONTINUE SPELL. Player can safely bowl 2 more overs at current intensity.`
-                       }
+                      {aiAnalysis.recommendation}
                     </p>
                   </div>
 
@@ -2207,6 +2278,20 @@ function Dashboard({
                   >
                     Dismiss Analysis
                   </button>
+                </motion.div>
+              )}
+
+              {(agentState === 'offline' || agentState === 'invalid') && (
+                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full mt-10 text-left">
+                  <div className="p-5 rounded-xl border mb-6 bg-slate-800/50 border-slate-600/40">
+                    <div className="flex items-center gap-3 mb-3">
+                      <AlertTriangle className="w-6 h-6 text-amber-400" />
+                      <span className="text-lg font-bold text-amber-300">AI Offline</span>
+                    </div>
+                    <p className="text-sm text-slate-300 leading-relaxed">
+                      Start backend: <span className="font-mono">cd api && func start</span>
+                    </p>
+                  </div>
                 </motion.div>
               )}
               </>

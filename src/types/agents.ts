@@ -1,11 +1,24 @@
-export type InjuryRisk = 'LOW' | 'MEDIUM' | 'HIGH';
+export type InjuryRisk = 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
+export type Severity = 'LOW' | 'MED' | 'HIGH';
 
 export interface FatigueAgentResponse {
-  agent: string;
-  version: string;
-  playerId: string;
-  fatigueIndex: number;
-  injuryRisk: InjuryRisk;
-  signals: string[];
+  severity: Severity;
+  headline: string;
   explanation: string;
+  recommendation: string;
+  signals: string[];
+  echo: {
+    playerId?: string;
+    fatigueIndex: number;
+    injuryRisk: InjuryRisk;
+    noBallRisk: InjuryRisk;
+    oversBowled: number;
+    consecutiveOvers: number;
+    heartRateRecovery?: string;
+  };
+  suggestedTweaks?: {
+    suggestedRestOvers?: number;
+    suggestedSubRole?: string;
+    notes?: string;
+  };
 }

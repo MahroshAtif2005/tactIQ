@@ -28,7 +28,7 @@ export async function generateAzureExplanation(input: FatigueAgentRequest, resul
           },
           {
             role: 'user',
-            content: `Player ${input.playerName} (${input.role}) fatigueIndex=${result.fatigueIndex}, risk=${result.injuryRisk}, signals=${result.signals.join(',') || 'NONE'}. Explain in 1-2 sentences.`
+            content: `Player ${input.playerName} (${input.role}) measuredFatigue=${input.fatigueIndex}, advisorySeverity=${result.severity}, signals=${result.signals.join(',') || 'NONE'}. Explain in 1-2 sentences.`
           }
         ],
         max_tokens: 80,
