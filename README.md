@@ -114,3 +114,70 @@ Quick setup:
 ## Deployment
 Deployed on Azure App Service via GitHub Actions (CI/CD).
 Every push to `main` triggers build + deploy.
+
+## ARCHITECTURE 
+
+Users (Coach / Analyst)
+        |
+        | HTTPS
+        v
++---------------------------+
+| Web UI (Vite + React)     |
+| - Run Coach Agent         |
+| - Player / Match Inputs   |
++-------------+-------------+
+              |
+              | HTTPS (REST)
+              v
++---------------------------+
+| Node.js + Express API     |
+| - validates request       |
+| - creates session context |
++-------------+-------------+
+              |
+              v
++------------------------------------------------------+
+| Agent Framework Orchestrator (Supervisor)            |
+| - maintains session state                            |
+| - decides which specialist agent(s) to run           |
+| - merges outputs into one final recommendation       |
++----------------------+-------------------------------+
+                       |
+                       | Decision: route only what’s needed (cost save)
+                       v
+            +----------------------------------+
+            | Model Router / Policy Layer      |
+            | - choose agent(s) + model tier   |
+            | - light model for simple checks  |
+            | - strong model for complex cases |
+            +---------+-----------+------------+
+                      |           |
+          run if needed|           |run if needed
+                      v           v
+        +------------------+   +------------------+
+        | Fatigue Agent    |   | Risk Agent       |
+        | - workload trend |   | - injury flags   |
+        | - safe spell     |   | - risk scoring   |
+        +--------+---------+   +--------+---------+
+                 \              /
+                  \            /
+                   \ run if needed
+                    v
+              +----------------------+
+              | Tactical Agent       |
+              | - match context      |
+              | - field/bowler plan  |
+              | - substitution logic |
+              +----------+-----------+
+                         |
+                         | merge + explain
+                         v
+              +----------------------+
+              | Final Output (Coach) |
+              | - recommendation     |
+              | - confidence + why   |
+              | - next best action   |
+              +----------+-----------+
+                         |
+                         v
+                 UI renders result
