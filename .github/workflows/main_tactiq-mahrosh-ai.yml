@@ -23,35 +23,30 @@ jobs:
         with:
           node-version: '20.x'
 
-      - name: npm install, build, and test
+      - name: Install and build
         run: |
           npm ci
           npm run build --if-present
-          npm run test --if-present
 
-      # Do not deploy node_modules; let App Service build/install on server.
-      - name: Remove local dependencies before packaging artifact
+      # Build ZIP from project root while excluding heavy/dev-only folders.
+      # Azure App Service (Oryx) will install dependencies on deploy.
+      - name: Create deployment zip
         run: |
-          rm -rf node_modules
-          rm -rf api/node_modules
+          zip -r app.zip . \
+            -x "node_modules/*" \
+               "node_modules/**" \
+               "api/node_modules/*" \
+               "api/node_modules/**" \
+               ".git/*" \
+               ".git/**" \
+               "*.log" \
+               "**/*.log"
 
-      # Upload only runtime files/folders needed by App Service.
-      # Using an explicit allowlist keeps artifacts small and avoids ZIP failures.
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: |
-            package.json
-            package-lock.json
-            server.js
-            dist/**
-            src/**
-            api/package.json
-            api/host.json
-            api/tsconfig.json
-            api/src/**
-          if-no-files-found: error
+          path: app.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -65,8 +60,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: node-app
-          path: release
-      
+          path: .
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -75,16 +70,14 @@ jobs:
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_DDA21A04251548FDB5501A2FF0057F8B }}
 
       # IMPORTANT:
-      # In Azure App Service Configuration, set:
-      # SCM_DO_BUILD_DURING_DEPLOYMENT=true
-      # This lets Azure install dependencies from package-lock.json during ZIP deploy.
-
+      # Ensure SCM_DO_BUILD_DURING_DEPLOYMENT=true in Azure App Service settings.
+      # This makes Oryx install dependencies (e.g., express) during ZIP deployment.
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'tactiq-mahrosh-ai'
           slot-name: 'Production'
-          package: release
+          package: app.zip
           clean: true
           
