@@ -116,10 +116,10 @@ Deployed on Azure App Service via GitHub Actions (CI/CD).
 Every push to `main` triggers build + deploy.
 
 ## ARCHITECTURE 
+```txt
 
 Users (Coach / Analyst)
         |
-        | HTTPS
         v
 +---------------------------+
 | Web UI (Vite + React)     |
@@ -127,7 +127,6 @@ Users (Coach / Analyst)
 | - Player / Match Inputs   |
 +-------------+-------------+
               |
-              | HTTPS (REST)
               v
 +---------------------------+
 | Node.js + Express API     |
@@ -143,16 +142,13 @@ Users (Coach / Analyst)
 | - merges outputs into one final recommendation       |
 +----------------------+-------------------------------+
                        |
-                       | Decision: route only what’s needed (cost save)
                        v
             +----------------------------------+
             | Model Router / Policy Layer      |
-            | - choose agent(s) + model tier   |
-            | - light model for simple checks  |
-            | - strong model for complex cases |
+            | - cost-aware routing             |
+            | - selects model tier             |
             +---------+-----------+------------+
                       |           |
-          run if needed|           |run if needed
                       v           v
         +------------------+   +------------------+
         | Fatigue Agent    |   | Risk Agent       |
@@ -161,8 +157,7 @@ Users (Coach / Analyst)
         +--------+---------+   +--------+---------+
                  \              /
                   \            /
-                   \ run if needed
-                    v
+                   v          v
               +----------------------+
               | Tactical Agent       |
               | - match context      |
@@ -170,14 +165,13 @@ Users (Coach / Analyst)
               | - substitution logic |
               +----------+-----------+
                          |
-                         | merge + explain
                          v
               +----------------------+
-              | Final Output (Coach) |
+              | Final Output         |
               | - recommendation     |
-              | - confidence + why   |
-              | - next best action   |
+              | - Next Best Action  |
               +----------+-----------+
                          |
                          v
-                 UI renders result
+                  UI renders result
+```
