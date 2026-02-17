@@ -105,3 +105,9 @@ Quick setup:
 1. Copy `api/local.settings.json.example` to `api/local.settings.json`
 2. Add your Azure OpenAI values
 3. Run `cd api && func start`
+
+## Azure App Service Startup (Linux, Node 20)
+
+To serve the built Vite app on Azure App Service:
+- Ensure App Setting `WEBSITES_PORT=8080` in **Azure Portal > App Service > Configuration**.
+- App Service should run `npm start` (which serves the built site from `dist` on port `8080`).
