@@ -66,6 +66,6 @@
             "dev": "concurrently \"vite\" \"npm --prefix api run start\"",
             "api:start": "npm --prefix api run start",
             "build": "vite build",
-            "start": "serve -s dist -l $PORT"
+            "start": "npm run build && serve -s dist -l $PORT"
       }
 }
