@@ -1,4 +1,9 @@
 # tactIQ
+
+## 🚀 Live Demo
+https://tactiq-mahrosh-ai-fzdpe3hrc2a6bmgx.uaenorth-01.azurewebsites.net/
+
+
 ### AI Tactical Coach for Player and Match Decisions
 
 tactIQ is a real time tactical assistant that functions like a digital coach for cricket teams.  
@@ -106,8 +111,6 @@ Quick setup:
 2. Add your Azure OpenAI values
 3. Run `cd api && func start`
 
-## Azure App Service Startup (Linux, Node 20)
-
-To serve the built Vite app on Azure App Service:
-- Ensure App Setting `WEBSITES_PORT=8080` in **Azure Portal > App Service > Configuration**.
-- App Service should run `npm start` (which serves the built site from `dist` on port `8080`).
+## Deployment
+Deployed on Azure App Service via GitHub Actions (CI/CD).
+Every push to `main` triggers build + deploy.
