@@ -56,8 +56,8 @@ The goal is not just to show numbers but to guide decisions.
 - Frontend React + TypeScript + Vite  
 - UI Components Radix UI + Tailwind CSS  
 - Icons Lucide React  
-- Backend Azure Functions (TypeScript)  
-- Azure OpenAI (optional)  
+- Backend Azure Functions
+- Azure OpenAI 
 
 ---
 
@@ -91,15 +91,13 @@ If you change Vite proxy settings, restart the Vite dev server.
 ## LLM Setup
 
 Fatigue Agent supports two modes:
-- Rule-based fallback (default when Azure env vars are missing)
-- Azure OpenAI LLM analysis (enabled when env vars are present)
+- Rule based fallback 
+- Azure OpenAI LLM analysis 
 
 Set these in `api/local.settings.json` (or environment):
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
 - `AZURE_OPENAI_DEPLOYMENT`
-- `AZURE_OPENAI_MODEL` (alternative to deployment name)
-- `AZURE_OPENAI_API_VERSION` (optional, default `2024-06-01`)
 
 The function auto-switches to LLM mode only when all three required values are present.
 
