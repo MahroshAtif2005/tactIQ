@@ -68,3 +68,35 @@ export interface FatigueAgentResponse {
   };
   debug?: unknown;
 }
+
+export type RiskLevelInput = 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
+export type RiskSeverity = 'LOW' | 'MED' | 'HIGH' | 'CRITICAL';
+
+export interface RiskAgentRequest {
+  playerId: string;
+  fatigueIndex: number;
+  injuryRisk: RiskLevelInput;
+  noBallRisk: RiskLevelInput;
+  oversBowled: number;
+  consecutiveOvers: number;
+  heartRateRecovery?: string;
+  format?: string;
+  phase?: string;
+  intensity?: string;
+  conditions?: string;
+  target?: number;
+  score?: number;
+  over?: number;
+  balls?: number;
+}
+
+export interface RiskAgentResponse {
+  agent: 'risk';
+  severity: RiskSeverity;
+  riskScore: number;
+  headline: string;
+  explanation: string;
+  recommendation: string;
+  signals: string[];
+  echo: RiskAgentRequest;
+}

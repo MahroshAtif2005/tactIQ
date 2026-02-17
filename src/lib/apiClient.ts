@@ -1,6 +1,7 @@
-import { FatigueAgentResponse } from '../types/agents';
+import { FatigueAgentResponse, RiskAgentResponse } from '../types/agents';
 
 const fatigueEndpoint = '/api/agents/fatigue';
+const riskEndpoint = '/api/agents/risk';
 
 export class ApiClientError extends Error {
   status?: number;
@@ -55,4 +56,45 @@ export async function postFatigueAgent(
   }
 
   return response.json() as Promise<FatigueAgentResponse>;
+}
+
+export async function postRiskAgent(
+  payload: unknown,
+  signal?: AbortSignal
+): Promise<RiskAgentResponse> {
+  let response: Response;
+  try {
+    response = await fetch(riskEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  } catch (error) {
+    console.error('[RiskAgent] Network error', {
+      url: riskEndpoint,
+      error,
+    });
+    throw new ApiClientError(
+      'AI Offline. Start backend: cd api && func start',
+      riskEndpoint
+    );
+  }
+
+  if (!response.ok) {
+    const responseText = await response.text();
+    console.error('[RiskAgent] Non-2xx response', {
+      url: riskEndpoint,
+      status: response.status,
+      body: responseText,
+    });
+    throw new ApiClientError(
+      `AI Offline. Start backend: cd api && func start`,
+      riskEndpoint,
+      response.status,
+      responseText
+    );
+  }
+
+  return response.json() as Promise<RiskAgentResponse>;
 }
