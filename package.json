@@ -36,6 +36,7 @@
             "class-variance-authority": "^0.7.1",
             "clsx": "*",
             "cmdk": "^1.1.1",
+            "dotenv": "^17.3.1",
             "embla-carousel-react": "^8.6.0",
             "express": "^4.22.1",
             "input-otp": "^1.4.2",
@@ -65,6 +66,6 @@
             "dev": "concurrently \"vite\" \"npm --prefix api run start\"",
             "api:start": "npm --prefix api run start",
             "build": "vite build",
-            "start": "node server.js"
+            "start": "serve -s dist -l $PORT"
       }
 }
