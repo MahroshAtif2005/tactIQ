@@ -58,8 +58,10 @@
       open: true,
       proxy: {
         '/api': {
-          target: 'http://localhost:7071',
+          // Functions port currently 7072; change if needed.
+          target: 'http://localhost:7072',
           changeOrigin: true,
+          rewrite: (path) => path,
         },
       },
     },
