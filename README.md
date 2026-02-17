@@ -1,6 +1,6 @@
 # tactIQ
 
-## 🚀 Live Demo
+## Live Demo
 https://tactiq-mahrosh-ai-fzdpe3hrc2a6bmgx.uaenorth-01.azurewebsites.net/
 
 
