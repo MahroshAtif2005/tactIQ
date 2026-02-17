@@ -27,6 +27,7 @@ jobs:
         run: |
           npm ci
           npm run build --if-present
+          npm run test --if-present
 
       # Build ZIP from project root while excluding heavy/dev-only folders.
       # Azure App Service (Oryx) will install dependencies on deploy.
@@ -39,6 +40,10 @@ jobs:
                "api/node_modules/**" \
                ".git/*" \
                ".git/**" \
+               ".github/*" \
+               ".github/**" \
+               ".vscode/*" \
+               ".vscode/**" \
                "*.log" \
                "**/*.log"
 
