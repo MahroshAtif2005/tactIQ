@@ -25,15 +25,32 @@ jobs:
 
       - name: npm install, build, and test
         run: |
-          npm install
+          npm ci
           npm run build --if-present
           npm run test --if-present
 
+      # Do not deploy node_modules; let App Service build/install on server.
+      - name: Remove local dependencies before packaging artifact
+        run: |
+          rm -rf node_modules
+          rm -rf api/node_modules
+
+      # Upload only runtime files/folders needed by App Service.
+      # Using an explicit allowlist keeps artifacts small and avoids ZIP failures.
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: .
+          path: |
+            package.json
+            package-lock.json
+            server.js
+            dist/**
+            api/package.json
+            api/host.json
+            api/tsconfig.json
+            api/src/**
+          if-no-files-found: error
 
   deploy:
     runs-on: ubuntu-latest
@@ -47,6 +64,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: node-app
+          path: release
       
       - name: Login to Azure
         uses: azure/login@v2
@@ -61,5 +79,6 @@ jobs:
         with:
           app-name: 'tactiq-mahrosh-ai'
           slot-name: 'Production'
-          package: .
+          package: release
+          clean: true
           
