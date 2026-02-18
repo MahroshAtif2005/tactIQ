@@ -1843,7 +1843,7 @@ function Dashboard({
       className="px-4 md:px-6 py-6 w-full flex flex-col"
     >
       {/* Context Bar */}
-      <div className="bg-[#0F172A] border border-white/5 rounded-xl px-3 py-5 flex flex-wrap items-center gap-6 mb-6">
+      <div className="bg-[#0F172A] border border-white/5 rounded-xl px-3 py-4 flex flex-wrap items-center gap-6 mb-6">
         <GlowingBackButton onClick={onBack} label="Match Setup" size="large" />
         <div className="h-6 w-px bg-transparent hidden md:block" />
         <div className="flex items-center gap-6 text-sm font-bold tracking-wider text-slate-400">
@@ -2041,7 +2041,7 @@ function Dashboard({
               <div>
                  <div className="flex items-center gap-2 mb-1">
                    <Activity className={`w-6 h-6 dashboard-icon-tall-lg ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500 animate-pulse' : 'text-emerald-400'}`} />
-                   <span className={`text-sm dashboard-panel-title-tall font-bold uppercase tracking-widest ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-emerald-400'}`}>
+                   <span className={`text-base font-bold uppercase tracking-widest ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-emerald-400'}`}>
                      {activePlayer?.role === 'Batsman' ? 'Batsman Live Telemetry' : 'Bowler Live Telemetry'}
                    </span>
                  </div>
@@ -2756,20 +2756,6 @@ function Dashboard({
               {activePlayer && isCoachOutputState && (
                 <div className="shrink-0 p-6 pt-3 border-t border-white/5 bg-[#0F172A]">
                   <div className="space-y-3">
-                    <button
-                      type="button"
-                      aria-label="Run Coach Agent"
-                      onClick={() => {
-                        primeCoachAutoScroll();
-                        runAgent('auto', 'button_click');
-                      }}
-                      onMouseEnter={() => setIsRunCoachHovered(true)}
-                      onMouseLeave={() => setIsRunCoachHovered(false)}
-                      className="w-full rounded-full px-12 py-4 text-lg font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
-                      style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
-                    >
-                      <PlayCircle className="w-6 h-6 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
-                    </button>
                     <button
                       onClick={() => {
                         primeCoachAutoScroll();
