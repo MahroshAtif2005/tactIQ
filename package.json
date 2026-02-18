@@ -62,10 +62,10 @@
             "@vitejs/plugin-react-swc": "^3.10.2",
             "concurrently": "^9.0.1"
       },
-      "scripts": {
-            "dev": "concurrently \"vite\" \"npm --prefix api run start\"",
-            "api:start": "npm --prefix api run start",
-            "build": "vite build",
-            "start": "npm ci && npm run build && npx serve -s dist -l $PORT"
-      }
+   "scripts": {
+  "dev": "concurrently \"vite\" \"npm --prefix api run start\"",
+  "api:start": "npm --prefix api run start",
+  "build": "vite build",
+  "start": "npx serve -s dist -l $PORT"
+}
 }
