@@ -47,6 +47,7 @@ export interface FatigueModelResult {
 }
 
 export interface FatigueAgentResponse {
+  status?: 'ok' | 'fallback' | 'error' | 'running' | 'skipped';
   severity: Severity;
   headline: string;
   explanation: string;
@@ -91,6 +92,7 @@ export interface RiskAgentRequest {
 }
 
 export interface RiskAgentResponse {
+  status?: 'ok' | 'fallback' | 'error' | 'running' | 'skipped';
   agent: 'risk';
   severity: RiskSeverity;
   riskScore: number;

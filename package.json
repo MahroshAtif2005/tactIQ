@@ -60,12 +60,15 @@
             "@types/react": "^19.2.14",
             "@types/react-dom": "^19.2.3",
             "@vitejs/plugin-react-swc": "^3.10.2",
+            "cross-env": "^7.0.3",
             "concurrently": "^9.0.1"
       },
-   "scripts": {
-  "dev": "concurrently \"vite\" \"npm --prefix api run start\"",
-  "api:start": "npm --prefix api run start",
-  "build": "vite build",
-  "start": "npx serve -s dist -l $PORT"
-}
+  "scripts": {
+    "dev:client": "vite",
+    "dev:functions": "cross-env-shell \"cd api && func start --typescript --port ${FUNCTION_PORT:-7071}\"",
+    "dev": "concurrently \"npm run dev:functions\" \"npm run dev:client\"",
+    "api:start": "npm --prefix api run start",
+    "build": "vite build",
+    "start": "npx serve -s dist -l $PORT"
+  }
 }
