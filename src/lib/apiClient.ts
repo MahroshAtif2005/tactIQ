@@ -1,7 +1,8 @@
-import { FatigueAgentResponse, RiskAgentResponse } from '../types/agents';
+import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse } from '../types/agents';
 
 const fatigueEndpoint = '/api/agents/fatigue';
 const riskEndpoint = '/api/agents/risk';
+const orchestrateEndpoint = '/api/orchestrate';
 
 export class ApiClientError extends Error {
   status?: number;
@@ -97,4 +98,45 @@ export async function postRiskAgent(
   }
 
   return response.json() as Promise<RiskAgentResponse>;
+}
+
+export async function postOrchestrate(
+  payload: unknown,
+  signal?: AbortSignal
+): Promise<OrchestrateResponse> {
+  let response: Response;
+  try {
+    response = await fetch(orchestrateEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  } catch (error) {
+    console.error('[Orchestrate] Network error', {
+      url: orchestrateEndpoint,
+      error,
+    });
+    throw new ApiClientError(
+      'AI Offline. Start backend: cd api && func start',
+      orchestrateEndpoint
+    );
+  }
+
+  if (!response.ok) {
+    const responseText = await response.text();
+    console.error('[Orchestrate] Non-2xx response', {
+      url: orchestrateEndpoint,
+      status: response.status,
+      body: responseText,
+    });
+    throw new ApiClientError(
+      'AI Offline. Start backend: cd api && func start',
+      orchestrateEndpoint,
+      response.status,
+      responseText
+    );
+  }
+
+  return response.json() as Promise<OrchestrateResponse>;
 }

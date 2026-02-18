@@ -81,15 +81,27 @@ The goal is not just to show numbers but to guide decisions.
 1. Install dependencies:
    - `npm install`
    - `npm --prefix api install`
-2. Start frontend + Azure Functions API:
-   - `npm run dev`
+2. Start Azure Functions API:
+   - Terminal 1: `cd api && func start`
+3. Start frontend:
+   - Terminal 2: `npm run dev`
+4. Verify Functions health:
+   - `curl http://localhost:7071/api/health`
 
-Frontend runs on `http://localhost:3000` and API runs on `http://localhost:7072`.
+If port `7071` is busy, run with a different port:
+- `FUNCTION_PORT=7072 npm run dev`
+- `VITE_FUNCTIONS_PORT=7072 FUNCTION_PORT=7072 npm run dev`
 
-## Fatigue Agent endpoint
+Frontend runs on `http://localhost:5173` and Azure Functions runs on `http://localhost:7071`.
 
-- `POST http://localhost:7072/api/agents/fatigue`
-- Frontend can call `/api/agents/fatigue` (proxied by Vite in dev).
+## API endpoints
+
+- `POST http://localhost:7071/api/agents/fatigue`
+- `POST http://localhost:7071/api/agents/risk`
+- `POST http://localhost:7071/api/agents/tactical`
+- `POST http://localhost:7071/api/orchestrate`
+- `GET  http://localhost:7071/api/health`
+- Frontend calls relative paths like `/api/orchestrate` via Vite proxy.
 
 If you change Vite proxy settings, restart the Vite dev server.
 
@@ -102,12 +114,14 @@ Fatigue Agent supports two modes:
 Set these in `api/local.settings.json` (or environment):
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_DEPLOYMENT`
+- `AZURE_OPENAI_API_VERSION` (defaults to `2024-10-21` if not set)
+- `AOAI_DEPLOYMENT_STRONG`
+- `AOAI_DEPLOYMENT_FALLBACK`
 
-The function auto-switches to LLM mode only when all three required values are present.
+When AOAI config is missing, Tactical Agent now returns deterministic fallback recommendations instead of failing offline.
 
 Quick setup:
-1. Copy `api/local.settings.json.example` to `api/local.settings.json`
+1. Copy `api/local.settings.example.json` to `api/local.settings.json`
 2. Add your Azure OpenAI values
 3. Run `cd api && func start`
 

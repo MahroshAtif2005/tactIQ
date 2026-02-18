@@ -29,8 +29,23 @@ import {
   Info
 } from 'lucide-react';
 import { motion, AnimatePresence, useMotionValue, useSpring, useTransform, useMotionTemplate } from 'motion/react';
-import { FatigueAgentResponse, RiskAgentResponse } from './types/agents';
-import { ApiClientError, postFatigueAgent, postRiskAgent } from './lib/apiClient';
+import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse, TacticalCombinedDecision } from './types/agents';
+import { ApiClientError, postOrchestrate } from './lib/apiClient';
+import {
+  clamp,
+  computeBaselineRecoveryScore,
+  computeFatigue,
+  computeInjuryRisk,
+  computeLoadRatio,
+  computeNoBallRisk,
+  computeRecoveryLevelAuto,
+  computeStatus,
+  type Phase,
+  type RecoveryLevel,
+  type RecoveryMode,
+  type Role,
+  type StatusLevel,
+} from './lib/riskModel';
 
 // --- Types ---
 
@@ -81,8 +96,24 @@ interface Player {
   restStartFatigue?: number;
   restElapsedSec?: number;
   recoveryElapsed?: number;
+  recoveryOffset?: number;
   isInjured?: boolean;
   isManuallyUnfit?: boolean;
+  isUnfit?: boolean;
+  _previousState?: {
+    fatigue: number;
+    hrRecovery: 'Good' | 'Moderate' | 'Poor';
+    injuryRisk: 'Low' | 'Medium' | 'High';
+    noBallRisk: 'Low' | 'Medium' | 'High';
+    overs: number;
+    consecutiveOvers: number;
+    recoveryOffset: number;
+    isResting: boolean;
+    restElapsedSec: number;
+    recoveryElapsed: number;
+    isInjured: boolean;
+    isManuallyUnfit: boolean;
+  };
 }
 
 interface FatigueAgentPayload {
@@ -123,6 +154,20 @@ interface AiAnalysis {
 interface AgentFeedStatus {
   fatigue: 'idle' | 'loading' | 'done' | 'error';
   risk: 'idle' | 'loading' | 'done' | 'error';
+  tactical: 'idle' | 'loading' | 'done' | 'error';
+}
+
+interface OrchestrateMetaView {
+  mode: 'auto' | 'full';
+  executedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
+  usedFallbackAgents: Array<'fatigue' | 'risk' | 'tactical'>;
+}
+
+interface RouterDecisionView {
+  intent: 'fatigue_check' | 'risk_check' | 'substitution' | 'full';
+  selectedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
+  reason: string;
+  signals: Record<string, unknown>;
 }
 
 interface RiskAgentPayload {
@@ -147,11 +192,8 @@ interface TelemetrySnapshot {
   playerId: string;
   overs: number;
   consecutiveOvers: number;
-  fatigue: number;
-  injuryRisk: Player['injuryRisk'];
-  noBallRisk: Player['noBallRisk'];
-  agentFatigueOverride?: number;
-  agentRiskOverride?: Player['agentRiskOverride'];
+  isResting: boolean;
+  restElapsedSec: number;
 }
 
 // --- Mock Data ---
@@ -189,7 +231,15 @@ const INITIAL_PLAYERS: Player[] = [
 
 // --- Components ---
 
-const GlowingBackButton = ({ onClick, label = "Back" }: { onClick: () => void, label?: string }) => {
+const GlowingBackButton = ({
+  onClick,
+  label = "Back",
+  size = 'default',
+}: {
+  onClick: () => void;
+  label?: string;
+  size?: 'default' | 'large';
+}) => {
   return (
     <button 
       onClick={onClick}
@@ -200,9 +250,11 @@ const GlowingBackButton = ({ onClick, label = "Back" }: { onClick: () => void, l
         <div className="absolute inset-0 bg-emerald-500/60 blur-[8px] rounded-full opacity-0 group-hover:opacity-100 group-hover:-translate-x-1 transition-all duration-300 pointer-events-none" />
         
         {/* The Arrow */}
-        <ArrowLeft className="w-5 h-5 relative z-10 group-hover:-translate-x-1 transition-transform duration-300" />
+        <ArrowLeft
+          className={`${size === 'large' ? 'w-6 h-6' : 'w-5 h-5'} relative z-10 group-hover:-translate-x-1 transition-transform duration-300`}
+        />
       </div>
-      <span className="font-medium text-sm tracking-wide">{label}</span>
+      <span className={`font-medium ${size === 'large' ? 'text-base' : 'text-sm'} tracking-wide`}>{label}</span>
     </button>
   );
 };
@@ -254,7 +306,18 @@ const ParallaxParticles = () => {
   );
 };
 
-const Particle = ({ top, left, size, opacity, depth, blur, mouseX, mouseY }: any) => {
+interface ParticleProps {
+  top: number;
+  left: number;
+  size: number;
+  opacity: number;
+  depth: number;
+  blur: number;
+  mouseX: ReturnType<typeof useSpring>;
+  mouseY: ReturnType<typeof useSpring>;
+}
+
+const Particle = ({ top, left, size, opacity, depth, blur, mouseX, mouseY }: ParticleProps) => {
   // Movement factor based on depth. 
   // Positive multiplier = moves WITH mouse (follows).
   // Increased divisor to make it cover more distance.
@@ -397,76 +460,14 @@ function SplashScreen({ onComplete }: { onComplete: () => void }) {
 
 // --- Telemetry Logic ---
 
-const computeTelemetry = (player: Player): Partial<Player> => {
-  if (player.isInjured) {
-    return {
-      fatigue: 10,
-      injuryRisk: 'High',
-      hrRecovery: 'Poor',
-      noBallRisk: 'High'
-    };
-  }
+const normalizePhase = (phase: string): Phase => {
+  if (phase === 'Powerplay' || phase === 'Middle' || phase === 'Death') return phase;
+  return 'Middle';
+};
 
-  if (player.isManuallyUnfit) {
-    return {
-      injuryRisk: 'High',
-      noBallRisk: 'High'
-    };
-  }
-
-  if (player.agentFatigueOverride !== undefined || player.agentRiskOverride !== undefined) {
-    const overrideFatigue = Math.max(0, Math.min(10, player.agentFatigueOverride ?? player.fatigue));
-    return {
-      fatigue: overrideFatigue,
-    };
-  }
-
-  if (player.isResting) {
-    const fatigue = Math.max(0, Math.min(10, player.fatigue));
-    return {
-      fatigue,
-      injuryRisk: player.injuryRisk,
-      noBallRisk: player.noBallRisk,
-      hrRecovery: player.hrRecovery,
-    };
-  }
-
-  let fatigue = 0;
-
-  // 1. Sleep Penalty
-  // If Sleep (hrs) < 6 -> increase base fatigue by +1.5
-  // If Sleep (hrs) < 5 -> increase base fatigue by +2.5
-  if (player.sleepHours < 5) fatigue += 2.5;
-  else if (player.sleepHours < 6) fatigue += 1.5;
-
-  // 2. Base Fatigue from Total Overs (0.5 per over)
-  fatigue += player.overs * 0.5;
-
-  // 3. Consecutive Over Strain (Extra Load)
-  // Calculate marginal cost of consecutive overs (above the base 0.5)
-  for (let i = 1; i <= player.consecutiveOvers; i++) {
-    let multiplier = 1.0;
-    if (i >= 6) multiplier = 1.5;
-    else if (i >= 4) multiplier = 1.2;
-    
-    // Total cost of a consecutive over is 1.0 * multiplier
-    // We subtract 0.5 because it's already counted in Total Overs
-    const marginalCost = (1.0 * multiplier) - 0.5;
-    fatigue += marginalCost;
-  }
-
-  // Clamp Fatigue
-  fatigue = Math.min(10, Math.max(0, fatigue));
-
-  // 4. Recovery-only adjustment (risk dropdowns remain user-controlled)
-  let hrRecovery = player.hrRecovery;
-  const limit = player.baselineFatigue;
-
-  // HR Recovery Adjustment
-  if (player.sleepHours < 6 && hrRecovery === 'Good') hrRecovery = 'Moderate';
-  if (fatigue > limit && hrRecovery === 'Good') hrRecovery = 'Moderate';
-
-  return { fatigue, hrRecovery };
+const normalizeRole = (role: Player['role']): Role => {
+  if (role === 'Fast Bowler' || role === 'Spinner' || role === 'All-rounder') return role;
+  return 'All-rounder';
 };
 
 const totalBallsFromOvers = (overs: number): number => {
@@ -480,37 +481,20 @@ const formatOverStr = (balls: number): string => {
   return `${wholeOvers}.${ballPart}`;
 };
 
-const safeNum = (v: any, fallback: number): number => {
+const safeNum = (v: unknown, fallback: number): number => {
   const n = typeof v === 'number' ? v : Number(v);
   return Number.isFinite(n) ? n : fallback;
-};
-
-const computeRecoveredFatigue = (current: number, dtSeconds: number, baselineTarget: number, limit: number): number => {
-  const safeCurrent = Math.max(0, Math.min(10, safeNum(current, 3.0)));
-  const target = Math.max(0, Math.min(10, safeNum(baselineTarget, 3.0)));
-  const safeLimit = Math.max(0, Math.min(10, safeNum(limit, 6)));
-
-  let decayRate = 0.01 + (safeCurrent / 10) * 0.03;
-  decayRate = safeNum(decayRate, 0.02);
-  decayRate = Math.min(Math.max(decayRate, 0.01), 0.05);
-  if (safeCurrent <= target + 0.5) decayRate *= 0.3;
-
-  const next = Math.max(target, Math.min(10, safeCurrent - (decayRate * Math.max(1, dtSeconds))));
-  if (!Number.isFinite(next)) {
-    console.warn('NaN fatigue calc', { current: safeCurrent, decayRate, baselineTarget: target, limit: safeLimit });
-  }
-  return Number.isFinite(next) ? next : safeCurrent;
-};
-
-const deriveRiskFromFatigue = (fatigueIndex: number): 'Low' | 'Medium' | 'High' => {
-  if (fatigueIndex >= 7) return 'High';
-  if (fatigueIndex >= 5) return 'Medium';
-  return 'Low';
 };
 
 const formatMMSS = (s: number): string => {
   const safe = Math.max(0, Math.floor(s));
   return `${String(Math.floor(safe / 60)).padStart(2, '0')}:${String(safe % 60).padStart(2, '0')}`;
+};
+
+const RECOVERY_RATE_BY_HRR: Record<RecoveryLevel, number> = {
+  Good: 0.03,
+  Moderate: 0.02,
+  Poor: 0.01,
 };
 
 // --- Main App Component ---
@@ -537,42 +521,97 @@ export default function App() {
   const [agentWarning, setAgentWarning] = useState<string | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AiAnalysis | null>(null);
   const [riskAnalysis, setRiskAnalysis] = useState<AiAnalysis | null>(null);
-  const [agentFeedStatus, setAgentFeedStatus] = useState<AgentFeedStatus>({ fatigue: 'idle', risk: 'idle' });
+  const [tacticalAnalysis, setTacticalAnalysis] = useState<TacticalAgentResponse | null>(null);
+  const [combinedDecision, setCombinedDecision] = useState<TacticalCombinedDecision | null>(null);
+  const [orchestrateMeta, setOrchestrateMeta] = useState<OrchestrateMetaView | null>(null);
+  const [routerDecision, setRouterDecision] = useState<RouterDecisionView | null>(null);
+  const [agentFeedStatus, setAgentFeedStatus] = useState<AgentFeedStatus>({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
   const [analysisRequested, setAnalysisRequested] = useState(false);
+  const [recoveryMode, setRecoveryMode] = useState<RecoveryMode>('auto');
+  const [manualRecovery, setManualRecovery] = useState<RecoveryLevel>('Moderate');
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
   const playersRef = useRef<Player[]>([]);
+  const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     playersRef.current = players;
   }, [players]);
 
-  const activePlayer = players.find(p => p.id === activePlayerId) || players[0];
-  const currentTelemetry = React.useMemo(() => {
-    const player = players.find((p) => p.id === activePlayerId);
-    if (!player) return null;
+  const selectedPlayer = players.find((p) => p.id === activePlayerId) ?? null;
+  const normalizedPhase = normalizePhase(matchContext.phase);
+  const activeDerived = React.useMemo(() => {
+    if (!selectedPlayer) return null;
+    const role = normalizeRole(selectedPlayer.role);
+    const oversBowled = Math.max(0, safeNum(selectedPlayer.overs, 0));
+    const consecutiveOvers = Math.max(0, safeNum(selectedPlayer.consecutiveOvers, 0));
+    const fatigueLimit = Math.max(0, safeNum(selectedPlayer.baselineFatigue, 6));
+    const sleepHrs = Math.max(0, safeNum(selectedPlayer.sleepHours, 7));
+    const recoveryMin = Math.max(0, safeNum(selectedPlayer.recoveryTime, 45));
+    const recoveryOffset = Math.max(0, safeNum(selectedPlayer.recoveryOffset, 0));
+
+    // Baseline capacity derived from sleep/recovery baselines.
+    const baselineRecoveryScore = computeBaselineRecoveryScore(sleepHrs, recoveryMin);
+    const baseFatigue = computeFatigue(oversBowled, consecutiveOvers, normalizedPhase, role, baselineRecoveryScore);
+    const computedFatigue = clamp(baseFatigue - recoveryOffset, 0, 10);
+    const computedLoadRatio = computeLoadRatio(computedFatigue, fatigueLimit);
+    const recoveryAuto = computeRecoveryLevelAuto(baselineRecoveryScore, computedLoadRatio);
+    const computedRecoveryDisplayed = recoveryMode === 'manual' ? manualRecovery : recoveryAuto;
+    const computedInjuryRisk = computeInjuryRisk(computedLoadRatio, consecutiveOvers, role, computedRecoveryDisplayed);
+    const computedNoBallRisk = computeNoBallRisk(computedFatigue, consecutiveOvers, normalizedPhase);
+    const computedStatus = computeStatus(computedLoadRatio);
+    const isUnfit = Boolean(selectedPlayer.isUnfit);
+    const fatigue = isUnfit ? 10 : computedFatigue;
+    const loadRatio = isUnfit ? Math.max(1.1, computedLoadRatio) : computedLoadRatio;
+    const recoveryDisplayed: RecoveryLevel = isUnfit ? 'Poor' : computedRecoveryDisplayed;
+    const injuryRisk: 'Low' | 'Medium' | 'High' = isUnfit ? 'High' : computedInjuryRisk;
+    const noBallRisk: 'Low' | 'Medium' | 'High' = isUnfit ? 'High' : computedNoBallRisk;
+    const status: StatusLevel = isUnfit ? 'EXCEEDED LIMIT' : computedStatus;
+
     return {
-      playerId: player.id.toUpperCase(),
-      playerName: player.name,
-      role: player.role,
-      oversBowled: Math.max(0, safeNum(player.overs, 0)),
-      consecutiveOvers: Math.max(0, safeNum(player.consecutiveOvers, 0)),
-      fatigueIndex: Math.max(0, Math.min(10, safeNum(player.fatigue, 3.0))),
-      injuryRisk: String(player.injuryRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
-      noBallRisk: String(player.noBallRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
-      heartRateRecovery: String(player.hrRecovery || 'Moderate'),
-      fatigueLimit: Math.max(0, safeNum(player.baselineFatigue, 6)),
-      sleepHours: Math.max(0, safeNum(player.sleepHours, 7)),
-      recoveryMinutes: Math.max(0, safeNum(player.recoveryTime, 45)),
+      ...selectedPlayer,
+      fatigue,
+      hrRecovery: recoveryDisplayed,
+      injuryRisk,
+      noBallRisk,
+      loadRatio,
+      status,
+      recoveryAuto,
+      recoveryDisplayed,
+      oversBowled,
+      consecutiveOvers,
+      fatigueLimit,
+      sleepHrs,
+      recoveryMin,
+      recoveryOffset,
+    };
+  }, [selectedPlayer, normalizedPhase, recoveryMode, manualRecovery]);
+
+  const activePlayer = activeDerived;
+  const currentTelemetry = React.useMemo(() => {
+    if (!activeDerived) return null;
+    return {
+      playerId: activeDerived.id.toUpperCase(),
+      playerName: activeDerived.name,
+      role: activeDerived.role,
+      oversBowled: activeDerived.oversBowled,
+      consecutiveOvers: activeDerived.consecutiveOvers,
+      fatigueIndex: activeDerived.fatigue,
+      injuryRisk: String(activeDerived.injuryRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
+      noBallRisk: String(activeDerived.noBallRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
+      heartRateRecovery: String(activeDerived.hrRecovery || 'Moderate'),
+      fatigueLimit: activeDerived.fatigueLimit,
+      sleepHours: activeDerived.sleepHrs,
+      recoveryMinutes: activeDerived.recoveryMin,
       matchContext: {
         format: matchContext.format || 'T20',
-        phase: matchContext.phase || 'Middle',
+        phase: normalizedPhase,
         over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
         intensity: matchContext.pitch || 'Medium',
       },
     };
-  }, [players, activePlayerId, matchContext, matchState.ballsBowled]);
+  }, [activeDerived, normalizedPhase, matchContext, matchState.ballsBowled]);
 
   const updateMatchState = (updates: Partial<MatchState>) => {
     setMatchState(prev => {
@@ -624,53 +663,65 @@ export default function App() {
   // Recovery Simulation Loop
   const hasRestingPlayers = players.some((p) => p.isResting);
   useEffect(() => {
-    if (!hasRestingPlayers) return;
+    if (!hasRestingPlayers) {
+      if (recoveryIntervalRef.current) {
+        clearInterval(recoveryIntervalRef.current);
+        recoveryIntervalRef.current = null;
+      }
+      return;
+    }
+    if (recoveryIntervalRef.current) return;
 
-    const tickSeconds = 1;
-    const interval = setInterval(() => {
+    recoveryIntervalRef.current = setInterval(() => {
       setPlayers((prev) =>
         prev.map((p) => {
           if (!p.isResting) return p;
 
+          const role = normalizeRole(p.role);
+          const baselineRecoveryScore = computeBaselineRecoveryScore(
+            Math.max(0, safeNum(p.sleepHours, 7)),
+            Math.max(0, safeNum(p.recoveryTime, 45))
+          );
+          const baseFatigue = computeFatigue(
+            Math.max(0, safeNum(p.overs, 0)),
+            Math.max(0, safeNum(p.consecutiveOvers, 0)),
+            normalizedPhase,
+            role,
+            baselineRecoveryScore
+          );
+          const currentOffset = Math.max(0, safeNum(p.recoveryOffset, 0));
+          const fatigueWithOffset = clamp(baseFatigue - currentOffset, 0, 10);
+          const loadRatio = computeLoadRatio(fatigueWithOffset, Math.max(0, safeNum(p.baselineFatigue, 6)));
+          const autoRecovery = computeRecoveryLevelAuto(baselineRecoveryScore, loadRatio);
+          const recoveryLevel =
+            p.id === activePlayerId && recoveryMode === 'manual' ? manualRecovery : autoRecovery;
+          const recoveryRate = RECOVERY_RATE_BY_HRR[recoveryLevel];
+
           const startMs = p.restStartMs ?? Date.now();
           const nextElapsedSeconds = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
-          const recoveryMinutes = safeNum(p.recoveryTime, 45);
-          const recoveryTargetSec = Math.max(1, Math.floor(recoveryMinutes * 60));
-          const restProgress = Math.max(0, Math.min(1, nextElapsedSeconds / recoveryTargetSec));
-          const baselineTargetFatigue = Math.max(0, Math.min(10, safeNum(p.baselineFatigue, 3.0)));
-          const startFatigue = Math.max(0, Math.min(10, safeNum(p.restStartFatigue ?? (p.agentFatigueOverride ?? p.fatigue), 3.0)));
-          const rawNextFatigue = startFatigue - ((startFatigue - baselineTargetFatigue) * restProgress);
-          const nextFatigue = Number.isFinite(rawNextFatigue)
-            ? Math.max(0, Math.min(10, rawNextFatigue))
-            : startFatigue;
-
-          console.log('isResting:', p.isResting, 'elapsed:', nextElapsedSeconds);
 
           return {
             ...p,
             restElapsedSec: nextElapsedSeconds,
             recoveryElapsed: nextElapsedSeconds / 60,
-            ...(p.agentFatigueOverride !== undefined
-              ? {
-                  agentFatigueOverride: nextFatigue,
-                }
-              : {
-                  fatigue: nextFatigue,
-                }),
-            hrRecovery: p.hrRecovery,
+            recoveryOffset: clamp(currentOffset + recoveryRate, 0, 10),
           };
         })
       );
-    }, tickSeconds * 1000);
+    }, 1000);
 
-    return () => clearInterval(interval);
-  }, [hasRestingPlayers]);
+    return () => {
+      if (recoveryIntervalRef.current) {
+        clearInterval(recoveryIntervalRef.current);
+        recoveryIntervalRef.current = null;
+      }
+    };
+  }, [hasRestingPlayers, activePlayerId, recoveryMode, manualRecovery, normalizedPhase]);
 
   const updatePlayer = (id: string, updates: Partial<Player>) => {
     setPlayers(prev => prev.map(p => {
       if (p.id !== id) return p;
       
-      // 1. Merge updates into a temporary object
       let updated = { ...p, ...updates };
 
       if (!('agentFatigueOverride' in updates) && !('agentRiskOverride' in updates)) {
@@ -678,17 +729,11 @@ export default function App() {
         updated.agentRiskOverride = undefined;
       }
 
-      // 2. Guardrails
-      // Consecutive overs cannot exceed total overs
       if (updated.consecutiveOvers > updated.overs) {
          updated.consecutiveOvers = updated.overs;
       }
-      
-      // 3. Recompute Telemetry (Fatigue, Risk, HR) derived from inputs
-      const telemetry = computeTelemetry(updated);
-      
-      // 4. Final Merge
-      return { ...updated, ...telemetry };
+
+      return updated;
     }));
   };
 
@@ -713,9 +758,10 @@ export default function App() {
       dismissalType: 'Not Out',
       baselineFatigue: 7, 
       sleepHours: 7,
-      recoveryTime: 45
+      recoveryTime: 45,
+      recoveryOffset: 0,
     };
-    setPlayers([...players, newPlayer]);
+    setPlayers((prev) => [...prev, newPlayer]);
     setActivePlayerId(newPlayer.id);
   };
 
@@ -751,37 +797,49 @@ export default function App() {
   };
 
   const handleAddOver = () => {
-    if (activePlayer.injuryRisk === 'High' || activePlayer.isSub) return;
-    // Logic: +1 Total Over (Fatigue recomputed automatically)
-    updatePlayer(activePlayer.id, { 
-      overs: activePlayer.overs + 1, 
-    });
+    if (!activePlayer) return;
+    setPlayers((prev) =>
+      prev.map((p) => {
+        if (p.id !== activePlayer.id) return p;
+        if (activePlayer.injuryRisk === 'High' || p.isSub) return p;
+        return { ...p, overs: p.overs + 1 };
+      })
+    );
   };
 
   const handleDecreaseOver = () => {
-    if (activePlayer.overs > 0) {
-      updatePlayer(activePlayer.id, { 
-        overs: activePlayer.overs - 1,
-      });
-    }
+    if (!activePlayer) return;
+    setPlayers((prev) =>
+      prev.map((p) => (p.id === activePlayer.id ? { ...p, overs: Math.max(0, p.overs - 1) } : p))
+    );
   };
 
   const handleConsecutiveChange = (delta: number) => {
+    if (!activePlayer) return;
     if (delta > 0) {
-      if (activePlayer.injuryRisk === 'High' || activePlayer.isSub) return;
-      // Increasing consecutive also implies increasing total
-      updatePlayer(activePlayer.id, { 
-        consecutiveOvers: activePlayer.consecutiveOvers + 1,
-        overs: activePlayer.overs + 1,
-      });
+      setPlayers((prev) =>
+        prev.map((p) => {
+          if (p.id !== activePlayer.id) return p;
+          if (activePlayer.injuryRisk === 'High' || p.isSub) return p;
+          return {
+            ...p,
+            consecutiveOvers: p.consecutiveOvers + 1,
+            overs: p.overs + 1,
+          };
+        })
+      );
     } else {
-      // Decreasing consecutive (correction or just reduction)
-      const newVal = Math.max(0, activePlayer.consecutiveOvers + delta);
-      updatePlayer(activePlayer.id, { consecutiveOvers: newVal });
+      setPlayers((prev) =>
+        prev.map((p) =>
+          p.id === activePlayer.id ? { ...p, consecutiveOvers: Math.max(0, p.consecutiveOvers + delta) } : p
+        )
+      );
     }
   };
 
   const handleNewSpell = () => {
+    if (!activePlayer) return;
+    if (activePlayer.isUnfit) return;
     // Reset consecutive overs (Fatigue drops automatically)
     updatePlayer(activePlayer.id, {
       consecutiveOvers: 0,
@@ -791,27 +849,22 @@ export default function App() {
   };
 
   const handleRest = () => {
-    // Toggle Rest Mode without clearing fatigue/risk immediately
+    if (!activePlayer) return;
+    if (activePlayer.isUnfit) return;
+    // Rest toggles timer-driven recovery; fatigue changes only via recoveryOffset over time.
     setPlayers((prev) =>
       prev.map((p) => {
         if (p.id !== activePlayer.id) return p;
         const nextResting = !p.isResting;
         const elapsed = p.restElapsedSec || 0;
-        if (nextResting) {
-          console.log('Rest started');
-        } else {
-          console.log('Rest resumed');
-        }
+        const nextStartMs = nextResting ? Date.now() - elapsed * 1000 : undefined;
         return {
           ...p,
           isResting: nextResting,
-          restStartMs: nextResting ? Date.now() : p.restStartMs,
-          restStartFatigue: nextResting
-            ? safeNum(p.agentFatigueOverride ?? p.fatigue, 3.0)
-            : p.restStartFatigue,
-          restElapsedSec: nextResting ? 0 : elapsed,
-          recoveryElapsed: (nextResting ? 0 : elapsed) / 60,
-          consecutiveOvers: nextResting ? 0 : p.consecutiveOvers,
+          restStartMs: nextStartMs,
+          restStartFatigue: p.restStartFatigue,
+          restElapsedSec: elapsed,
+          recoveryElapsed: elapsed / 60,
           isManuallyUnfit: nextResting ? false : p.isManuallyUnfit,
           isInjured: nextResting ? false : p.isInjured,
         };
@@ -820,11 +873,72 @@ export default function App() {
   };
 
   const handleMarkUnfit = () => {
-    updatePlayer(activePlayer.id, {
-      isManuallyUnfit: true,
-      injuryRisk: 'High',
-      noBallRisk: 'High'
-    });
+    if (!activePlayerId) return;
+    setPlayers((prev) =>
+      prev.map((p) => {
+        if (p.id !== activePlayerId) return p;
+
+        if (!p.isUnfit) {
+          const recoveryOffset = Math.max(0, safeNum(p.recoveryOffset, 0));
+          return {
+            ...p,
+            _previousState: p._previousState ?? {
+              fatigue: Math.max(0, safeNum(p.fatigue, 0)),
+              hrRecovery: p.hrRecovery,
+              injuryRisk: p.injuryRisk,
+              noBallRisk: p.noBallRisk,
+              overs: p.overs,
+              consecutiveOvers: p.consecutiveOvers,
+              recoveryOffset,
+              isResting: Boolean(p.isResting),
+              restElapsedSec: Math.max(0, safeNum(p.restElapsedSec, 0)),
+              recoveryElapsed: Math.max(0, safeNum(p.recoveryElapsed, 0)),
+              isInjured: Boolean(p.isInjured),
+              isManuallyUnfit: Boolean(p.isManuallyUnfit),
+            },
+            isUnfit: true,
+            isManuallyUnfit: true,
+            isInjured: true,
+            fatigue: 10,
+            hrRecovery: 'Poor',
+            injuryRisk: 'High',
+            noBallRisk: 'High',
+            isResting: false,
+            restStartMs: undefined,
+          };
+        }
+
+        const backup = p._previousState;
+        if (backup) {
+          return {
+            ...p,
+            isUnfit: false,
+            _previousState: undefined,
+            isManuallyUnfit: backup.isManuallyUnfit,
+            isInjured: backup.isInjured,
+            overs: backup.overs,
+            consecutiveOvers: backup.consecutiveOvers,
+            recoveryOffset: backup.recoveryOffset,
+            fatigue: backup.fatigue,
+            hrRecovery: backup.hrRecovery,
+            injuryRisk: backup.injuryRisk,
+            noBallRisk: backup.noBallRisk,
+            isResting: backup.isResting,
+            restElapsedSec: backup.restElapsedSec,
+            recoveryElapsed: backup.recoveryElapsed,
+            restStartMs: backup.isResting ? Date.now() - backup.restElapsedSec * 1000 : undefined,
+          };
+        }
+
+        return {
+          ...p,
+          isUnfit: false,
+          _previousState: undefined,
+          isManuallyUnfit: false,
+          isInjured: false,
+        };
+      })
+    );
   };
 
   const buildAiAnalysis = (
@@ -874,28 +988,10 @@ export default function App() {
     };
   };
 
-  const captureTelemetrySnapshot = (player: Player): TelemetrySnapshot => ({
-    playerId: player.id,
-    overs: safeNum(player.overs, 0),
-    consecutiveOvers: safeNum(player.consecutiveOvers, 0),
-    fatigue: safeNum(player.fatigue, 0),
-    injuryRisk: player.injuryRisk,
-    noBallRisk: player.noBallRisk,
-    agentFatigueOverride: player.agentFatigueOverride,
-    agentRiskOverride: player.agentRiskOverride,
-  });
-
-  const isTelemetryEqual = (a: TelemetrySnapshot, b: TelemetrySnapshot): boolean =>
-    a.playerId === b.playerId &&
-    a.overs === b.overs &&
-    a.consecutiveOvers === b.consecutiveOvers &&
-    a.fatigue === b.fatigue &&
-    a.injuryRisk === b.injuryRisk &&
-    a.noBallRisk === b.noBallRisk &&
-    a.agentFatigueOverride === b.agentFatigueOverride &&
-    a.agentRiskOverride === b.agentRiskOverride;
-
-  const runAgent = async (reason: 'button_click' | 'non_button' = 'non_button') => {
+  const runAgent = async (
+    mode: 'auto' | 'full' = 'auto',
+    reason: 'button_click' | 'non_button' = 'non_button'
+  ) => {
     if (reason !== 'button_click') {
       if (import.meta.env.DEV) {
         console.warn('Coach analysis blocked', { reason });
@@ -916,119 +1012,113 @@ export default function App() {
 
     setAiAnalysis(null);
     setRiskAnalysis(null);
-    setAgentFeedStatus({ fatigue: 'loading', risk: 'idle' });
+    setTacticalAnalysis(null);
+    setCombinedDecision(null);
+    setOrchestrateMeta(null);
+    setRouterDecision(null);
+    setAgentFeedStatus({ fatigue: 'loading', risk: 'idle', tactical: 'loading' });
     setAgentWarning(null);
     setAgentState('thinking');
 
-    const activePlayerState = playersRef.current.find((p) => p.id === activePlayerId);
-    if (!activePlayerState) return;
-    const telemetrySnapshot = captureTelemetrySnapshot(activePlayerState);
-    const snapshotId = `${currentTelemetry.playerId}:${currentTelemetry.fatigueIndex}:${currentTelemetry.oversBowled}:${currentTelemetry.consecutiveOvers}:${Date.now()}`;
-    const payload: FatigueAgentPayload = {
-      playerId: currentTelemetry.playerId,
-      playerName: currentTelemetry.playerName,
-      role: currentTelemetry.role,
-      oversBowled: currentTelemetry.oversBowled,
-      consecutiveOvers: currentTelemetry.consecutiveOvers,
-      fatigueIndex: currentTelemetry.fatigueIndex,
-      injuryRisk: currentTelemetry.injuryRisk,
-      noBallRisk: currentTelemetry.noBallRisk,
-      heartRateRecovery: currentTelemetry.heartRateRecovery,
-      fatigueLimit: currentTelemetry.fatigueLimit,
-      sleepHours: currentTelemetry.sleepHours,
-      recoveryMinutes: currentTelemetry.recoveryMinutes,
-      snapshotId,
-      matchContext: currentTelemetry.matchContext,
-    };
-    const riskPayload: RiskAgentPayload = {
-      playerId: currentTelemetry.playerId,
-      fatigueIndex: currentTelemetry.fatigueIndex,
-      injuryRisk: currentTelemetry.injuryRisk,
-      noBallRisk: currentTelemetry.noBallRisk,
-      oversBowled: currentTelemetry.oversBowled,
-      consecutiveOvers: currentTelemetry.consecutiveOvers,
-      heartRateRecovery: currentTelemetry.heartRateRecovery,
-      format: currentTelemetry.matchContext.format,
-      phase: currentTelemetry.matchContext.phase,
-      intensity: currentTelemetry.matchContext.intensity,
-      conditions: matchContext.weather,
-      target: matchState.target,
-      score: matchState.runs,
-      over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
-      balls: Math.max(0, totalBallsFromOvers(matchState.totalOvers) - matchState.ballsBowled),
+    const roster = playersRef.current;
+    const batsmen = roster.filter((p) => p.role === 'Batsman' && p.inRoster !== false && !p.isDismissed);
+    const bench = roster.filter((p) => p.isSub || p.inRoster === false).map((p) => p.name).slice(0, 5);
+    const totalBalls = totalBallsFromOvers(matchState.totalOvers);
+    const ballsRemaining = Math.max(0, totalBalls - matchState.ballsBowled);
+    const oversFaced = matchState.ballsBowled / 6;
+    const currentRunRate = matchState.ballsBowled > 0 ? matchState.runs / oversFaced : 0;
+    const runsNeeded = matchState.target != null ? Math.max(matchState.target - matchState.runs, 0) : 0;
+    const requiredRunRate = ballsRemaining > 0 ? (runsNeeded / ballsRemaining) * 6 : 0;
+    const tacticalPhase = String(currentTelemetry.matchContext.phase || 'middle').toLowerCase();
+    const payload = {
+      mode,
+        player: {
+        playerId: currentTelemetry.playerId,
+        playerName: currentTelemetry.playerName,
+        role: currentTelemetry.role,
+        oversBowled: currentTelemetry.oversBowled,
+        consecutiveOvers: currentTelemetry.consecutiveOvers,
+        fatigueIndex: currentTelemetry.fatigueIndex,
+        injuryRisk: currentTelemetry.injuryRisk,
+        noBallRisk: currentTelemetry.noBallRisk,
+        heartRateRecovery: currentTelemetry.heartRateRecovery,
+        fatigueLimit: currentTelemetry.fatigueLimit,
+        sleepHours: currentTelemetry.sleepHours,
+          recoveryMinutes: currentTelemetry.recoveryMinutes,
+          isUnfit: Boolean(activePlayer?.isUnfit),
+        },
+      match: {
+        format: currentTelemetry.matchContext.format,
+        phase: currentTelemetry.matchContext.phase,
+        over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
+        intensity: currentTelemetry.matchContext.intensity,
+        conditions: matchContext.weather,
+        target: matchState.target,
+        score: matchState.runs,
+        balls: ballsRemaining,
+        tactical: {
+          phase: tacticalPhase === 'death' || tacticalPhase === 'powerplay' || tacticalPhase === 'middle' ? tacticalPhase : 'middle',
+          requiredRunRate,
+          currentRunRate,
+          wicketsInHand: Math.max(0, 10 - matchState.wickets),
+          oversRemaining: Number((ballsRemaining / 6).toFixed(1)),
+        },
+      },
+      players: {
+        striker: batsmen[0]?.name || 'Striker',
+        nonStriker: batsmen[1]?.name || batsmen[0]?.name || 'Non-striker',
+        bowler: currentTelemetry.playerName,
+        bench,
+      },
     };
     if (import.meta.env.DEV) {
-      console.log('[agent] calling', '/api/agents/fatigue');
-      console.log('Fatigue analyze payload', payload);
+      console.log('[agent] calling', '/api/orchestrate');
+      console.log('Orchestrate payload', payload);
     }
 
     try {
-      const result = await postFatigueAgent(payload, controller.signal);
+      const result: OrchestrateResponse = await postOrchestrate(payload, controller.signal);
       if (requestId !== fatigueRequestSeq.current) return;
-      if (import.meta.env.DEV) {
-        console.log('Fatigue analyze response', result);
-      }
-      const mapped = buildAiAnalysis(result, 'fatigue');
-      if (!mapped) {
-        setAgentFeedStatus({ fatigue: 'error', risk: 'idle' });
-        setAgentState('invalid');
-        setAgentWarning('Invalid AI response');
-        return;
-      }
+      const fatigueMapped = result.fatigue ? buildAiAnalysis(result.fatigue, 'fatigue') : null;
+      const riskMapped = result.risk ? buildAiAnalysis(result.risk, 'risk') : null;
+      const tacticalMapped = result.tactical || null;
 
-      setAiAnalysis(mapped);
-      setAgentFeedStatus({ fatigue: 'done', risk: 'loading' });
-      if (import.meta.env.DEV) {
-        console.log('[agent] calling', '/api/agents/risk');
-      }
-      const riskResult = await postRiskAgent(riskPayload, controller.signal);
-      if (requestId !== fatigueRequestSeq.current) return;
-      if (import.meta.env.DEV) {
-        console.log('Risk analyze response', riskResult);
-      }
-      const mappedRisk = buildAiAnalysis(riskResult, 'risk');
-      if (!mappedRisk) {
-        setAgentFeedStatus({ fatigue: 'done', risk: 'error' });
-        setAgentState('invalid');
-        setAgentWarning('Invalid risk response');
-        return;
-      }
-      setRiskAnalysis(mappedRisk);
-      setAgentFeedStatus({ fatigue: 'done', risk: 'done' });
-      setAgentState('done');
+      setAiAnalysis(fatigueMapped);
+      setRiskAnalysis(riskMapped);
+      setTacticalAnalysis(tacticalMapped);
+      setCombinedDecision((result.finalDecision || result.combinedDecision) || null);
+      setOrchestrateMeta({
+        mode: result.meta.mode,
+        executedAgents: result.meta.executedAgents,
+        usedFallbackAgents: result.meta.usedFallbackAgents || [],
+      });
+      setRouterDecision(result.routerDecision || null);
 
-      const currentPlayer = playersRef.current.find((p) => p.id === telemetrySnapshot.playerId);
-      if (currentPlayer) {
-        const nowSnapshot = captureTelemetrySnapshot(currentPlayer);
-        if (!isTelemetryEqual(telemetrySnapshot, nowSnapshot) && import.meta.env.DEV) {
-          console.error('Telemetry mutated during coach analysis; reverting', {
-            before: telemetrySnapshot,
-            after: nowSnapshot,
-          });
-          setPlayers((prev) =>
-            prev.map((p) =>
-              p.id === telemetrySnapshot.playerId
-                ? {
-                    ...p,
-                    overs: telemetrySnapshot.overs,
-                    consecutiveOvers: telemetrySnapshot.consecutiveOvers,
-                    fatigue: telemetrySnapshot.fatigue,
-                    injuryRisk: telemetrySnapshot.injuryRisk,
-                    noBallRisk: telemetrySnapshot.noBallRisk,
-                    agentFatigueOverride: telemetrySnapshot.agentFatigueOverride,
-                    agentRiskOverride: telemetrySnapshot.agentRiskOverride,
-                  }
-                : p
-            )
-          );
-        }
-      }
+      const fatigueErrored = result.errors.some((e) => e.agent === 'fatigue');
+      const riskErrored = result.errors.some((e) => e.agent === 'risk');
+      const tacticalErrored = result.errors.some((e) => e.agent === 'tactical');
+      setAgentFeedStatus({
+        fatigue: result.meta.executedAgents.includes('fatigue')
+          ? (fatigueMapped ? 'done' : fatigueErrored ? 'error' : 'idle')
+          : 'idle',
+        risk: result.meta.executedAgents.includes('risk')
+          ? (riskMapped ? 'done' : riskErrored ? 'error' : 'idle')
+          : 'idle',
+        tactical: result.meta.executedAgents.includes('tactical')
+          ? (tacticalMapped ? 'done' : tacticalErrored ? 'error' : 'idle')
+          : 'idle',
+      });
+
+      const visibleErrors = result.errors.filter((e) => !(e.agent === 'tactical' && tacticalMapped));
+      setAgentWarning(visibleErrors.length > 0 ? visibleErrors.map((e) => `${e.agent}: ${e.message}`).join(' | ') : null);
+      setAgentState(result.errors.length > 0 && !fatigueMapped && !riskMapped && !tacticalMapped ? 'offline' : 'done');
     } catch (error) {
       if ((error as Error)?.name === 'AbortError') return;
       if (requestId !== fatigueRequestSeq.current) return;
       setAgentFeedStatus((prev) => ({
         fatigue: prev.fatigue === 'loading' ? 'error' : prev.fatigue,
         risk: prev.risk === 'loading' ? 'error' : prev.risk,
+        tactical: prev.tactical === 'loading' ? 'error' : prev.tactical,
       }));
       if (error instanceof ApiClientError) {
         setAgentWarning(error.message);
@@ -1045,7 +1135,11 @@ export default function App() {
     if (!analysisRequested) {
       setAiAnalysis(null);
       setRiskAnalysis(null);
-      setAgentFeedStatus({ fatigue: 'idle', risk: 'idle' });
+      setTacticalAnalysis(null);
+      setCombinedDecision(null);
+      setOrchestrateMeta(null);
+      setRouterDecision(null);
+      setAgentFeedStatus({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
       setAgentWarning(null);
       setAgentState('idle');
     }
@@ -1062,7 +1156,11 @@ export default function App() {
     setAgentWarning(null);
     setAiAnalysis(null);
     setRiskAnalysis(null);
-    setAgentFeedStatus({ fatigue: 'idle', risk: 'idle' });
+    setTacticalAnalysis(null);
+    setCombinedDecision(null);
+    setOrchestrateMeta(null);
+    setRouterDecision(null);
+    setAgentFeedStatus({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
   };
 
   const navigateTo = (p: Page) => {
@@ -1071,7 +1169,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 overflow-x-hidden relative">
+    <div className="min-h-screen w-full flex flex-col bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 overflow-x-hidden overflow-y-auto relative">
       {/* Global Mouse Glow Cursor - Only on Landing Page */}
       {page === 'landing' && <MouseGlow />}
 
@@ -1104,7 +1202,7 @@ export default function App() {
       )}
 
       {/* Navigation Bar */}
-      <nav className="border-b border-white/10 bg-[#060B16]/90 backdrop-blur-md sticky top-0 z-50">
+      <nav className="border-b border-white/10 bg-[#060B16]/90 backdrop-blur-md sticky top-0 z-50 shrink-0">
         <div className="w-full px-3 sm:px-4">
           <div className="flex items-center justify-between h-20">
             <div className="flex items-center gap-3 cursor-pointer group" onClick={() => navigateTo('landing')}>
@@ -1219,7 +1317,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <main className="relative z-10 min-h-[calc(100vh-5rem)] w-full flex flex-col">
+      <main className="relative z-10 flex-1 w-full flex flex-col dashboard-main-offset">
         <AnimatePresence mode="wait">
           {page === 'landing' && (
             <LandingPage key="landing" onStart={() => navigateTo('setup')} />
@@ -1250,6 +1348,10 @@ export default function App() {
               agentWarning={agentWarning}
               aiAnalysis={aiAnalysis}
               riskAnalysis={riskAnalysis}
+              tacticalAnalysis={tacticalAnalysis}
+              combinedDecision={combinedDecision}
+              orchestrateMeta={orchestrateMeta}
+              routerDecision={routerDecision}
               agentFeedStatus={agentFeedStatus}
               runAgent={runAgent}
               onDismissAnalysis={dismissAnalysis}
@@ -1259,6 +1361,10 @@ export default function App() {
               handleNewSpell={handleNewSpell}
               handleRest={handleRest}
               handleMarkUnfit={handleMarkUnfit}
+              recoveryMode={recoveryMode}
+              setRecoveryMode={setRecoveryMode}
+              manualRecovery={manualRecovery}
+              setManualRecovery={setManualRecovery}
               onBack={() => navigateTo('setup')}
             />
           )}
@@ -1498,14 +1604,55 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
   );
 }
 
-function Dashboard({ 
+interface DashboardProps {
+  matchContext: MatchContext;
+  matchState: MatchState;
+  players: Player[];
+  activePlayer: (Player & { status: StatusLevel; loadRatio: number }) | null;
+  setActivePlayerId: React.Dispatch<React.SetStateAction<string>>;
+  updatePlayer: (id: string, updates: Partial<Player>) => void;
+  updateMatchState: (updates: Partial<MatchState>) => void;
+  addPlayer: (name: string, role: Player['role'], isSub?: boolean, inRoster?: boolean) => void;
+  deletePlayer: (id: string) => void;
+  movePlayerToSub: (id: string) => void;
+  agentState: 'idle' | 'thinking' | 'done' | 'offline' | 'invalid';
+  aiAnalysis: AiAnalysis | null;
+  riskAnalysis: AiAnalysis | null;
+  tacticalAnalysis: TacticalAgentResponse | null;
+  combinedDecision: TacticalCombinedDecision | null;
+  orchestrateMeta: OrchestrateMetaView | null;
+  routerDecision: RouterDecisionView | null;
+  agentFeedStatus: AgentFeedStatus;
+  agentWarning: string | null;
+  runAgent: (mode?: 'auto' | 'full', reason?: 'button_click' | 'non_button') => Promise<void>;
+  onDismissAnalysis: () => void;
+  handleAddOver: () => void;
+  handleDecreaseOver: () => void;
+  handleConsecutiveChange: (delta: number) => void;
+  handleNewSpell: () => void;
+  handleRest: () => void;
+  handleMarkUnfit: () => void;
+  recoveryMode: RecoveryMode;
+  setRecoveryMode: React.Dispatch<React.SetStateAction<RecoveryMode>>;
+  manualRecovery: RecoveryLevel;
+  setManualRecovery: React.Dispatch<React.SetStateAction<RecoveryLevel>>;
+  onBack: () => void;
+}
+
+function Dashboard({
   matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, addPlayer, deletePlayer, movePlayerToSub,
-  agentState, aiAnalysis, riskAnalysis, agentFeedStatus, agentWarning, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit, onBack 
-}: any) {
+  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit,
+  recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, onBack
+}: DashboardProps) {
   const [isAdding, setIsAdding] = useState(false);
   const [newPlayerName, setNewPlayerName] = useState('');
   const [newPlayerRole, setNewPlayerRole] = useState<Player['role']>('Fast Bowler');
   const [substitutionRecommendation, setSubstitutionRecommendation] = useState<string | null>(null);
+  const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
+  const [showRouterSignals, setShowRouterSignals] = useState(false);
+  const tacticalScrollRef = useRef<HTMLDivElement | null>(null);
+  const tacticalEndRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
 
   useEffect(() => {
     setSubstitutionRecommendation(null);
@@ -1531,8 +1678,7 @@ function Dashboard({
     onDismissAnalysis?.();
   };
 
-  const rosterPlayers = players.filter((p: Player) => p.inRoster !== false);
-  const totalCount = rosterPlayers.length;
+  const totalCount = players.filter((p: Player) => p.inRoster !== false).length;
   const isMaxed = totalCount >= 13;
   const isBatsmanActive = activePlayer?.role === 'Batsman';
 
@@ -1618,61 +1764,93 @@ function Dashboard({
   const boundaryEvents = activePlayer?.boundaryEvents || [];
   const foursCount = boundaryEvents.filter((event) => event === '4').length;
   const sixesCount = boundaryEvents.filter((event) => event === '6').length;
-  const finalDecision = aiAnalysis && riskAnalysis
+  const selectedAgents = routerDecision?.selectedAgents || orchestrateMeta?.executedAgents || [];
+  const selectedAgentSet = new Set(selectedAgents);
+  const toStatusLabel = (status: 'idle' | 'loading' | 'done' | 'error', isSelected: boolean, isFallback?: boolean): 'OK' | 'RUNNING' | 'SKIPPED' | 'FALLBACK' | 'ERROR' => {
+    if (!isSelected && orchestrateMeta?.mode === 'auto') return 'SKIPPED';
+    if (status === 'loading') return 'RUNNING';
+    if (status === 'error') return isFallback ? 'FALLBACK' : 'ERROR';
+    if (status === 'done') return isFallback ? 'FALLBACK' : 'OK';
+    return isSelected ? 'RUNNING' : 'SKIPPED';
+  };
+  const finalDecision = combinedDecision
     ? {
-        severity: aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
-          ? 'CRITICAL'
-          : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
-          ? 'HIGH'
-          : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
-            ? 'MED'
-            : 'LOW',
-        action:
-          aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
-            ? 'Immediate substitution advised. Remove from active spell now.'
-            : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
-            ? 'Rotate bowler for next over.'
-            : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
-              ? 'No immediate change; manage spell length and monitor trend.'
-              : 'No change, continue and monitor trend.',
+        severity: aiAnalysis?.severity || riskAnalysis?.severity || 'LOW',
+        action: combinedDecision.immediateAction,
         reasons: [
-          aiAnalysis.headline,
-          riskAnalysis.headline,
+          combinedDecision.rationale,
+          combinedDecision.suggestedAdjustments[0] || 'No additional adjustment suggested.',
         ],
       }
-    : null;
-  const fatigueCardTheme = {
-    wrapper: 'p-4 rounded-xl border border-emerald-500/25 border-l-[3px] border-l-emerald-400/80 bg-gradient-to-b from-emerald-500/8 to-[#162032] shadow-[0_0_18px_rgba(16,185,129,0.08)] hover:shadow-[0_0_24px_rgba(16,185,129,0.14)] transition-shadow',
-    badge: 'text-emerald-200 border-emerald-500/45 bg-emerald-900/35',
-    chip: 'text-emerald-100 border-emerald-500/35 bg-emerald-500/10 shadow-[0_0_12px_rgba(16,185,129,0.14)]',
-  };
-  const riskCardTheme = {
-    wrapper: 'p-4 rounded-xl border border-amber-500/25 border-l-[3px] border-l-amber-400/85 bg-gradient-to-b from-amber-500/8 to-[#162032] shadow-[0_0_18px_rgba(245,158,11,0.09)] hover:shadow-[0_0_26px_rgba(245,158,11,0.16)] transition-shadow',
-    badge: 'text-amber-200 border-amber-500/45 bg-amber-900/35',
-    chip: 'text-amber-100 border-amber-500/35 bg-amber-500/10 shadow-[0_0_12px_rgba(245,158,11,0.15)]',
-  };
-
+    : aiAnalysis && riskAnalysis
+      ? {
+          severity: aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
+            ? 'CRITICAL'
+            : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
+              ? 'HIGH'
+              : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
+                ? 'MED'
+                : 'LOW',
+          action:
+            aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
+              ? 'Immediate substitution advised. Remove from active spell now.'
+              : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
+                ? 'Rotate bowler for next over.'
+                : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
+                  ? 'No immediate change; manage spell length and monitor trend.'
+                  : 'No change, continue and monitor trend.',
+          reasons: [
+            aiAnalysis.headline,
+            riskAnalysis.headline,
+          ],
+        }
+      : null;
+  const isCoachOutputState =
+    agentState === 'thinking' ||
+    agentState === 'done' ||
+    agentState === 'offline' ||
+    agentState === 'invalid';
   const handleAddBoundary = (boundary: '4' | '6') => {
     if (!activePlayer) return;
     updatePlayer(activePlayer.id, { boundaryEvents: [...boundaryEvents, boundary] });
   };
+
+  const handleTacticalScroll = () => {
+    const container = tacticalScrollRef.current;
+    if (!container) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 80;
+  };
+
+  const primeCoachAutoScroll = () => {
+    stickToBottomRef.current = true;
+    requestAnimationFrame(() => {
+      tacticalEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    });
+  };
+
+  // Auto-follow new analysis output while user is near the bottom.
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    tacticalEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, agentWarning, substitutionRecommendation]);
 
 
   return (
     <motion.div 
       initial={{ opacity: 0 }} 
       animate={{ opacity: 1 }}
-      className="flex-1 p-4 md:p-6 w-full flex flex-col"
+      className="px-4 md:px-6 py-6 w-full flex flex-col"
     >
       {/* Context Bar */}
-      <div className="bg-[#0F172A] border border-white/5 rounded-xl p-3 flex flex-wrap items-center gap-6 mb-6">
-        <GlowingBackButton onClick={onBack} label="Match Setup" />
-        <div className="h-6 w-px bg-white/10 hidden md:block" />
-        <div className="flex items-center gap-6 text-xs font-bold tracking-wider text-slate-400">
-           <span className="flex items-center gap-2"><Trophy className="w-3 h-3" /> {matchContext.format}</span>
-           <span className="flex items-center gap-2 text-amber-400"><Zap className="w-3 h-3" /> {matchContext.phase}</span>
-           <span className="flex items-center gap-2"><Activity className="w-3 h-3" /> {matchContext.pitch.toUpperCase()} INTENSITY</span>
-           <span className="flex items-center gap-2 text-blue-400"><Thermometer className="w-3 h-3" /> {matchContext.weather.toUpperCase()}</span>
+      <div className="bg-[#0F172A] border border-white/5 rounded-xl px-3 py-5 flex flex-wrap items-center gap-6 mb-6">
+        <GlowingBackButton onClick={onBack} label="Match Setup" size="large" />
+        <div className="h-6 w-px bg-transparent hidden md:block" />
+        <div className="flex items-center gap-6 text-sm font-bold tracking-wider text-slate-400">
+           <span className="flex items-center gap-2"><Trophy className="w-4 h-4" /> {matchContext.format}</span>
+           <span className="flex items-center gap-2 text-amber-400"><Zap className="w-4 h-4" /> {matchContext.phase}</span>
+           <span className="flex items-center gap-2"><Activity className="w-4 h-4" /> {matchContext.pitch.toUpperCase()} INTENSITY</span>
+           <span className="flex items-center gap-2 text-blue-400"><Thermometer className="w-4 h-4" /> {matchContext.weather.toUpperCase()}</span>
            <span className="flex items-center gap-1.5 text-emerald-400">
              SCORE
              <input
@@ -1736,54 +1914,59 @@ function Dashboard({
         </div>
       </div>
 
-      <div className="flex-1 grid lg:grid-cols-12 gap-6 min-h-0">
+      <div className="w-full">
+      <div className="grid lg:grid-cols-12 gap-6 mt-2 dashboard-grid-stretch">
         
         {/* LEFT: ROSTER (EDITABLE) */}
-        <div className="lg:col-span-3 flex flex-col gap-4">
-          <div className="bg-[#0F172A] border border-white/5 rounded-2xl flex-1 flex flex-col overflow-hidden">
-            <div className="p-4 border-b border-white/5 bg-slate-900/50 flex items-center justify-between">
-               <h3 className="text-sm font-bold text-slate-400 flex items-center gap-2">
-                 <Users className="w-4 h-4" /> Roster ({totalCount}/13)
+        <div className="lg:col-span-3 flex flex-col gap-4 h-full">
+          <div className="bg-[#0F172A] border border-white/5 rounded-2xl dashboard-card-min-h h-full flex-1 flex flex-col overflow-visible">
+            <div className="px-5 py-6 border-b border-white/5 bg-slate-900/50 flex items-center justify-between">
+               <h3 className="text-sm dashboard-panel-title-tall font-bold text-slate-400 flex items-center gap-2">
+                 <Users className="w-5 h-5 dashboard-icon-tall" /> Roster ({totalCount}/13)
                </h3>
                {totalCount > 11 && (
                  <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded border border-amber-500/20">Subs Active</span>
                )}
             </div>
             
-            <div className="p-3 space-y-2 overflow-y-auto flex-1">
-              {rosterPlayers.map((p: Player, index: number) => {
+            <div className="px-4 py-5 space-y-3 overflow-visible flex-1 h-full">
+              {players.filter((p: Player) => p.inRoster !== false).map((player: Player, index: number) => {
                 const isSub = index >= 11;
                 return (
-                  <div key={p.id} className="relative group">
+                  <div key={player.id} className="relative group">
                     <button
-                      onClick={() => setActivePlayerId(p.id)}
+                      onClick={() => setActivePlayerId(player.id)}
                       className={`w-full flex items-center gap-3 p-3 rounded-xl transition-all border text-left ${
-                        activePlayer.id === p.id 
+                        activePlayer.id === player.id 
                           ? 'bg-emerald-500/10 border-emerald-500/50' 
                           : 'bg-transparent border-transparent hover:bg-white/5'
                       }`}
                     >
-                      <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shadow-lg shrink-0 ${
-                        activePlayer.id === p.id ? 'bg-emerald-500 text-black' : 'bg-slate-800 text-slate-400 group-hover:bg-slate-700'
+                      <div className={`w-8 h-8 dashboard-avatar-tall rounded-full flex items-center justify-center text-xs font-bold shadow-lg shrink-0 ${
+                        activePlayer.id === player.id ? 'bg-emerald-500 text-black' : 'bg-slate-800 text-slate-400 group-hover:bg-slate-700'
                       }`}>
-                        {p.name.charAt(0)}
+                        {player.name.charAt(0)}
                       </div>
                       <div className="min-w-0 flex-1">
-                        <div className={`font-semibold text-sm truncate ${activePlayer.id === p.id ? 'text-white' : 'text-slate-300'}`}>
-                          {p.name} {isSub && <span className="text-[10px] text-amber-500 ml-1">(Sub)</span>}
+                        <div className={`font-semibold text-sm dashboard-roster-name-tall ${activePlayer.id === player.id ? 'text-white' : 'text-slate-300'}`}>
+                          <div className="flex items-center min-w-0">
+                            <span className="truncate">{player.name}</span>
+                            {player.isUnfit && <span className="ml-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500 animate-pulse shadow-[0_0_10px_rgba(239,68,68,0.75)]" />}
+                          </div>
+                          {isSub && <span className="text-[10px] text-amber-500 ml-1 shrink-0">(Sub)</span>}
                         </div>
-                        <div className="text-[10px] uppercase font-bold text-slate-500 truncate">{p.role}</div>
+                        <div className="text-[10px] dashboard-roster-role-tall uppercase font-bold text-slate-500 truncate">{player.role}</div>
                       </div>
                       {/* Only show Chevron if not hovering (to avoid clash with delete) or just keep it simple */}
-                      {activePlayer.id === p.id && <ChevronRight className="w-4 h-4 text-emerald-500 ml-auto shrink-0 group-hover:hidden" />}
+                      {activePlayer.id === player.id && <ChevronRight className="w-5 h-5 text-emerald-500 ml-auto shrink-0 group-hover:hidden" />}
                     </button>
                     
                     {/* Delete Button (Hover) */}
                     <button 
-                      onClick={(e) => { e.stopPropagation(); deletePlayer(p.id); }}
+                      onClick={(e) => { e.stopPropagation(); deletePlayer(player.id); }}
                       className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg bg-rose-500/20 text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-rose-500 hover:text-white"
                     >
-                      <Trash2 className="w-4 h-4" />
+                      <Trash2 className="w-5 h-5" />
                     </button>
                   </div>
                 );
@@ -1797,7 +1980,7 @@ function Dashboard({
                       onClick={() => setIsAdding(true)}
                       className="w-full py-3 rounded-xl border border-dashed border-slate-700 text-slate-500 hover:text-white hover:border-emerald-500/50 hover:bg-emerald-500/5 transition-all flex items-center justify-center gap-2 text-sm font-medium"
                     >
-                      <UserPlus className="w-4 h-4" /> Add Player
+                      <UserPlus className="w-5 h-5" /> Add Player
                     </button>
                   ) : (
                     <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-700 animate-in fade-in slide-in-from-top-2">
@@ -1832,7 +2015,7 @@ function Dashboard({
                             onClick={() => setIsAdding(false)}
                             className="px-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors"
                           >
-                            <X className="w-4 h-4" />
+                            <X className="w-5 h-5" />
                           </button>
                         </div>
                       </div>
@@ -1845,9 +2028,9 @@ function Dashboard({
         </div>
 
         {/* CENTER: METRICS */}
-        <div className="lg:col-span-6 flex flex-col gap-4">
-          <div className={`bg-[#0F172A] border rounded-2xl flex-1 p-6 relative overflow-hidden flex flex-col transition-all duration-500 ${
-            (activePlayer.fatigue > activePlayer.baselineFatigue || activePlayer.injuryRisk === 'High')
+        <div className="lg:col-span-6 flex flex-col gap-4 h-full">
+          <div className={`bg-[#0F172A] border rounded-2xl dashboard-card-min-h h-full flex-1 px-6 py-6 dashboard-center-panel-y relative overflow-visible flex flex-col transition-all duration-500 ${
+            (activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High')
               ? 'border-rose-500/50 shadow-[0_0_30px_rgba(225,29,72,0.15)]' 
               : 'border-white/5'
           }`}>
@@ -1857,12 +2040,12 @@ function Dashboard({
             <div className="flex justify-between items-start mb-8 relative z-10">
               <div>
                  <div className="flex items-center gap-2 mb-1">
-                   <Activity className={`w-4 h-4 ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500 animate-pulse' : 'text-emerald-400'}`} />
-                   <span className={`text-xs font-bold uppercase tracking-widest ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-emerald-400'}`}>
+                   <Activity className={`w-6 h-6 dashboard-icon-tall-lg ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500 animate-pulse' : 'text-emerald-400'}`} />
+                   <span className={`text-sm dashboard-panel-title-tall font-bold uppercase tracking-widest ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-emerald-400'}`}>
                      {activePlayer?.role === 'Batsman' ? 'Batsman Live Telemetry' : 'Bowler Live Telemetry'}
                    </span>
                  </div>
-                 <h2 className="text-3xl font-bold text-white">{activePlayer ? activePlayer.name : 'Select Player'}</h2>
+                 <h2 className="text-3xl dashboard-main-heading-tall font-bold text-white">{activePlayer ? activePlayer.name : 'Select Player'}</h2>
               </div>
               {activePlayer && (
                 <div className="px-3 py-1 bg-slate-800 rounded border border-slate-700 text-xs font-mono text-slate-400">
@@ -1881,7 +2064,7 @@ function Dashboard({
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -8 }}
                   transition={{ duration: 0.2 }}
-                  className="relative z-10 min-h-[560px] flex flex-col"
+                  className="relative z-10 min-h-[560px] flex flex-col flex-1 overflow-visible"
                 >
                   <div className="grid grid-cols-2 gap-4 mb-8">
                     <div className="bg-[#162032] rounded-xl p-5 border border-white/5 text-center">
@@ -1896,7 +2079,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center border bg-slate-800 hover:bg-slate-700 text-white border-slate-600"
                         >
-                          <Minus className="w-4 h-4" />
+                          <Minus className="w-5 h-5" />
                         </button>
                         <button
                           onClick={() => {
@@ -1905,7 +2088,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20"
                         >
-                          <Plus className="w-4 h-4" />
+                          <Plus className="w-5 h-5" />
                         </button>
                       </div>
                     </div>
@@ -1923,7 +2106,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center border bg-slate-800 hover:bg-slate-700 text-white border-slate-600"
                         >
-                          <Minus className="w-4 h-4" />
+                          <Minus className="w-5 h-5" />
                         </button>
                         <button
                           onClick={() => {
@@ -1934,7 +2117,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20"
                         >
-                          <Plus className="w-4 h-4" />
+                          <Plus className="w-5 h-5" />
                         </button>
                       </div>
                     </div>
@@ -1990,7 +2173,7 @@ function Dashboard({
                             disabled={!activePlayer || activePlayer.isDismissed}
                             className="w-8 h-8 rounded-full border border-white/15 bg-slate-800/80 text-slate-200 flex items-center justify-center transition-all hover:border-emerald-400/40 hover:text-emerald-300 hover:shadow-[0_0_10px_rgba(16,185,129,0.25)] disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                           >
-                            <Plus className="w-3.5 h-3.5" />
+                            <Plus className="w-4 h-4" />
                           </button>
                         </div>
                         <div className="flex items-center rounded-lg border border-white/10 bg-slate-900/40 px-3 py-2">
@@ -2002,7 +2185,7 @@ function Dashboard({
                             disabled={!activePlayer || activePlayer.isDismissed}
                             className="w-8 h-8 rounded-full border border-white/15 bg-slate-800/80 text-slate-200 flex items-center justify-center transition-all hover:border-emerald-400/40 hover:text-emerald-300 hover:shadow-[0_0_10px_rgba(16,185,129,0.25)] disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                           >
-                            <Plus className="w-3.5 h-3.5" />
+                            <Plus className="w-4 h-4" />
                           </button>
                         </div>
                       </div>
@@ -2084,13 +2267,13 @@ function Dashboard({
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -8 }}
                   transition={{ duration: 0.2 }}
-                  className="relative z-10 min-h-[560px] flex flex-col"
+                  className="relative z-10 min-h-[560px] flex flex-col flex-1 overflow-visible"
                 >
-                  {(activePlayer.fatigue > activePlayer.baselineFatigue || activePlayer.injuryRisk === 'High') && (
+                  {(activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High') && (
                     <div className="mb-6 bg-rose-950/40 border border-rose-500/30 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4 animate-in fade-in slide-in-from-top-4 backdrop-blur-md shadow-2xl shadow-rose-900/10">
                       <div className="flex items-center gap-4 w-full sm:w-auto">
                         <div className="w-10 h-10 rounded-full bg-rose-500/20 flex items-center justify-center border border-rose-500/30 shrink-0 animate-pulse">
-                          <AlertTriangle className="w-5 h-5 text-rose-400" />
+                          <AlertTriangle className="w-6 h-6 text-rose-400" />
                         </div>
                         <div>
                           <h4 className="text-sm font-bold text-rose-400 uppercase tracking-wide flex items-center gap-2">
@@ -2104,7 +2287,7 @@ function Dashboard({
                         onClick={handleRemoveActive}
                         className="w-full sm:w-auto px-4 py-2.5 bg-gradient-to-r from-rose-700 to-rose-600 hover:from-rose-600 hover:to-rose-500 text-white text-xs font-bold rounded-lg transition-all shadow-lg shadow-rose-900/30 hover:shadow-rose-900/50 flex items-center justify-center gap-2 whitespace-nowrap active:scale-95 border border-rose-500/30"
                       >
-                        <LogOut className="w-3.5 h-3.5" /> Remove from Active Squad
+                        <LogOut className="w-4 h-4" /> Remove from Active Squad
                       </button>
                     </div>
                   )}
@@ -2116,17 +2299,17 @@ function Dashboard({
                       <div className="flex justify-center gap-4 mt-2 opacity-100 transition-opacity">
                         <button
                           onClick={handleDecreaseOver}
-                          disabled={activePlayer.isSub}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
+                          disabled={activePlayer.isSub || activePlayer.isUnfit}
+                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
                         >
-                          <Minus className="w-4 h-4" />
+                          <Minus className="w-5 h-5" />
                         </button>
                         <button
                           onClick={handleAddOver}
-                          disabled={activePlayer.injuryRisk === 'High' || activePlayer.isSub}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center shadow-lg transition-all ${activePlayer.injuryRisk === 'High' || activePlayer.isSub ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none' : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
+                          disabled={activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit}
+                          className={`w-8 h-8 rounded-full flex items-center justify-center shadow-lg transition-all ${activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none' : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
                         >
-                          <Plus className="w-4 h-4" />
+                          <Plus className="w-5 h-5" />
                         </button>
                       </div>
                     </div>
@@ -2137,17 +2320,17 @@ function Dashboard({
                       <div className="flex justify-center gap-4 mt-2 opacity-100 transition-opacity">
                         <button
                           onClick={() => handleConsecutiveChange(-1)}
-                          disabled={activePlayer.isSub}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
+                          disabled={activePlayer.isSub || activePlayer.isUnfit}
+                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
                         >
-                          <Minus className="w-4 h-4" />
+                          <Minus className="w-5 h-5" />
                         </button>
                         <button
                           onClick={() => handleConsecutiveChange(1)}
-                          disabled={activePlayer.injuryRisk === 'High' || activePlayer.isSub}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.injuryRisk === 'High' || activePlayer.isSub ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-700 hover:bg-slate-600 text-white border-slate-600'}`}
+                          disabled={activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit}
+                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-700 hover:bg-slate-600 text-white border-slate-600'}`}
                         >
-                          <Plus className="w-4 h-4" />
+                          <Plus className="w-5 h-5" />
                         </button>
                       </div>
                     </div>
@@ -2158,10 +2341,10 @@ function Dashboard({
                   <div className="grid grid-cols-2 gap-x-8 gap-y-6 mt-6">
                     <div>
                       <div className="flex justify-between mb-2">
-                        <label className={`text-xs font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
-                          <Activity className={`w-3 h-3 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Fatigue Index (0-10)
+                        <label className={`text-sm font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
+                          <Activity className={`w-4 h-4 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Fatigue Index (0-10)
                         </label>
-                        <span className={`font-mono ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-white'}`}>{activePlayer.fatigue.toFixed(1)}</span>
+                        <span className={`text-lg font-mono ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-white'}`}>{activePlayer.fatigue.toFixed(1)}</span>
                       </div>
                       <div className="h-3 bg-slate-800 rounded-full overflow-hidden">
                         <motion.div
@@ -2169,6 +2352,17 @@ function Dashboard({
                           animate={{ width: `${(activePlayer.fatigue / 10) * 100}%` }}
                           className={`h-full rounded-full ${activePlayer.fatigue > 7 ? 'bg-rose-500' : activePlayer.fatigue > 4 ? 'bg-amber-400' : 'bg-emerald-500'}`}
                         />
+                      </div>
+                      <div className="mt-2">
+                        <span className={`text-xs font-bold uppercase px-2 py-1 rounded border ${
+                          activePlayer.status === 'EXCEEDED LIMIT'
+                            ? 'text-rose-400 border-rose-500/40 bg-rose-500/10'
+                            : activePlayer.status === 'APPROACHING LIMIT'
+                              ? 'text-amber-400 border-amber-500/40 bg-amber-500/10'
+                              : 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10'
+                        }`}>
+                          {activePlayer.status}
+                        </span>
                       </div>
                       <AnimatePresence>
                         {(activePlayer.isResting || (activePlayer.restElapsedSec || 0) > 0) && (
@@ -2200,13 +2394,32 @@ function Dashboard({
                     </div>
 
                     <div>
-                      <label className={`text-xs font-bold mb-2 block flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
-                        <AlertTriangle className={`w-3 h-3 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Heart Rate Recovery
-                      </label>
+                      <div className="mb-2 flex items-center justify-between">
+                        <label className={`text-sm font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
+                          <AlertTriangle className={`w-4 h-4 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Heart Rate Recovery
+                        </label>
+                        <div className="inline-flex items-center rounded-md border border-slate-700 bg-[#162032] p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setRecoveryMode('auto')}
+                            className={`px-2 py-1 text-xs font-bold rounded ${recoveryMode === 'auto' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
+                          >
+                            Auto
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRecoveryMode('manual')}
+                            className={`px-2 py-1 text-xs font-bold rounded ${recoveryMode === 'manual' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
+                          >
+                            Manual
+                          </button>
+                        </div>
+                      </div>
                       <select
-                        value={activePlayer.hrRecovery}
-                        onChange={(e) => updatePlayer(activePlayer.id, { hrRecovery: e.target.value })}
-                        className={`w-full bg-[#162032] text-sm rounded-lg px-3 py-2 border focus:outline-none ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 border-rose-500/50 bg-rose-500/5' : 'text-white border-slate-700'}`}
+                        value={recoveryMode === 'manual' ? manualRecovery : activePlayer.hrRecovery}
+                        onChange={(e) => setManualRecovery(e.target.value as RecoveryLevel)}
+                        disabled={recoveryMode === 'auto'}
+                        className={`w-full bg-[#162032] text-base rounded-lg px-3 py-2.5 border focus:outline-none ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 border-rose-500/50 bg-rose-500/5' : 'text-white border-slate-700'} ${recoveryMode === 'auto' ? 'opacity-80 cursor-not-allowed' : ''}`}
                       >
                         <option value="Good">Good</option>
                         <option value="Moderate">Moderate</option>
@@ -2215,52 +2428,41 @@ function Dashboard({
                     </div>
 
                     <div className={`bg-[#162032] p-3 rounded-lg flex items-center justify-between border transition-all duration-300 ${activePlayer.injuryRisk === 'High' ? 'border-rose-500/50 bg-rose-500/10 shadow-[0_0_15px_rgba(244,63,94,0.15)]' : 'border-white/5'}`}>
-                      <span className={`text-sm font-medium ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>Injury Risk</span>
-                      <select
-                        value={activePlayer.injuryRisk}
-                        onChange={(e) => updatePlayer(activePlayer.id, { injuryRisk: e.target.value })}
-                        className={`bg-transparent text-sm font-bold text-right outline-none ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : activePlayer.injuryRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}
-                      >
-                        <option value="Low">LOW</option>
-                        <option value="Medium">MED</option>
-                        <option value="High">HIGH</option>
-                      </select>
+                      <span className={`text-base font-medium ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>Injury Risk</span>
+                      <span className={`text-base font-bold text-right ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : activePlayer.injuryRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
+                        {activePlayer.injuryRisk.toUpperCase()}
+                      </span>
                     </div>
 
                     <div className={`bg-[#162032] p-3 rounded-lg flex items-center justify-between border transition-all duration-300 ${activePlayer.noBallRisk === 'High' ? 'border-rose-500/50 bg-rose-500/10 shadow-[0_0_15px_rgba(244,63,94,0.15)]' : 'border-white/5'}`}>
-                      <span className={`text-sm font-medium ${activePlayer.noBallRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>No-Ball Risk</span>
-                      <select
-                        value={activePlayer.noBallRisk}
-                        onChange={(e) => updatePlayer(activePlayer.id, { noBallRisk: e.target.value })}
-                        className={`bg-transparent text-sm font-bold text-right outline-none ${activePlayer.noBallRisk === 'High' ? 'text-rose-500' : activePlayer.noBallRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}
-                      >
-                        <option value="Low">LOW</option>
-                        <option value="Medium">MED</option>
-                        <option value="High">HIGH</option>
-                      </select>
+                      <span className={`text-base font-medium ${activePlayer.noBallRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>No-Ball Risk</span>
+                      <span className={`text-base font-bold text-right ${activePlayer.noBallRisk === 'High' ? 'text-rose-500' : activePlayer.noBallRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
+                        {activePlayer.noBallRisk.toUpperCase()}
+                      </span>
                     </div>
                   </div>
 
                   <div className="mt-auto pt-8">
-                    <p className="text-[10px] font-bold text-slate-500 uppercase mb-3">Quick Actions</p>
+                    <p className="text-xs font-bold text-slate-500 uppercase mb-3">Quick Actions</p>
                     <div className="grid grid-cols-3 gap-3">
-                      <button onClick={handleMarkUnfit} className="bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 p-3 rounded-lg transition-all flex flex-col items-center group shadow-lg shadow-rose-900/10">
-                        <Zap className="w-5 h-5 mb-1" />
-                        <span className="text-xs font-bold">Mark Unfit</span>
-                        <span className="text-[9px] opacity-70">High injury risk</span>
+                      <button onClick={handleMarkUnfit} className={`border p-4 rounded-lg transition-all flex flex-col items-center group shadow-lg ${activePlayer.isUnfit ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-emerald-900/10' : 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/30 shadow-rose-900/10'}`}>
+                        <Zap className="w-6 h-6 mb-1" />
+                        <span className="text-sm font-bold">{activePlayer.isUnfit ? 'Mark Fit' : 'Mark Unfit'}</span>
+                        <span className="text-[10px] opacity-70">{activePlayer.isUnfit ? 'Restore player state' : 'Force critical state'}</span>
                       </button>
-                      <button onClick={handleNewSpell} className="bg-slate-800 hover:bg-slate-700 text-slate-300 p-3 rounded-lg transition-colors flex flex-col items-center border border-slate-700">
-                        <CheckCircle2 className="w-5 h-5 mb-1" />
-                        <span className="text-xs font-bold">New Spell</span>
-                        <span className="text-[9px] opacity-70">Reset count</span>
+                      <button onClick={handleNewSpell} disabled={activePlayer.isUnfit} className={`p-4 rounded-lg transition-colors flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}>
+                        <CheckCircle2 className="w-6 h-6 mb-1" />
+                        <span className="text-sm font-bold">New Spell</span>
+                        <span className="text-[10px] opacity-70">Reset count</span>
                       </button>
                       <button
                         onClick={handleRest}
-                        className={`p-3 rounded-lg transition-all flex flex-col items-center border ${activePlayer.isResting ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
+                        disabled={activePlayer.isUnfit}
+                        className={`p-4 rounded-lg transition-all flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : activePlayer.isResting ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
                       >
-                        <Wind className={`w-5 h-5 mb-1 ${activePlayer.isResting ? 'animate-pulse' : ''}`} />
-                        <span className="text-xs font-bold">{activePlayer.isResting ? 'Resting...' : 'Rest'}</span>
-                        <span className="text-[9px] opacity-70">{activePlayer.isResting ? 'Click to Resume' : 'Start Recovery'}</span>
+                        <Wind className={`w-6 h-6 mb-1 ${activePlayer.isResting ? 'animate-pulse' : ''}`} />
+                        <span className="text-sm font-bold">{activePlayer.isResting ? 'Resting...' : 'Rest'}</span>
+                        <span className="text-[10px] opacity-70">{activePlayer.isResting ? 'Click to Resume' : 'Start Recovery'}</span>
                       </button>
                     </div>
                   </div>
@@ -2269,7 +2471,7 @@ function Dashboard({
             </AnimatePresence>
             ) : (
                <div className="flex flex-col items-center justify-center h-full text-slate-500">
-                 <Users className="w-12 h-12 mb-4 opacity-50" />
+                 <Users className="w-14 h-14 mb-4 opacity-50" />
                  <p>Select a player from the roster to view metrics.</p>
                </div>
             )}
@@ -2278,213 +2480,333 @@ function Dashboard({
         </div>
 
         {/* RIGHT: COACH AGENT */}
-        <div className="lg:col-span-3 flex flex-col gap-4">
-           <div className="bg-[#0F172A] border border-white/5 rounded-2xl flex-1 p-6 relative flex flex-col overflow-hidden">
-              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50" />
+        <div className="lg:col-span-3 flex flex-col gap-4 h-full">
+           <div className="dashboard-card-min-h dashboard-coach-fixed-height h-full flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50 rounded-t-2xl" />
               
-              <div className="w-full flex items-center justify-between mb-8 absolute top-6 px-6">
-                <span className="text-sm font-bold text-slate-300 flex items-center gap-2">
-                  <Shield className="w-4 h-4 text-indigo-400" /> Tactical Coach AI
-                </span>
+              <div className="shrink-0 p-6 pb-3">
+                <div className="w-full flex items-center justify-between">
+                  <span className="text-xl dashboard-panel-title-tall font-bold text-slate-300 flex items-center gap-2">
+                    <Shield className="w-10 h-10 dashboard-title-icon-tall text-emerald-400 drop-shadow-[0_0_6px_rgba(16,185,129,0.6)]" /> Tactical Coach AI
+                  </span>
+                </div>
               </div>
+
+              <div className="flex-1 min-h-0 flex flex-col overflow-hidden px-6 py-5">
               
               {activePlayer ? (
               <>
-               {agentWarning && (
-                 <div className="w-full px-6 mb-4">
-                   <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-3 py-2 text-left">
-                     {agentWarning}
-                   </div>
-                 </div>
-               )}
-               {showBatsmanAiAlert && (
-                 <motion.div
-                   initial={{ opacity: 0, y: 10 }}
-                   animate={{ opacity: 1, y: 0 }}
-                   className="mb-6 w-full px-6"
-                 >
-                    <div className={`rounded-xl p-5 relative overflow-hidden border ${isPressureCritical ? 'bg-rose-950/20 border-rose-500/30' : 'bg-amber-950/20 border-amber-500/30'}`}>
-                       <div className="flex items-start gap-3">
-                         <div className={`w-9 h-9 rounded-lg flex items-center justify-center border shrink-0 ${isPressureCritical ? 'bg-rose-500/15 border-rose-500/40' : 'bg-amber-500/15 border-amber-500/40'}`}>
-                           <AlertTriangle className={`w-4 h-4 ${isPressureCritical ? 'text-rose-400' : 'text-amber-300'}`} />
-                         </div>
-                         <div className="text-left">
-                           <h4 className={`text-xs font-bold uppercase tracking-wide mb-2 ${isPressureCritical ? 'text-rose-300' : 'text-amber-200'}`}>
-                             {tacticalAlertTitle}
-                           </h4>
-                           <p className="text-xs text-slate-200 mb-2">{tacticalAlertText}</p>
-                           <p className="text-xs text-slate-300 mb-3">
-                             Pressure {pressureIndex.toFixed(1)}/10 | RR {currentRunRate.toFixed(2)} (Req {requiredRunRate.toFixed(2)}) | SR {batsmanStrikeRate.toFixed(1)} / Req {requiredStrikeRate.toFixed(1)}
-                           </p>
-                           <p className="text-[11px] text-slate-400 mb-3">
-                             {alertWhyLine}
-                           </p>
-                           <div className="space-y-1.5">
-                             {batsmanRecommendations.map((tip, index) => (
-                               <p key={index} className="text-xs text-slate-200 leading-relaxed">• {tip}</p>
-                             ))}
-                           </div>
-                         </div>
-                       </div>
-                    </div>
-                 </motion.div>
-               )}
-               {substitutionRecommendation && (
-                 <motion.div 
-                   initial={{ opacity: 0, y: 10 }}
-                   animate={{ opacity: 1, y: 0 }}
-                   className="mb-8 w-full px-6"
-                 >
-                    <div className="bg-rose-950/20 border border-rose-500/20 rounded-xl p-6 relative overflow-hidden group">
-                       <div className="absolute top-0 right-0 w-32 h-32 bg-rose-500/5 blur-[40px] rounded-full pointer-events-none group-hover:bg-rose-500/10 transition-colors" />
-                       <div className="flex items-start gap-4 relative z-10">
-                          <div className="w-10 h-10 rounded-lg bg-rose-500/10 flex items-center justify-center border border-rose-500/20 shrink-0">
-                             <AlertTriangle className="w-5 h-5 text-rose-400" />
-                          </div>
-                          <div>
-                             <h4 className="text-xs font-bold text-rose-400 uppercase tracking-wide mb-2 flex items-center gap-2">
-                                Strategic Intervention
-                                <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-rose-500 shadow-[0_0_8px_#f43f5e]" />
-                             </h4>
-                             <p className="text-sm text-rose-100/90 leading-relaxed font-medium">
-                               {substitutionRecommendation}
-                             </p>
-                          </div>
-                       </div>
-                    </div>
-                 </motion.div>
-               )}
               {/* EMPTY_STATE_MARKER */}
-              {agentState === 'idle' && !substitutionRecommendation && (
-                <div className="h-full w-full flex flex-col items-center justify-center px-6">
-                  <div className="flex flex-col items-center -mt-10">
-                    <div className="w-28 h-28 rounded-3xl flex items-center justify-center bg-gradient-to-br from-indigo-500/25 via-purple-500/20 to-blue-500/15 border border-white/10 shadow-[0_0_40px_rgba(99,102,241,0.25)] backdrop-blur-md mb-8">
-                      <Shield className="w-12 h-12 text-white/90" />
+              {!isCoachOutputState && !substitutionRecommendation && (
+                <div className="flex-1 flex flex-col items-center justify-center">
+                  <div className="w-full flex flex-col items-center gap-4">
+                    <div className="w-24 h-24 dashboard-coach-shield-container-tall dashboard-coach-shift-up rounded-3xl flex items-center justify-center bg-gradient-to-br from-indigo-500/25 via-purple-500/20 to-blue-500/15 border border-white/10 shadow-[0_0_40px_rgba(99,102,241,0.25)] backdrop-blur-md">
+                      <div className="relative overflow-visible">
+                        <div
+                          className="absolute inset-0 -z-10 rounded-full blur-xl"
+                          style={{
+                            width: 80,
+                            height: 88,
+                            left: '50%',
+                            top: '50%',
+                            transform: 'translate(-50%, -50%)',
+                            background: 'rgba(16,185,129,0.18)',
+                            boxShadow: '0 0 35px rgba(16,185,129,0.35)',
+                          }}
+                        />
+                        <div
+                          className="relative rounded-full p-4"
+                          style={{
+                            boxShadow: '0 0 18px rgba(16,185,129,0.25)',
+                          }}
+                        >
+                          <Shield
+                            className="w-14 h-14 dashboard-coach-shield-glyph-tall text-emerald-400"
+                            style={{
+                              filter: 'drop-shadow(0 0 10px rgba(16,185,129,0.7))',
+                            }}
+                          />
+                        </div>
+                      </div>
                     </div>
-                    <h3 className="text-2xl font-semibold text-white/95 mb-12 text-center">Ready to Analyze</h3>
+                    <button
+                      type="button"
+                      aria-label="Run Coach Agent"
+                      onClick={() => {
+                        primeCoachAutoScroll();
+                        runAgent('auto', 'button_click');
+                      }}
+                      onMouseEnter={() => setIsRunCoachHovered(true)}
+                      onMouseLeave={() => setIsRunCoachHovered(false)}
+                      className="w-full rounded-full px-12 py-5 text-lg font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
+                      style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
+                    >
+                      <PlayCircle className="w-6 h-6 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    aria-label="Run Coach Agent"
-                    onClick={() => runAgent('button_click')}
-                    className="w-full max-w-[420px] h-14 rounded-full px-10 text-lg font-semibold flex items-center justify-center gap-3 bg-gradient-to-r from-indigo-500 via-purple-500 to-blue-500 shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:brightness-110 hover:shadow-[0_12px_55px_rgba(99,102,241,0.45)] active:scale-[0.99] transition cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
-                  >
-                    <PlayCircle className="w-5 h-5 shrink-0" /> Run Coach Agent
-                  </button>
                 </div>
               )}
 
-              {(agentState === 'thinking' || agentState === 'done' || agentState === 'offline' || agentState === 'invalid') && (
-                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full mt-10 text-left overflow-y-auto max-h-[62vh] pr-1 space-y-5">
-                  <div className={fatigueCardTheme.wrapper}>
-                    <div className="flex items-center justify-between mb-2">
-                      <h4 className="text-sm font-bold text-white">Fatigue Agent</h4>
-                      <span className={`text-[10px] px-2 py-0.5 rounded border ${fatigueCardTheme.badge}`}>
-                        {agentFeedStatus.fatigue === 'loading'
-                          ? 'LOADING'
-                          : agentFeedStatus.fatigue === 'done'
-                            ? `${aiAnalysis?.severity ?? 'LOW'} · F ${safeNum(aiAnalysis?.fatigueIndex, 0).toFixed(1)}`
-                            : agentFeedStatus.fatigue.toUpperCase()}
+              {isCoachOutputState && (
+                <div className="flex-1 min-h-0 flex flex-col">
+                  <div className="flex-none mb-3 rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
+                    {agentState === 'thinking' ? 'Analyzing...' : 'Analysis Output'}
+                  </div>
+                  <div ref={tacticalScrollRef} onScroll={handleTacticalScroll} className="tactical-scroll flex-1 min-h-0 overflow-y-auto pr-2 space-y-5">
+                  {agentWarning && (
+                    <div className="w-full">
+                      <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-3 py-2 text-left">
+                        {agentWarning}
+                      </div>
+                    </div>
+                  )}
+                  {showBatsmanAiAlert && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="w-full"
+                    >
+                      <div className={`rounded-xl p-5 relative overflow-hidden border ${isPressureCritical ? 'bg-rose-950/20 border-rose-500/30' : 'bg-amber-950/20 border-amber-500/30'}`}>
+                        <div className="flex items-start gap-3">
+                          <div className={`w-9 h-9 rounded-lg flex items-center justify-center border shrink-0 ${isPressureCritical ? 'bg-rose-500/15 border-rose-500/40' : 'bg-amber-500/15 border-amber-500/40'}`}>
+                            <AlertTriangle className={`w-5 h-5 ${isPressureCritical ? 'text-rose-400' : 'text-amber-300'}`} />
+                          </div>
+                          <div className="text-left">
+                            <h4 className={`text-xs font-bold uppercase tracking-wide mb-2 ${isPressureCritical ? 'text-rose-300' : 'text-amber-200'}`}>
+                              {tacticalAlertTitle}
+                            </h4>
+                            <p className="text-xs text-slate-200 mb-2">{tacticalAlertText}</p>
+                            <p className="text-xs text-slate-300 mb-3">
+                              Pressure {pressureIndex.toFixed(1)}/10 | RR {currentRunRate.toFixed(2)} (Req {requiredRunRate.toFixed(2)}) | SR {batsmanStrikeRate.toFixed(1)} / Req {requiredStrikeRate.toFixed(1)}
+                            </p>
+                            <p className="text-[11px] text-slate-400 mb-3">
+                              {alertWhyLine}
+                            </p>
+                            <div className="space-y-1.5">
+                              {batsmanRecommendations.map((tip, index) => (
+                                <p key={index} className="text-xs text-slate-200 leading-relaxed">• {tip}</p>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                  {substitutionRecommendation && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="w-full"
+                    >
+                      <div className="bg-rose-950/20 border border-rose-500/20 rounded-xl p-6 relative overflow-hidden group">
+                        <div className="absolute top-0 right-0 w-32 h-32 bg-rose-500/5 blur-[40px] rounded-full pointer-events-none group-hover:bg-rose-500/10 transition-colors" />
+                        <div className="flex items-start gap-4 relative z-10">
+                          <div className="w-10 h-10 rounded-lg bg-rose-500/10 flex items-center justify-center border border-rose-500/20 shrink-0">
+                            <AlertTriangle className="w-6 h-6 text-rose-400" />
+                          </div>
+                          <div>
+                            <h4 className="text-xs font-bold text-rose-400 uppercase tracking-wide mb-2 flex items-center gap-2">
+                              Strategic Intervention
+                              <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-rose-500 shadow-[0_0_8px_#f43f5e]" />
+                            </h4>
+                            <p className="text-sm text-rose-100/90 leading-relaxed font-medium">
+                              {substitutionRecommendation}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full text-left pr-1 space-y-5">
+                  <div className="p-4 rounded-xl border border-indigo-400/35 bg-[#162032]">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-sm font-bold text-white">Tactical Coach AI</h4>
+                      <span className="text-[10px] px-2 py-0.5 rounded border border-indigo-400/40 text-indigo-200 bg-indigo-500/10">
+                        {orchestrateMeta?.mode === 'full' ? 'FULL COMBINED' : 'AUTO ROUTING'}
                       </span>
                     </div>
-                    {agentFeedStatus.fatigue === 'loading' && (
-                      <p className="text-xs text-slate-400">Analyzing telemetry...</p>
-                    )}
-                    {agentFeedStatus.fatigue === 'error' && (
-                      <p className="text-xs text-amber-300">Fatigue agent unavailable. Start backend: <span className="font-mono">cd api && func start</span></p>
-                    )}
-                    {agentFeedStatus.fatigue === 'done' && aiAnalysis && (
-                      <>
-                        <p className="text-xs font-semibold text-slate-100 mb-1">{aiAnalysis.headline}</p>
-                        <p className="text-xs text-slate-300 mb-2 line-clamp-3">{aiAnalysis.explanation}</p>
-                        <p className="text-[10px] text-slate-400 mb-2">
-                          Fatigue ({safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1)}) | Injury {aiAnalysis.injuryRisk} | No-ball {aiAnalysis.noBallRisk}
-                        </p>
-                        <div className="flex flex-wrap gap-1.5 mb-2">
-                          {aiAnalysis.signals.map((signal, i) => (
-                            <span key={`${signal}-${i}`} className={`text-[10px] px-2 py-0.5 rounded border ${fatigueCardTheme.chip}`}>{signal}</span>
-                          ))}
-                        </div>
-                        <p className="text-xs text-white">{aiAnalysis.recommendation}</p>
-                      </>
+                    <p className="text-[11px] text-slate-400 mt-1">Router intent: {routerDecision?.intent || 'monitor'}</p>
+                  </div>
+
+                  <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
+                    <p className="text-xs font-bold text-slate-200 mb-2">Model Router</p>
+                    <div className="flex flex-wrap gap-1.5 mb-2">
+                      {(routerDecision?.selectedAgents || orchestrateMeta?.executedAgents || []).map((agent) => (
+                        <span key={agent} className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200 bg-slate-800">
+                          {agent.toUpperCase()}
+                        </span>
+                      ))}
+                    </div>
+                    <p className="text-xs text-slate-300 mb-2">{routerDecision?.reason || 'Router selecting agents from current signals.'}</p>
+                    <button
+                      onClick={() => setShowRouterSignals((v) => !v)}
+                      className="text-[11px] text-slate-400 hover:text-slate-200"
+                    >
+                      {showRouterSignals ? 'Hide Signals' : 'Show Signals'}
+                    </button>
+                    {showRouterSignals && (
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-slate-400">
+                        {Object.entries(routerDecision?.signals || {}).map(([k, v]) => (
+                          <div key={k} className="flex justify-between gap-2 border border-slate-800 rounded px-2 py-1">
+                            <span>{k}</span>
+                            <span className="text-slate-200">{String(v)}</span>
+                          </div>
+                        ))}
+                      </div>
                     )}
                   </div>
 
-                  <div className={riskCardTheme.wrapper}>
-                    <div className="flex items-center justify-between mb-2">
-                      <h4 className="text-sm font-bold text-white">{agentFeedStatus.risk === 'error' ? 'Risk Agent (offline)' : 'Risk Agent'}</h4>
-                      <span className={`text-[10px] px-2 py-0.5 rounded border ${
-                        agentFeedStatus.risk === 'error'
-                          ? 'text-rose-300 border-rose-500/40 bg-rose-500/10'
-                          : riskCardTheme.badge
-                      }`}>
-                        {agentFeedStatus.risk === 'loading'
-                          ? 'LOADING'
-                          : agentFeedStatus.risk === 'done'
-                            ? `${riskAnalysis?.severity ?? 'LOW'} · R ${Math.round(safeNum(riskAnalysis?.riskScore, 0))}`
-                            : agentFeedStatus.risk.toUpperCase()}
-                      </span>
-                    </div>
-                    {agentFeedStatus.risk === 'loading' && (
-                      <p className="text-xs text-slate-400">Aggregating risk signals...</p>
-                    )}
-                    {agentFeedStatus.risk === 'error' && (
-                      <p className="text-xs text-amber-300">Risk agent unavailable. Start backend: <span className="font-mono">cd api && func start</span></p>
-                    )}
-                    {agentFeedStatus.risk === 'done' && riskAnalysis && (
-                      <>
-                        <p className="text-xs font-semibold text-slate-100 mb-1">{riskAnalysis.headline}</p>
-                        <p className="text-xs text-slate-300 mb-2 line-clamp-3">{riskAnalysis.explanation}</p>
-                        <p className="text-[10px] text-slate-400 mb-2">
-                          Risk Score ({Math.round(safeNum(riskAnalysis.riskScore, 0))}) | Injury {riskAnalysis.injuryRisk} | No-ball {riskAnalysis.noBallRisk}
-                        </p>
-                        <div className="flex flex-wrap gap-1.5 mb-2">
-                          {riskAnalysis.signals.map((signal, i) => (
-                            <span key={`${signal}-${i}`} className={`text-[10px] px-2 py-0.5 rounded border ${riskCardTheme.chip}`}>{signal}</span>
-                          ))}
+                  {[
+                    {
+                      key: 'fatigue' as const,
+                      title: 'Fatigue Agent',
+                      subtitle: 'Workload and recovery drift',
+                      status: toStatusLabel(agentFeedStatus.fatigue, selectedAgentSet.has('fatigue'), orchestrateMeta?.usedFallbackAgents.includes('fatigue')),
+                      summary: aiAnalysis ? `${aiAnalysis.headline}` : 'No output',
+                      detail: aiAnalysis ? `Fatigue ${safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1)} · ${aiAnalysis.recommendation}` : 'Skipped by router',
+                      severity: aiAnalysis?.severity,
+                    },
+                    {
+                      key: 'risk' as const,
+                      title: 'Risk Agent',
+                      subtitle: 'Injury and no-ball risk',
+                      status: toStatusLabel(agentFeedStatus.risk, selectedAgentSet.has('risk'), orchestrateMeta?.usedFallbackAgents.includes('risk')),
+                      summary: riskAnalysis ? `${riskAnalysis.headline}` : 'No output',
+                      detail: riskAnalysis ? `Risk ${Math.round(safeNum(riskAnalysis.riskScore, 0))} · ${riskAnalysis.recommendation}` : 'Skipped by router',
+                      severity: riskAnalysis?.severity,
+                    },
+                    {
+                      key: 'tactical' as const,
+                      title: 'Tactical Agent',
+                      subtitle: 'Substitution and next action',
+                      status: toStatusLabel(agentFeedStatus.tactical, selectedAgentSet.has('tactical'), tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')),
+                      summary: tacticalAnalysis ? tacticalAnalysis.immediateAction : 'No output',
+                      detail: tacticalAnalysis ? tacticalAnalysis.rationale : 'Skipped by router',
+                      severity: tacticalAnalysis ? `${Math.round((tacticalAnalysis.confidence || 0) * 100)}%` : undefined,
+                    },
+                  ].map((step) => (
+                    <div key={step.key} className={`p-4 rounded-xl border ${selectedAgentSet.has(step.key) || orchestrateMeta?.mode === 'full' ? 'border-slate-700 bg-[#162032]' : 'border-slate-800 bg-slate-900/30 opacity-70'}`}>
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-2">
+                          <span className={`w-2 h-2 rounded-full ${
+                            step.status === 'OK' ? 'bg-emerald-400' :
+                            step.status === 'RUNNING' ? 'bg-indigo-400 animate-pulse' :
+                            step.status === 'FALLBACK' ? 'bg-amber-400' :
+                            step.status === 'ERROR' ? 'bg-rose-400' : 'bg-slate-600'
+                          }`} />
+                          <p className="text-xs font-bold text-white">{step.title}</p>
                         </div>
-                        <p className="text-xs text-white">{riskAnalysis.recommendation}</p>
-                      </>
-                    )}
-                  </div>
+                        <div className="flex items-center gap-2">
+                          {step.status === 'FALLBACK' && <span className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300">Fallback logic</span>}
+                          <span className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200">{step.status}</span>
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-slate-500 mb-1">{step.subtitle}</p>
+                      {step.status === 'SKIPPED' ? (
+                        <p className="text-xs text-slate-500">Skipped by router</p>
+                      ) : (
+                        <>
+                          <p className="text-xs text-slate-200 line-clamp-2">{step.summary}</p>
+                          <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{step.detail}</p>
+                        </>
+                      )}
+                    </div>
+                  ))}
 
-                  {finalDecision && (
-                    <div className={`p-5 rounded-xl border ${
-                      finalDecision.severity === 'CRITICAL'
-                        ? 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
-                        : finalDecision.severity === 'HIGH'
-                        ? 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
-                        : finalDecision.severity === 'MED'
-                          ? 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
-                          : 'bg-gradient-to-b from-indigo-500/12 to-[#162032] border-indigo-400/35 border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]'
-                    }`}>
-                      <p className="text-[11px] font-bold uppercase tracking-wide text-slate-300 mb-1">Final Analysis / Decision</p>
-                      <h3 className="text-base font-bold text-white mb-2">Final Decision</h3>
-                      <p className="text-sm text-slate-200 mb-2">{finalDecision.action}</p>
-                      <p className="text-xs text-slate-400">Reasons: {finalDecision.reasons[0]}; {finalDecision.reasons[1]}</p>
+                  {combinedDecision && (
+                    <div className="p-5 rounded-xl border border-indigo-400/35 bg-gradient-to-b from-indigo-500/12 to-[#162032] border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]">
+                      <p className="text-[11px] font-bold uppercase tracking-wide text-slate-300 mb-1">Final Recommendation</p>
+                      <h3 className="text-lg font-bold text-white mb-2">{combinedDecision.immediateAction}</h3>
+                      <ul className="text-xs text-slate-300 space-y-1 mb-2">
+                        <li>• {combinedDecision.rationale}</li>
+                        {(combinedDecision.suggestedAdjustments || []).slice(0, 2).map((item, idx) => (
+                          <li key={`${item}-${idx}`}>• {item}</li>
+                        ))}
+                      </ul>
+                      {orchestrateMeta?.mode === 'full' && (
+                        <p className="text-[11px] text-indigo-200">
+                          Consensus: Risk {riskAnalysis?.severity || 'N/A'} | Fatigue {aiAnalysis ? safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1) : 'N/A'} | Tactical {tacticalAnalysis ? 'Action-ready' : 'N/A'}
+                        </p>
+                      )}
+                      {orchestrateMeta?.mode === 'auto' && orchestrateMeta.executedAgents.length <= 1 && (
+                        <p className="text-[11px] text-slate-400 mt-2">
+                          Auto routing ran: {orchestrateMeta.executedAgents.join(', ')}. Run full analysis for a combined view.
+                        </p>
+                      )}
                     </div>
                   )}
 
-                  <button 
-                    onClick={handleDismissAnalysis}
-                    className="w-full py-3 rounded-lg border border-slate-700 text-slate-400 text-sm hover:text-white hover:bg-slate-800 transition-colors"
-                  >
-                    Dismiss Analysis
-                  </button>
+                  {(tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')) && (
+                    <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                      Fallback mode active (Azure OpenAI not configured).
+                      <Info className="w-3 h-3 text-slate-500" title="Set AOAI env vars in local settings or Azure App Service to enable Azure OpenAI." />
+                    </p>
+                  )}
+
                 </motion.div>
+                <div ref={tacticalEndRef} />
+                </div>
+                </div>
               )}
               </>
               ) : (
                 <div className="mt-8 text-slate-500 text-sm">Select a player to analyze</div>
               )}
+              </div>
+              {activePlayer && isCoachOutputState && (
+                <div className="shrink-0 p-6 pt-3 border-t border-white/5 bg-[#0F172A]">
+                  <div className="space-y-3">
+                    <button
+                      type="button"
+                      aria-label="Run Coach Agent"
+                      onClick={() => {
+                        primeCoachAutoScroll();
+                        runAgent('auto', 'button_click');
+                      }}
+                      onMouseEnter={() => setIsRunCoachHovered(true)}
+                      onMouseLeave={() => setIsRunCoachHovered(false)}
+                      className="w-full rounded-full px-12 py-4 text-lg font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
+                      style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
+                    >
+                      <PlayCircle className="w-6 h-6 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                    </button>
+                    <button
+                      onClick={() => {
+                        primeCoachAutoScroll();
+                        runAgent('full', 'button_click');
+                      }}
+                      disabled={agentState === 'thinking'}
+                      className={`w-full py-3 rounded-lg border text-sm transition-colors ${agentState === 'thinking' ? 'border-slate-700 text-slate-500 cursor-not-allowed' : 'border-indigo-400/30 text-indigo-200 hover:text-white hover:bg-indigo-500/10'}`}
+                    >
+                      {agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}
+                    </button>
+
+                    <button
+                      onClick={handleDismissAnalysis}
+                      className="w-full py-3 rounded-lg border border-slate-700 text-slate-400 text-sm hover:text-white hover:bg-slate-800 transition-colors"
+                    >
+                      Dismiss Analysis
+                    </button>
+                  </div>
+                </div>
+              )}
            </div>
         </div>
+      </div>
       </div>
     </motion.div>
   );
 }
 
-function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: any) {
+interface BaselinesProps {
+  players: Player[];
+  updatePlayer: (id: string, updates: Partial<Player>) => void;
+  addPlayer: (name: string, role: Player['role'], isSub?: boolean, inRoster?: boolean) => void;
+  deletePlayer: (id: string) => void;
+  onBack: () => void;
+}
+
+function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: BaselinesProps) {
   const [activeTooltip, setActiveTooltip] = useState<string | null>(null);
 
   const toggleTooltip = (field: string) => {
@@ -2596,7 +2918,7 @@ function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: a
                    <td className="px-6 py-4">
                       <select 
                         value={p.role}
-                        onChange={(e) => updatePlayer(p.id, { role: e.target.value as any })}
+                        onChange={(e) => updatePlayer(p.id, { role: e.target.value as Player['role'] })}
                         className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1.5 focus:border-emerald-500 outline-none w-full"
                       >
                         <option value="Bowler">Bowler</option>
@@ -2716,7 +3038,7 @@ function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: a
   );
 }
 
-function BaselineInfoCard({ icon, title, desc }: any) {
+function BaselineInfoCard({ icon, title, desc }: { icon: React.ReactNode; title: string; desc: string }) {
   return (
     <div className="flex gap-3 p-3 rounded-lg bg-slate-900/50 border border-white/5">
       <div className="mt-0.5">{icon}</div>

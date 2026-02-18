@@ -1,9 +1,13 @@
 
-  import { defineConfig } from 'vite';
-  import react from '@vitejs/plugin-react-swc';
-  import path from 'path';
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react-swc';
+import path from 'path';
 
-  export default defineConfig({
+const functionsPort = process.env.VITE_FUNCTIONS_PORT || process.env.FUNCTION_PORT || '7071';
+const apiTarget = `http://localhost:${functionsPort}`;
+console.log(`[vite] Proxying /api -> ${apiTarget}`);
+
+export default defineConfig({
     plugins: [react()],
     resolve: {
       extensions: ['.js', '.jsx', '.ts', '.tsx', '.json'],
@@ -54,14 +58,14 @@
       outDir: 'dist',
     },
     server: {
-      port: 3000,
+      port: 5173,
       open: true,
       proxy: {
         '/api': {
-          // Functions port currently 7072; change if needed.
-          target: 'http://localhost:7072',
+          // Route all API requests to local Azure Functions host.
+          target: apiTarget,
           changeOrigin: true,
-          rewrite: (path) => path,
+          secure: false,
         },
       },
     },
