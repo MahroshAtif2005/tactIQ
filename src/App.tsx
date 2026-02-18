@@ -1840,17 +1840,17 @@ function Dashboard({
     <motion.div 
       initial={{ opacity: 0 }} 
       animate={{ opacity: 1 }}
-      className="px-4 md:px-6 py-6 w-full flex flex-col"
+      className="px-4 md:px-6 pt-5 pb-6 w-full flex flex-col"
     >
       {/* Context Bar */}
       <div className="bg-[#0F172A] border border-white/5 rounded-xl px-3 py-4 flex flex-wrap items-center gap-6 mb-6">
-        <GlowingBackButton onClick={onBack} label="Match Setup" size="large" />
+        <GlowingBackButton onClick={onBack} label="Match Setup" />
         <div className="h-6 w-px bg-transparent hidden md:block" />
-        <div className="flex items-center gap-6 text-sm font-bold tracking-wider text-slate-400">
-           <span className="flex items-center gap-2"><Trophy className="w-4 h-4" /> {matchContext.format}</span>
-           <span className="flex items-center gap-2 text-amber-400"><Zap className="w-4 h-4" /> {matchContext.phase}</span>
-           <span className="flex items-center gap-2"><Activity className="w-4 h-4" /> {matchContext.pitch.toUpperCase()} INTENSITY</span>
-           <span className="flex items-center gap-2 text-blue-400"><Thermometer className="w-4 h-4" /> {matchContext.weather.toUpperCase()}</span>
+        <div className="flex items-center gap-6 text-xs font-bold tracking-wider text-slate-400">
+           <span className="flex items-center gap-2"><Trophy className="w-3.5 h-3.5" /> {matchContext.format}</span>
+           <span className="flex items-center gap-2 text-amber-400"><Zap className="w-3.5 h-3.5" /> {matchContext.phase}</span>
+           <span className="flex items-center gap-2"><Activity className="w-3.5 h-3.5" /> {matchContext.pitch.toUpperCase()} INTENSITY</span>
+           <span className="flex items-center gap-2 text-blue-400"><Thermometer className="w-3.5 h-3.5" /> {matchContext.weather.toUpperCase()}</span>
            <span className="flex items-center gap-1.5 text-emerald-400">
              SCORE
              <input
@@ -1915,7 +1915,7 @@ function Dashboard({
       </div>
 
       <div className="w-full">
-      <div className="grid lg:grid-cols-12 gap-6 mt-2 dashboard-grid-stretch">
+      <div className="grid lg:grid-cols-12 gap-6 mt-0 dashboard-grid-stretch">
         
         {/* LEFT: ROSTER (EDITABLE) */}
         <div className="lg:col-span-3 flex flex-col gap-4 h-full">
@@ -2341,10 +2341,10 @@ function Dashboard({
                   <div className="grid grid-cols-2 gap-x-8 gap-y-6 mt-6">
                     <div>
                       <div className="flex justify-between mb-2">
-                        <label className={`text-sm font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
-                          <Activity className={`w-4 h-4 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Fatigue Index (0-10)
+                        <label className={`text-[13px] font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
+                          <Activity className={`w-3 h-3 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Fatigue Index (0-10)
                         </label>
-                        <span className={`text-lg font-mono ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-white'}`}>{activePlayer.fatigue.toFixed(1)}</span>
+                        <span className={`text-base font-mono ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-white'}`}>{activePlayer.fatigue.toFixed(1)}</span>
                       </div>
                       <div className="h-3 bg-slate-800 rounded-full overflow-hidden">
                         <motion.div
@@ -2395,8 +2395,8 @@ function Dashboard({
 
                     <div>
                       <div className="mb-2 flex items-center justify-between">
-                        <label className={`text-sm font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
-                          <AlertTriangle className={`w-4 h-4 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Heart Rate Recovery
+                        <label className={`text-[13px] font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
+                          <AlertTriangle className={`w-3 h-3 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Heart Rate Recovery
                         </label>
                         <div className="inline-flex items-center rounded-md border border-slate-700 bg-[#162032] p-0.5">
                           <button
@@ -2419,7 +2419,7 @@ function Dashboard({
                         value={recoveryMode === 'manual' ? manualRecovery : activePlayer.hrRecovery}
                         onChange={(e) => setManualRecovery(e.target.value as RecoveryLevel)}
                         disabled={recoveryMode === 'auto'}
-                        className={`w-full bg-[#162032] text-base rounded-lg px-3 py-2.5 border focus:outline-none ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 border-rose-500/50 bg-rose-500/5' : 'text-white border-slate-700'} ${recoveryMode === 'auto' ? 'opacity-80 cursor-not-allowed' : ''}`}
+                        className={`w-full bg-[#162032] text-sm rounded-lg px-3 py-2.5 border focus:outline-none ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 border-rose-500/50 bg-rose-500/5' : 'text-white border-slate-700'} ${recoveryMode === 'auto' ? 'opacity-80 cursor-not-allowed' : ''}`}
                       >
                         <option value="Good">Good</option>
                         <option value="Moderate">Moderate</option>
@@ -2428,30 +2428,30 @@ function Dashboard({
                     </div>
 
                     <div className={`bg-[#162032] p-3 rounded-lg flex items-center justify-between border transition-all duration-300 ${activePlayer.injuryRisk === 'High' ? 'border-rose-500/50 bg-rose-500/10 shadow-[0_0_15px_rgba(244,63,94,0.15)]' : 'border-white/5'}`}>
-                      <span className={`text-base font-medium ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>Injury Risk</span>
-                      <span className={`text-base font-bold text-right ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : activePlayer.injuryRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
+                      <span className={`text-sm font-medium ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>Injury Risk</span>
+                      <span className={`text-sm font-bold text-right ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : activePlayer.injuryRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
                         {activePlayer.injuryRisk.toUpperCase()}
                       </span>
                     </div>
 
                     <div className={`bg-[#162032] p-3 rounded-lg flex items-center justify-between border transition-all duration-300 ${activePlayer.noBallRisk === 'High' ? 'border-rose-500/50 bg-rose-500/10 shadow-[0_0_15px_rgba(244,63,94,0.15)]' : 'border-white/5'}`}>
-                      <span className={`text-base font-medium ${activePlayer.noBallRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>No-Ball Risk</span>
-                      <span className={`text-base font-bold text-right ${activePlayer.noBallRisk === 'High' ? 'text-rose-500' : activePlayer.noBallRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
+                      <span className={`text-sm font-medium ${activePlayer.noBallRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>No-Ball Risk</span>
+                      <span className={`text-sm font-bold text-right ${activePlayer.noBallRisk === 'High' ? 'text-rose-500' : activePlayer.noBallRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
                         {activePlayer.noBallRisk.toUpperCase()}
                       </span>
                     </div>
                   </div>
 
-                  <div className="mt-auto pt-8">
-                    <p className="text-xs font-bold text-slate-500 uppercase mb-3">Quick Actions</p>
+                  <div className="mt-6">
+                    <p className="text-xs font-bold text-slate-500 uppercase mb-2">Quick Actions</p>
                     <div className="grid grid-cols-3 gap-3">
                       <button onClick={handleMarkUnfit} className={`border p-4 rounded-lg transition-all flex flex-col items-center group shadow-lg ${activePlayer.isUnfit ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-emerald-900/10' : 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/30 shadow-rose-900/10'}`}>
-                        <Zap className="w-6 h-6 mb-1" />
+                        <Zap className="w-5 h-5 mb-0.5" />
                         <span className="text-sm font-bold">{activePlayer.isUnfit ? 'Mark Fit' : 'Mark Unfit'}</span>
                         <span className="text-[10px] opacity-70">{activePlayer.isUnfit ? 'Restore player state' : 'Force critical state'}</span>
                       </button>
                       <button onClick={handleNewSpell} disabled={activePlayer.isUnfit} className={`p-4 rounded-lg transition-colors flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}>
-                        <CheckCircle2 className="w-6 h-6 mb-1" />
+                        <CheckCircle2 className="w-5 h-5 mb-0.5" />
                         <span className="text-sm font-bold">New Spell</span>
                         <span className="text-[10px] opacity-70">Reset count</span>
                       </button>
@@ -2460,7 +2460,7 @@ function Dashboard({
                         disabled={activePlayer.isUnfit}
                         className={`p-4 rounded-lg transition-all flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : activePlayer.isResting ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
                       >
-                        <Wind className={`w-6 h-6 mb-1 ${activePlayer.isResting ? 'animate-pulse' : ''}`} />
+                        <Wind className={`w-5 h-5 mb-0.5 ${activePlayer.isResting ? 'animate-pulse' : ''}`} />
                         <span className="text-sm font-bold">{activePlayer.isResting ? 'Resting...' : 'Rest'}</span>
                         <span className="text-[10px] opacity-70">{activePlayer.isResting ? 'Click to Resume' : 'Start Recovery'}</span>
                       </button>
@@ -2481,7 +2481,7 @@ function Dashboard({
 
         {/* RIGHT: COACH AGENT */}
         <div className="lg:col-span-3 flex flex-col gap-4 h-full">
-           <div className="dashboard-card-min-h dashboard-coach-fixed-height h-full flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
+           <div className="dashboard-card-min-h dashboard-coach-fixed-height flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
               <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50 rounded-t-2xl" />
               
               <div className="shrink-0 p-6 pb-3">
@@ -2538,10 +2538,10 @@ function Dashboard({
                       }}
                       onMouseEnter={() => setIsRunCoachHovered(true)}
                       onMouseLeave={() => setIsRunCoachHovered(false)}
-                      className="w-full rounded-full px-12 py-5 text-lg font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
+                      className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
                       style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
                     >
-                      <PlayCircle className="w-6 h-6 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                      <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
                     </button>
                   </div>
                 </div>
@@ -2756,6 +2756,20 @@ function Dashboard({
               {activePlayer && isCoachOutputState && (
                 <div className="shrink-0 p-6 pt-3 border-t border-white/5 bg-[#0F172A]">
                   <div className="space-y-3">
+                    <button
+                      type="button"
+                      aria-label="Run Coach Agent"
+                      onClick={() => {
+                        primeCoachAutoScroll();
+                        runAgent('auto', 'button_click');
+                      }}
+                      onMouseEnter={() => setIsRunCoachHovered(true)}
+                      onMouseLeave={() => setIsRunCoachHovered(false)}
+                      className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
+                      style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
+                    >
+                      <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                    </button>
                     <button
                       onClick={() => {
                         primeCoachAutoScroll();

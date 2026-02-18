@@ -3206,19 +3206,19 @@ body {
 }
 
 .dashboard-avatar-tall {
-  height: 2.35rem;
+  height: 2.2rem;
 }
 
 .dashboard-title-icon-tall {
-  height: 3rem;
+  height: 2.75rem;
 }
 
 .dashboard-coach-shield-container-tall {
-  height: 7.5rem;
+  height: 7rem;
 }
 
 .dashboard-coach-shield-glyph-tall {
-  height: 4.2rem;
+  height: 3.9rem;
 }
 
 .dashboard-coach-shift-up {
@@ -3230,36 +3230,36 @@ body {
 }
 
 .dashboard-main-heading-tall {
-  font-size: 2rem;
+  font-size: 1.9rem;
   line-height: 1.1;
 }
 
 .dashboard-panel-title-tall {
-  font-size: 1.1rem;
+  font-size: 1rem;
   line-height: 1.2;
 }
 
 .dashboard-roster-name-tall {
-  font-size: .98rem;
+  font-size: .94rem;
   line-height: 1.25;
 }
 
 .dashboard-roster-role-tall {
-  font-size: .72rem;
+  font-size: .68rem;
   line-height: 1.1;
 }
 
 .dashboard-ready-text-tall {
-  font-size: 1.8rem;
+  font-size: 1.7rem;
   line-height: 1.1;
 }
 
 .dashboard-icon-tall {
-  height: 1.45rem;
+  height: 1.3rem;
 }
 
 .dashboard-icon-tall-lg {
-  height: 1.8rem;
+  height: 1.6rem;
 }
 
 .tactical-scroll::-webkit-scrollbar {
