@@ -2079,7 +2079,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center border bg-slate-800 hover:bg-slate-700 text-white border-slate-600"
                         >
-                          <Minus className="w-5 h-5" />
+                          <Minus className="w-4 h-4" />
                         </button>
                         <button
                           onClick={() => {
@@ -2088,7 +2088,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20"
                         >
-                          <Plus className="w-5 h-5" />
+                          <Plus className="w-4 h-4" />
                         </button>
                       </div>
                     </div>
@@ -2106,7 +2106,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center border bg-slate-800 hover:bg-slate-700 text-white border-slate-600"
                         >
-                          <Minus className="w-5 h-5" />
+                          <Minus className="w-4 h-4" />
                         </button>
                         <button
                           onClick={() => {
@@ -2117,7 +2117,7 @@ function Dashboard({
                           }}
                           className="w-8 h-8 rounded-full flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20"
                         >
-                          <Plus className="w-5 h-5" />
+                          <Plus className="w-4 h-4" />
                         </button>
                       </div>
                     </div>
