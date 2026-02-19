@@ -514,6 +514,9 @@ const normalizeApiFailureBody = (body?: string): string | null => {
   if (!body) return null;
   const trimmed = body.trim();
   if (!trimmed) return null;
+  if (/^<!doctype html/i.test(trimmed) || /^<html/i.test(trimmed)) {
+    return 'API returned HTML instead of JSON (likely SPA fallback intercepting /api routes).';
+  }
 
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;

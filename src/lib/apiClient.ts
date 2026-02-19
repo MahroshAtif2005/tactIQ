@@ -28,6 +28,16 @@ export class ApiClientError extends Error {
 const coachAgentFailureMessage = (status: number | 'network'): string =>
   `Coach Agent failed (${status}). Check API deployment / VITE_API_BASE_URL.`;
 
+const summarizeErrorText = (text: string): string => {
+  const normalized = text.trim().replace(/\s+/g, ' ');
+  return normalized.length > 180 ? `${normalized.slice(0, 180)}...` : normalized;
+};
+
+const looksLikeHtml = (text: string): boolean => {
+  const trimmed = text.trim().toLowerCase();
+  return trimmed.startsWith('<!doctype html') || trimmed.startsWith('<html');
+};
+
 async function requestText(
   url: string,
   init: RequestInit
@@ -55,8 +65,11 @@ async function requestText(
       status: response.status,
       body: responseText,
     });
+    const shortText = summarizeErrorText(responseText);
     throw new ApiClientError(
-      coachAgentFailureMessage(response.status),
+      shortText
+        ? `${coachAgentFailureMessage(response.status)} API ${response.status}: ${shortText}`
+        : coachAgentFailureMessage(response.status),
       url,
       response.status,
       responseText
@@ -71,6 +84,15 @@ function parseJsonResponse<TResponse>(
   url: string,
   status: number
 ): TResponse {
+  if (looksLikeHtml(text)) {
+    throw new ApiClientError(
+      `Coach Agent failed (${status}). API returned HTML instead of JSON at ${url}. Check API routing and SPA fallback.`,
+      url,
+      status,
+      text
+    );
+  }
+
   try {
     return JSON.parse(text) as TResponse;
   } catch (error) {

@@ -71,6 +71,6 @@
     "api:start": "npm --prefix api run start",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "npx serve -s dist -l $PORT"
+    "start": "node server.js"
   }
 }
