@@ -114,6 +114,12 @@ Frontend runs on `http://localhost:5173` and Azure Functions runs on `http://loc
 
 If you change Vite proxy settings, restart the Vite dev server.
 
+## Production API Base URL
+
+- If backend APIs are hosted separately from the frontend (for example Azure Functions on another host), set `VITE_API_BASE_URL` in Azure App Service -> Configuration.
+- The frontend builds API URLs as `${VITE_API_BASE_URL}/api/...` when configured, and defaults to same-origin `/api/...` when empty (so local Vite proxy still works).
+- If `/api/health` fails and `VITE_API_BASE_URL` is empty, the Coach panel now shows an explicit error suggesting this configuration.
+
 ## LLM Setup
 
 Fatigue Agent supports two modes:

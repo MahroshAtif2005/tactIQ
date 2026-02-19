@@ -40,7 +40,7 @@ import {
   YAxis,
 } from 'recharts';
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse, TacticalCombinedDecision } from './types/agents';
-import { ApiClientError, postOrchestrate } from './lib/apiClient';
+import { ApiClientError, apiHealthUrl, apiOrchestrateUrl, getApiHealth, postOrchestrate } from './lib/apiClient';
 import {
   clamp,
   computeBaselineRecoveryScore,
@@ -501,6 +501,56 @@ const formatMMSS = (s: number): string => {
   return `${String(Math.floor(safe / 60)).padStart(2, '0')}:${String(safe % 60).padStart(2, '0')}`;
 };
 
+interface AgentFailureDetail {
+  status: number | 'network';
+  url: string;
+  message: string;
+  hint: string | null;
+}
+
+const isApiBaseConfigured = Boolean(import.meta.env.VITE_API_BASE_URL?.trim());
+
+const normalizeApiFailureBody = (body?: string): string | null => {
+  if (!body) return null;
+  const trimmed = body.trim();
+  if (!trimmed) return null;
+
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    const candidate = [parsed.message, parsed.error, parsed.detail].find(
+      (value): value is string => typeof value === 'string' && value.trim().length > 0
+    );
+    if (candidate) return candidate.trim();
+  } catch {
+    // Keep plain-text body fallback.
+  }
+
+  return trimmed.replace(/\s+/g, ' ').slice(0, 180);
+};
+
+const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailureDetail => {
+  if (error instanceof ApiClientError) {
+    const status = error.status ?? 'network';
+    const hint =
+      !isApiBaseConfigured && error.url.includes('/api/health')
+        ? 'Set VITE_API_BASE_URL in Azure App Service -> Configuration.'
+        : null;
+    return {
+      status,
+      url: error.url,
+      message: normalizeApiFailureBody(error.body) ?? error.message,
+      hint,
+    };
+  }
+
+  return {
+    status: 'network',
+    url: fallbackUrl,
+    message: error instanceof Error ? error.message : 'Request failed before receiving an API response.',
+    hint: !isApiBaseConfigured ? 'Set VITE_API_BASE_URL in Azure App Service -> Configuration.' : null,
+  };
+};
+
 const RECOVERY_RATE_BY_HRR: Record<RecoveryLevel, number> = {
   Good: 0.03,
   Moderate: 0.02,
@@ -529,6 +579,7 @@ export default function App() {
   const [activePlayerId, setActivePlayerId] = useState<string>('p1');
   const [agentState, setAgentState] = useState<'idle' | 'thinking' | 'done' | 'offline' | 'invalid'>('idle');
   const [agentWarning, setAgentWarning] = useState<string | null>(null);
+  const [agentFailure, setAgentFailure] = useState<AgentFailureDetail | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AiAnalysis | null>(null);
   const [riskAnalysis, setRiskAnalysis] = useState<AiAnalysis | null>(null);
   const [tacticalAnalysis, setTacticalAnalysis] = useState<TacticalAgentResponse | null>(null);
@@ -1030,6 +1081,7 @@ export default function App() {
     setRouterDecision(null);
     setAgentFeedStatus({ fatigue: 'loading', risk: 'idle', tactical: 'loading' });
     setAgentWarning(null);
+    setAgentFailure(null);
     setAgentState('thinking');
 
     const roster = playersRef.current;
@@ -1084,11 +1136,12 @@ export default function App() {
       },
     };
     if (import.meta.env.DEV) {
-      console.log('[agent] calling', '/api/orchestrate');
+      console.log('[agent] calling', apiOrchestrateUrl);
       console.log('Orchestrate payload', payload);
     }
 
     try {
+      await getApiHealth(controller.signal);
       const result: OrchestrateResponse = await postOrchestrate(payload, controller.signal);
       if (requestId !== fatigueRequestSeq.current) return;
       const fatigueMapped = result.fatigue ? buildAiAnalysis(result.fatigue, 'fatigue') : null;
@@ -1123,6 +1176,7 @@ export default function App() {
 
       const visibleErrors = result.errors.filter((e) => !(e.agent === 'tactical' && tacticalMapped));
       setAgentWarning(visibleErrors.length > 0 ? visibleErrors.map((e) => `${e.agent}: ${e.message}`).join(' | ') : null);
+      setAgentFailure(null);
       setAgentState(result.errors.length > 0 && !fatigueMapped && !riskMapped && !tacticalMapped ? 'offline' : 'done');
       setAnalysisActive(true);
     } catch (error) {
@@ -1133,11 +1187,8 @@ export default function App() {
         risk: prev.risk === 'loading' ? 'error' : prev.risk,
         tactical: prev.tactical === 'loading' ? 'error' : prev.tactical,
       }));
-      if (error instanceof ApiClientError) {
-        setAgentWarning(error.message);
-      } else {
-        setAgentWarning('AI Offline. Start backend: cd api && func start');
-      }
+      setAgentWarning(null);
+      setAgentFailure(toAgentFailureDetail(error, apiOrchestrateUrl));
       setAgentState('offline');
       setAnalysisActive(false);
     }
@@ -1155,6 +1206,7 @@ export default function App() {
       setRouterDecision(null);
       setAgentFeedStatus({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
       setAgentWarning(null);
+      setAgentFailure(null);
       setAgentState('idle');
       setAnalysisActive(false);
     }
@@ -1170,6 +1222,7 @@ export default function App() {
     setAnalysisActive(false);
     setAgentState('idle');
     setAgentWarning(null);
+    setAgentFailure(null);
     setAiAnalysis(null);
     setRiskAnalysis(null);
     setTacticalAnalysis(null);
@@ -1362,6 +1415,7 @@ export default function App() {
               movePlayerToSub={movePlayerToSub}
               agentState={agentState}
               agentWarning={agentWarning}
+              agentFailure={agentFailure}
               aiAnalysis={aiAnalysis}
               riskAnalysis={riskAnalysis}
               tacticalAnalysis={tacticalAnalysis}
@@ -1814,6 +1868,7 @@ interface DashboardProps {
   routerDecision: RouterDecisionView | null;
   agentFeedStatus: AgentFeedStatus;
   agentWarning: string | null;
+  agentFailure: AgentFailureDetail | null;
   analysisActive: boolean;
   runAgent: (mode?: 'auto' | 'full', reason?: 'button_click' | 'non_button') => Promise<void>;
   onDismissAnalysis: () => void;
@@ -1832,7 +1887,7 @@ interface DashboardProps {
 
 function Dashboard({
   matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, addPlayer, deletePlayer, movePlayerToSub,
-  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit,
+  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit,
   recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, onBack
 }: DashboardProps) {
   const [isAdding, setIsAdding] = useState(false);
@@ -2757,6 +2812,42 @@ function Dashboard({
                             <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
                           </button>
                         </div>
+                        {agentFailure && (
+                          <div className="w-full mt-3">
+                            <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-left">
+                              <p className="text-[10px] uppercase tracking-wide font-semibold text-rose-100">Coach Agent failed</p>
+                              <p className="mt-1 text-[11px] text-rose-200">
+                                {`${String(agentFailure.status)} at ${agentFailure.url} - ${agentFailure.message}`}
+                              </p>
+                              {agentFailure.hint && (
+                                <p className="mt-1 text-[11px] text-rose-200/90">{agentFailure.hint}</p>
+                              )}
+                              <a
+                                href={apiHealthUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="mt-1 inline-block text-[11px] text-cyan-200 underline decoration-cyan-300/40 hover:text-cyan-100"
+                              >
+                                Check /api/health
+                              </a>
+                            </div>
+                          </div>
+                        )}
+                        {!agentFailure && agentWarning && (
+                          <div className="w-full mt-3">
+                            <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-left">
+                              <p className="text-[11px] text-rose-200">{agentWarning}</p>
+                              <a
+                                href={apiHealthUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="mt-1 inline-block text-[11px] text-cyan-200 underline decoration-cyan-300/40 hover:text-cyan-100"
+                              >
+                                Check /api/health
+                              </a>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
