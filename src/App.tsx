@@ -1064,7 +1064,18 @@ export default function App() {
       console.log('Coach analysis triggered', { reason: 'button_click' });
     }
     if (agentState === 'thinking') return;
-    if (!currentTelemetry) return;
+    if (!currentTelemetry) {
+      setAgentWarning(null);
+      setAgentFailure({
+        status: 'network',
+        url: apiOrchestrateUrl,
+        message: 'No active player telemetry available for analysis.',
+        hint: null,
+      });
+      setAgentState('invalid');
+      setAnalysisActive(false);
+      return;
+    }
     setAnalysisRequested(true);
     setAnalysisActive(false);
 
