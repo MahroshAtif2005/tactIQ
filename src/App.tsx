@@ -2509,7 +2509,7 @@ function Dashboard({
               {/* EMPTY_STATE_MARKER */}
               {!isCoachOutputState && !substitutionRecommendation && (
                 <div className="flex-1 flex flex-col items-center justify-center">
-                  <div className="w-full flex flex-col items-center gap-4">
+                  <div className="w-full flex flex-col items-center gap-2">
                     <div className="w-24 h-24 dashboard-coach-shield-container-tall dashboard-coach-shift-up rounded-3xl flex items-center justify-center bg-gradient-to-br from-indigo-500/25 via-purple-500/20 to-blue-500/15 border border-white/10 shadow-[0_0_40px_rgba(99,102,241,0.25)] backdrop-blur-md">
                       <div className="relative overflow-visible">
                         <div
@@ -2548,7 +2548,7 @@ function Dashboard({
                       }}
                       onMouseEnter={() => setIsRunCoachHovered(true)}
                       onMouseLeave={() => setIsRunCoachHovered(false)}
-                      className="mt-2 w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
+                      className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
                       style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
                     >
                       <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
