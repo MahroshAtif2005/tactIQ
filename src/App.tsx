@@ -508,8 +508,6 @@ interface AgentFailureDetail {
   hint: string | null;
 }
 
-const isApiBaseConfigured = Boolean(import.meta.env.VITE_API_BASE_URL?.trim());
-
 const normalizeApiFailureBody = (body?: string): string | null => {
   if (!body) return null;
   const trimmed = body.trim();
@@ -534,10 +532,9 @@ const normalizeApiFailureBody = (body?: string): string | null => {
 const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailureDetail => {
   if (error instanceof ApiClientError) {
     const status = error.status ?? 'network';
-    const hint =
-      !isApiBaseConfigured && error.url.includes('/api/health')
-        ? 'Set VITE_API_BASE_URL in Azure App Service -> Configuration.'
-        : null;
+    const hint = error.url.includes('/api/health')
+      ? 'Check /api/health and confirm backend deployment.'
+      : null;
     return {
       status,
       url: error.url,
@@ -550,7 +547,7 @@ const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailure
     status: 'network',
     url: fallbackUrl,
     message: error instanceof Error ? error.message : 'Request failed before receiving an API response.',
-    hint: !isApiBaseConfigured ? 'Set VITE_API_BASE_URL in Azure App Service -> Configuration.' : null,
+    hint: 'Check backend deployment and /api route availability.',
   };
 };
 
