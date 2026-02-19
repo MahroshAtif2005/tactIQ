@@ -29,6 +29,16 @@ import {
   Info
 } from 'lucide-react';
 import { motion, AnimatePresence, useMotionValue, useSpring, useTransform, useMotionTemplate } from 'motion/react';
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse, TacticalCombinedDecision } from './types/agents';
 import { ApiClientError, postOrchestrate } from './lib/apiClient';
 import {
@@ -526,6 +536,7 @@ export default function App() {
   const [orchestrateMeta, setOrchestrateMeta] = useState<OrchestrateMetaView | null>(null);
   const [routerDecision, setRouterDecision] = useState<RouterDecisionView | null>(null);
   const [agentFeedStatus, setAgentFeedStatus] = useState<AgentFeedStatus>({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
+  const [analysisActive, setAnalysisActive] = useState(false);
   const [analysisRequested, setAnalysisRequested] = useState(false);
   const [recoveryMode, setRecoveryMode] = useState<RecoveryMode>('auto');
   const [manualRecovery, setManualRecovery] = useState<RecoveryLevel>('Moderate');
@@ -1004,6 +1015,7 @@ export default function App() {
     if (agentState === 'thinking') return;
     if (!currentTelemetry) return;
     setAnalysisRequested(true);
+    setAnalysisActive(false);
 
     fatigueAbortRef.current?.abort();
     const controller = new AbortController();
@@ -1112,6 +1124,7 @@ export default function App() {
       const visibleErrors = result.errors.filter((e) => !(e.agent === 'tactical' && tacticalMapped));
       setAgentWarning(visibleErrors.length > 0 ? visibleErrors.map((e) => `${e.agent}: ${e.message}`).join(' | ') : null);
       setAgentState(result.errors.length > 0 && !fatigueMapped && !riskMapped && !tacticalMapped ? 'offline' : 'done');
+      setAnalysisActive(true);
     } catch (error) {
       if ((error as Error)?.name === 'AbortError') return;
       if (requestId !== fatigueRequestSeq.current) return;
@@ -1126,6 +1139,7 @@ export default function App() {
         setAgentWarning('AI Offline. Start backend: cd api && func start');
       }
       setAgentState('offline');
+      setAnalysisActive(false);
     }
   };
 
@@ -1142,6 +1156,7 @@ export default function App() {
       setAgentFeedStatus({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
       setAgentWarning(null);
       setAgentState('idle');
+      setAnalysisActive(false);
     }
     setAnalysisRequested(false);
     return () => {
@@ -1152,6 +1167,7 @@ export default function App() {
   const dismissAnalysis = () => {
     fatigueAbortRef.current?.abort();
     setAnalysisRequested(false);
+    setAnalysisActive(false);
     setAgentState('idle');
     setAgentWarning(null);
     setAiAnalysis(null);
@@ -1169,7 +1185,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen h-screen w-full flex flex-col overflow-hidden bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 relative">
+    <div className="min-h-screen h-auto w-full flex flex-col bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 relative">
       {/* Global Mouse Glow Cursor - Only on Landing Page */}
       {page === 'landing' && <MouseGlow />}
 
@@ -1317,7 +1333,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col overflow-hidden dashboard-main-offset">
+      <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col dashboard-main-offset">
         <AnimatePresence mode="wait">
           {page === 'landing' && (
             <LandingPage key="landing" onStart={() => navigateTo('setup')} />
@@ -1353,6 +1369,7 @@ export default function App() {
               orchestrateMeta={orchestrateMeta}
               routerDecision={routerDecision}
               agentFeedStatus={agentFeedStatus}
+              analysisActive={analysisActive}
               runAgent={runAgent}
               onDismissAnalysis={dismissAnalysis}
               handleAddOver={handleAddOver}
@@ -1604,6 +1621,179 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
   );
 }
 
+interface FatigueForecastPoint {
+  overAhead: number;
+  fatigue: number;
+}
+
+const FORECAST_OVERS = [0, 1, 2, 3, 4, 5];
+const FORECAST_Y_TICKS = [0, 2.5, 5, 7.5, 10];
+
+const fatigueIntensityMultiplier = (intensity?: string): number => {
+  const normalized = String(intensity || '').trim().toUpperCase();
+  if (normalized === 'COOL' || normalized === 'LOW') return 0.85;
+  if (normalized === 'MEDIUM') return 1.0;
+  if (normalized === 'POWERPLAY' || normalized === 'HIGH') return 1.15;
+  return 1.0;
+};
+
+const fatigueRecoveryDelta = (heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok'): number => {
+  const normalized = String(heartRateRecovery || '').trim().toUpperCase();
+  if (normalized === 'GOOD') return -0.2;
+  if (normalized === 'OK' || normalized === 'MODERATE') return -0.1;
+  if (normalized === 'POOR') return 0.0;
+  return -0.1;
+};
+
+const buildFatigueForecast = ({
+  currentFatigue,
+  intensity,
+  consecutiveOvers,
+  heartRateRecovery,
+}: {
+  currentFatigue: number;
+  intensity?: string;
+  consecutiveOvers: number;
+  heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
+}): FatigueForecastPoint[] => {
+  const startFatigue = clamp(currentFatigue, 0, 10);
+  const safeConsecutiveOvers = Math.max(0, consecutiveOvers);
+  const incrementPerOver =
+    0.55 * fatigueIntensityMultiplier(intensity) +
+    0.10 * safeConsecutiveOvers +
+    fatigueRecoveryDelta(heartRateRecovery);
+
+  return FORECAST_OVERS.map((overAhead) => ({
+    overAhead,
+    fatigue: Number(clamp(startFatigue + incrementPerOver * overAhead, 0, 10).toFixed(1)),
+  }));
+};
+
+function FatigueForecastChart({
+  currentFatigue,
+  intensity,
+  consecutiveOvers,
+  heartRateRecovery,
+}: {
+  currentFatigue: number;
+  intensity?: string;
+  consecutiveOvers: number;
+  heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
+}) {
+  const points: FatigueForecastPoint[] = React.useMemo(() => {
+    const inc = 0.56;
+    return Array.from({ length: 6 }, (_, i) => ({
+      overAhead: i,
+      fatigue: Math.round(clamp((currentFatigue ?? 0) + inc * i, 0, 10) * 10) / 10,
+    }));
+  }, [currentFatigue]);
+
+  return (
+    <div className="relative rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] p-4 overflow-hidden">
+      <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-emerald-500/10 via-cyan-500/5 to-transparent pointer-events-none" />
+      <div className="relative z-10">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-bold text-white">Fatigue Forecast</h3>
+            <p className="text-xs text-slate-400">Next 5 overs • AI projection</p>
+          </div>
+          <span className="rounded-full border border-cyan-400/35 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-cyan-200">
+            AI
+          </span>
+        </div>
+
+        <div className="mt-4 h-[240px] w-full" style={{ height: 240 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={points} margin={{ top: 10, right: 12, left: 0, bottom: 18 }}>
+              <defs>
+                <linearGradient id="fatigueLine" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="rgba(34,211,238,0.95)" />
+                  <stop offset="100%" stopColor="rgba(16,185,129,0.95)" />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="4 6" vertical={false} stroke="rgba(255,255,255,0.08)" />
+              <XAxis
+                dataKey="overAhead"
+                ticks={FORECAST_OVERS}
+                tickFormatter={(value) => (value === 0 ? 'Now' : `+${value}`)}
+                tickLine={false}
+                axisLine={{ stroke: 'rgba(255,255,255,0.10)' }}
+                tick={{ fill: 'rgba(255,255,255,0.55)', fontSize: 12 }}
+                label={{ value: 'Overs Ahead', position: 'insideBottom', offset: -8, fill: 'rgba(255,255,255,0.55)' }}
+              />
+              <YAxis
+                domain={[0, 10]}
+                ticks={FORECAST_Y_TICKS}
+                tickLine={false}
+                axisLine={false}
+                tick={{ fill: 'rgba(255,255,255,0.55)', fontSize: 12 }}
+                label={{ value: 'Fatigue (0–10)', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.55)' }}
+              />
+              <Tooltip
+                cursor={{ stroke: 'rgba(255,255,255,0.10)', strokeWidth: 1 }}
+                contentStyle={{
+                  background: 'rgba(10,15,30,0.95)',
+                  border: '1px solid rgba(255,255,255,0.10)',
+                  borderRadius: '12px',
+                  color: 'rgba(255,255,255,0.85)',
+                }}
+                formatter={(val: number | string) => [`${val}`, 'Fatigue']}
+                labelFormatter={(value: number | string) => (Number(value) === 0 ? 'Now' : `+${value} overs`)}
+              />
+              <ReferenceLine
+                y={7}
+                stroke="rgba(255,255,255,0.12)"
+                strokeDasharray="6 6"
+                label={{ value: 'High risk ≥ 7', position: 'insideTopRight', fill: 'rgba(255,255,255,0.40)' }}
+              />
+              <Line
+                type="monotone"
+                dataKey="fatigue"
+                stroke="url(#fatigueLine)"
+                strokeWidth={8}
+                opacity={0.18}
+                dot={false}
+                activeDot={false}
+              />
+              <Line
+                type="monotone"
+                dataKey="fatigue"
+                stroke="url(#fatigueLine)"
+                strokeWidth={3}
+                dot={{ r: 4, stroke: 'rgba(34,211,238,0.95)', strokeWidth: 2, fill: 'rgba(10,15,30,1)' }}
+                activeDot={{ r: 6, stroke: 'rgba(34,211,238,1)', strokeWidth: 2, fill: 'rgba(16,185,129,0.20)' }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="mt-4 border-t border-white/10" />
+
+        <div className="mt-4 grid grid-cols-3 sm:grid-cols-6 gap-2">
+          {points.map((point, index) => {
+            const isLast = index === points.length - 1;
+            return (
+              <div
+                key={`forecast-chip-${point.overAhead}`}
+                className={`rounded-xl border bg-white/[0.03] px-3 py-2 ${
+                  isLast ? 'border-emerald-400/45 shadow-[0_0_14px_rgba(16,185,129,0.16)]' : 'border-white/10'
+                }`}
+              >
+                <p className="text-[10px] uppercase tracking-wide text-slate-400">
+                  {point.overAhead === 0 ? 'Now' : `+${point.overAhead} ov`}
+                </p>
+                <p className={`text-xs font-mono font-bold ${isLast ? 'text-emerald-300' : 'text-cyan-200'}`}>
+                  {point.fatigue.toFixed(1)}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface DashboardProps {
   matchContext: MatchContext;
   matchState: MatchState;
@@ -1624,6 +1814,7 @@ interface DashboardProps {
   routerDecision: RouterDecisionView | null;
   agentFeedStatus: AgentFeedStatus;
   agentWarning: string | null;
+  analysisActive: boolean;
   runAgent: (mode?: 'auto' | 'full', reason?: 'button_click' | 'non_button') => Promise<void>;
   onDismissAnalysis: () => void;
   handleAddOver: () => void;
@@ -1641,7 +1832,7 @@ interface DashboardProps {
 
 function Dashboard({
   matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, addPlayer, deletePlayer, movePlayerToSub,
-  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit,
+  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit,
   recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, onBack
 }: DashboardProps) {
   const [isAdding, setIsAdding] = useState(false);
@@ -1675,6 +1866,7 @@ function Dashboard({
   const handleDismissAnalysis = () => {
     console.log('dismiss analysis');
     setSubstitutionRecommendation(null);
+    setShowRouterSignals(false);
     onDismissAnalysis?.();
   };
 
@@ -1805,11 +1997,7 @@ function Dashboard({
           ],
         }
       : null;
-  const isCoachOutputState =
-    agentState === 'thinking' ||
-    agentState === 'done' ||
-    agentState === 'offline' ||
-    agentState === 'invalid';
+  const isCoachOutputState = analysisActive;
   const handleAddBoundary = (boundary: '4' | '6') => {
     if (!activePlayer) return;
     updatePlayer(activePlayer.id, { boundaryEvents: [...boundaryEvents, boundary] });
@@ -2476,6 +2664,17 @@ function Dashboard({
                       </button>
                     </div>
                   </div>
+
+                  {analysisActive && (
+                    <div className="mt-6">
+                      <FatigueForecastChart
+                        currentFatigue={activePlayer.fatigue}
+                        intensity={matchContext.pitch || matchContext.phase || 'Medium'}
+                        consecutiveOvers={activePlayer.consecutiveOvers ?? 0}
+                        heartRateRecovery={activePlayer.hrRecovery ?? 'Good'}
+                      />
+                    </div>
+                  )}
                   </motion.div>
                 )}
               </AnimatePresence>
@@ -2563,12 +2762,13 @@ function Dashboard({
                   )}
 
                   {isCoachOutputState && (
-                    <div
-                      ref={scrollRef}
-                      onScroll={handleTacticalScroll}
-                      className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain pr-2 coach-output"
-                    >
-                      <div className="space-y-5">
+                    <div className="mt-4 rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                      <div
+                        ref={scrollRef}
+                        onScroll={handleTacticalScroll}
+                        className="max-h-[45vh] overflow-y-auto overscroll-contain pr-1 coach-output"
+                      >
+                        <div className="space-y-5">
                         <div className="rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
                           {agentState === 'thinking' ? 'Analyzing...' : 'Analysis Output'}
                         </div>
@@ -2762,7 +2962,8 @@ function Dashboard({
                             </p>
                           )}
                         </motion.div>
-                        <div ref={bottomRef} />
+                          <div ref={bottomRef} />
+                        </div>
                       </div>
                     </div>
                   )}

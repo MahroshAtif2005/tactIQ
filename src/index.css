@@ -3170,16 +3170,19 @@ html {
 }
 
 html, body {
-  height: 100%;
+  height: auto;
+  min-height: 100%;
+  overflow-y: auto;
 }
 
 body {
   margin: 0;
-  overflow-y: auto;
 }
 
 #root {
-  min-height: 100%;
+  min-height: 100vh;
+  height: auto;
+  overflow: visible;
 }
 
 .dashboard-main-offset {
