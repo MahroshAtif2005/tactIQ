@@ -1169,7 +1169,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen w-full flex flex-col bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 overflow-x-hidden overflow-y-auto relative">
+    <div className="h-screen w-full flex flex-col bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 overflow-x-hidden overflow-y-auto relative">
       {/* Global Mouse Glow Cursor - Only on Landing Page */}
       {page === 'landing' && <MouseGlow />}
 
@@ -1317,7 +1317,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <main className="relative z-10 flex-1 w-full flex flex-col dashboard-main-offset">
+      <main className={`relative z-10 flex-1 w-full flex flex-col dashboard-main-offset ${page === 'dashboard' ? 'min-h-0 overflow-hidden' : ''}`}>
         <AnimatePresence mode="wait">
           {page === 'landing' && (
             <LandingPage key="landing" onStart={() => navigateTo('setup')} />
@@ -1650,8 +1650,8 @@ function Dashboard({
   const [substitutionRecommendation, setSubstitutionRecommendation] = useState<string | null>(null);
   const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
   const [showRouterSignals, setShowRouterSignals] = useState(false);
-  const tacticalScrollRef = useRef<HTMLDivElement | null>(null);
-  const tacticalEndRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
 
   useEffect(() => {
@@ -1816,34 +1816,44 @@ function Dashboard({
   };
 
   const handleTacticalScroll = () => {
-    const container = tacticalScrollRef.current;
+    const container = scrollRef.current;
     if (!container) return;
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     stickToBottomRef.current = distanceFromBottom < 80;
   };
 
+  const scrollCoachOutputToBottom = (behavior: ScrollBehavior = 'smooth') => {
+    const container = scrollRef.current;
+    if (container) {
+      container.scrollTo({ top: container.scrollHeight, behavior });
+    } else {
+      bottomRef.current?.scrollIntoView({ behavior, block: 'end' });
+    }
+  };
+
   const primeCoachAutoScroll = () => {
     stickToBottomRef.current = true;
     requestAnimationFrame(() => {
-      tacticalEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      scrollCoachOutputToBottom('smooth');
     });
   };
 
   // Auto-follow new analysis output while user is near the bottom.
   useEffect(() => {
+    if (!isCoachOutputState) return;
     if (!stickToBottomRef.current) return;
-    tacticalEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, agentWarning, substitutionRecommendation]);
+    scrollCoachOutputToBottom('smooth');
+  }, [agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, agentWarning, substitutionRecommendation, isCoachOutputState]);
 
 
   return (
     <motion.div 
       initial={{ opacity: 0 }} 
       animate={{ opacity: 1 }}
-      className="px-4 md:px-6 pt-5 pb-6 w-full flex flex-col"
+      className="px-4 md:px-6 pt-5 pb-6 w-full flex flex-col flex-1 min-h-0"
     >
       {/* Context Bar */}
-      <div className="bg-[#0F172A] border border-white/5 rounded-xl px-3 py-4 flex flex-wrap items-center gap-6 mb-6">
+      <div className="flex-none bg-[#0F172A] border border-white/5 rounded-xl px-3 py-4 flex flex-wrap items-center gap-6 mb-6">
         <GlowingBackButton onClick={onBack} label="Match Setup" />
         <div className="h-6 w-px bg-transparent hidden md:block" />
         <div className="flex items-center gap-6 text-xs font-bold tracking-wider text-slate-400">
@@ -1914,12 +1924,12 @@ function Dashboard({
         </div>
       </div>
 
-      <div className="w-full">
-      <div className="grid lg:grid-cols-12 gap-6 mt-0 items-stretch">
+      <div className="w-full flex-1 min-h-0 overflow-hidden">
+      <div className="h-full min-h-0 grid lg:grid-cols-12 gap-6 mt-0 items-stretch">
         
         {/* LEFT: ROSTER (EDITABLE) */}
-        <div className="lg:col-span-3 flex flex-col gap-4 h-full">
-          <div className="bg-[#0F172A] border border-white/5 rounded-2xl min-h-[70vh] h-full flex-1 flex flex-col overflow-visible">
+        <div className="lg:col-span-3 flex flex-col gap-4 h-full min-h-0">
+          <div className="bg-[#0F172A] border border-white/5 rounded-2xl h-full min-h-0 flex-1 flex flex-col overflow-hidden">
             <div className="px-5 py-6 border-b border-white/5 bg-slate-900/50 flex items-center justify-between">
                <h3 className="text-sm dashboard-panel-title-tall font-bold text-slate-400 flex items-center gap-2">
                  <Users className="w-5 h-5 dashboard-icon-tall" /> Roster ({totalCount}/13)
@@ -2028,8 +2038,8 @@ function Dashboard({
         </div>
 
         {/* CENTER: METRICS */}
-        <div className="lg:col-span-6 flex flex-col gap-4 h-full">
-          <div className={`bg-[#0F172A] border rounded-2xl min-h-[70vh] h-full flex-1 px-6 py-6 dashboard-center-panel-y relative overflow-visible flex flex-col transition-all duration-500 ${
+        <div className="lg:col-span-6 flex flex-col gap-4 h-full min-h-0">
+          <div className={`bg-[#0F172A] border rounded-2xl h-full min-h-0 flex-1 px-6 py-6 dashboard-center-panel-y relative overflow-hidden flex flex-col transition-all duration-500 ${
             (activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High')
               ? 'border-rose-500/50 shadow-[0_0_30px_rgba(225,29,72,0.15)]' 
               : 'border-white/5'
@@ -2480,11 +2490,11 @@ function Dashboard({
         </div>
 
         {/* RIGHT: COACH AGENT */}
-        <div className="lg:col-span-3 flex flex-col gap-4 h-full">
-           <div className="min-h-[70vh] h-full flex-1 flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
+        <div className="lg:col-span-3 flex flex-col gap-4 h-full min-h-0">
+           <div className="h-full min-h-0 flex-1 flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
               <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50 rounded-t-2xl" />
               
-              <div className="shrink-0 p-6 pb-3">
+              <div className="flex-none p-6 pb-3">
                 <div className="w-full flex items-center justify-between">
                   <span className="text-xl dashboard-panel-title-tall font-bold text-slate-300 flex items-center gap-2">
                     <Shield className="w-10 h-10 dashboard-title-icon-tall text-emerald-400 drop-shadow-[0_0_6px_rgba(16,185,129,0.6)]" /> Tactical Coach AI
@@ -2538,7 +2548,7 @@ function Dashboard({
                       }}
                       onMouseEnter={() => setIsRunCoachHovered(true)}
                       onMouseLeave={() => setIsRunCoachHovered(false)}
-                      className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
+                      className="mt-2 w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
                       style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
                     >
                       <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
@@ -2548,11 +2558,11 @@ function Dashboard({
               )}
 
               {isCoachOutputState && (
-                <div className="flex-1 min-h-0 flex flex-col">
-                  <div className="flex-none mb-3 rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
+                <div ref={scrollRef} onScroll={handleTacticalScroll} className="tactical-scroll flex-1 min-h-0 overflow-y-auto pr-2">
+                  <div className="space-y-5">
+                  <div className="rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
                     {agentState === 'thinking' ? 'Analyzing...' : 'Analysis Output'}
                   </div>
-                  <div ref={tacticalScrollRef} onScroll={handleTacticalScroll} className="tactical-scroll flex-1 min-h-0 overflow-y-auto pr-2 space-y-5">
                   {agentWarning && (
                     <div className="w-full">
                       <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-3 py-2 text-left">
@@ -2744,7 +2754,7 @@ function Dashboard({
                   )}
 
                 </motion.div>
-                <div ref={tacticalEndRef} />
+                <div ref={bottomRef} />
                 </div>
                 </div>
               )}
@@ -2753,23 +2763,11 @@ function Dashboard({
                 <div className="mt-8 text-slate-500 text-sm">Select a player to analyze</div>
               )}
               </div>
-              {activePlayer && isCoachOutputState && (
-                <div className="shrink-0 p-6 pt-3 border-t border-white/5 bg-[#0F172A]">
+              {activePlayer && (
+                <div className="flex-none p-6 pt-3 border-t border-white/5 bg-[#0F172A]">
                   <div className="space-y-3">
-                    <button
-                      type="button"
-                      aria-label="Run Coach Agent"
-                      onClick={() => {
-                        primeCoachAutoScroll();
-                        runAgent('auto', 'button_click');
-                      }}
-                      onMouseEnter={() => setIsRunCoachHovered(true)}
-                      onMouseLeave={() => setIsRunCoachHovered(false)}
-                      className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
-                      style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
-                    >
-                      <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
-                    </button>
+                    {isCoachOutputState && (
+                      <>
                     <button
                       onClick={() => {
                         primeCoachAutoScroll();
@@ -2787,6 +2785,8 @@ function Dashboard({
                     >
                       Dismiss Analysis
                     </button>
+                      </>
+                    )}
                   </div>
                 </div>
               )}
