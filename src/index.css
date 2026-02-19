@@ -3289,3 +3289,20 @@ body {
   scrollbar-color: #10B981 rgba(15, 23, 42, 0.75);
   scrollbar-gutter: stable;
 }
+
+.coach-output::-webkit-scrollbar {
+  width: 6px;
+}
+
+.coach-output {
+  scrollbar-color: #22c55e transparent;
+}
+
+.coach-output::-webkit-scrollbar-thumb {
+  background-color: #22c55e;
+  border-radius: 6px;
+}
+
+.coach-output::-webkit-scrollbar-track {
+  background: transparent;
+}
