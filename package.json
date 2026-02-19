@@ -49,7 +49,6 @@
             "react-hook-form": "^7.55.0",
             "react-resizable-panels": "^2.1.7",
             "recharts": "^2.15.2",
-            "serve": "^14.2.0",
             "sonner": "^2.0.3",
             "tailwind-merge": "*",
             "vaul": "^1.1.2",
@@ -60,17 +59,13 @@
             "@types/react": "^19.2.14",
             "@types/react-dom": "^19.2.3",
             "@vitejs/plugin-react-swc": "^3.10.2",
-            "cross-env": "^7.0.3",
-            "concurrently": "^9.0.1"
+            "concurrently": "^9.0.1",
+            "cross-env": "^7.0.3"
       },
-  "scripts": {
-    "dev:client": "vite",
-    "dev:functions": "cross-env-shell \"cd api && func start --typescript --port ${FUNCTION_PORT:-7071}\"",
-    "dev": "vite",
-    "dev:full": "concurrently \"npm run dev:functions\" \"npm run dev:client\"",
-    "api:start": "npm --prefix api run start",
-    "build": "vite build",
-    "preview": "vite preview",
-    "start": "node server.js"
-  }
+      "scripts": {
+            "dev": "vite",
+            "build": "vite build",
+            "preview": "vite preview",
+            "start": "node server.js"
+      }
 }

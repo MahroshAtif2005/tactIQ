@@ -1,14 +1,10 @@
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse } from '../types/agents';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
+export const apiHealthUrl = '/api/health';
+export const apiOrchestrateUrl = '/api/orchestrate';
 
-const toApiUrl = (path: string): string => `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`;
-
-export const apiHealthUrl = toApiUrl('/api/health');
-export const apiOrchestrateUrl = toApiUrl('/api/orchestrate');
-
-const fatigueEndpoint = toApiUrl('/api/agents/fatigue');
-const riskEndpoint = toApiUrl('/api/agents/risk');
+const fatigueEndpoint = '/api/agents/fatigue';
+const riskEndpoint = '/api/agents/risk';
 const orchestrateEndpoint = apiOrchestrateUrl;
 
 export class ApiClientError extends Error {
@@ -26,7 +22,7 @@ export class ApiClientError extends Error {
 }
 
 const coachAgentFailureMessage = (status: number | 'network'): string =>
-  `Coach Agent failed (${status}). Check API deployment / VITE_API_BASE_URL.`;
+  `Coach Agent failed (${status}). Check API deployment.`;
 
 const summarizeErrorText = (text: string): string => {
   const normalized = text.trim().replace(/\s+/g, ' ');
@@ -143,7 +139,49 @@ export async function postOrchestrate(
   payload: unknown,
   signal?: AbortSignal
 ): Promise<OrchestrateResponse> {
-  return postJson<OrchestrateResponse>(orchestrateEndpoint, payload, signal);
+  const raw = await postJson<unknown>(orchestrateEndpoint, payload, signal);
+
+  if (
+    raw &&
+    typeof raw === 'object' &&
+    'meta' in raw &&
+    'errors' in raw &&
+    'combinedDecision' in raw
+  ) {
+    return raw as OrchestrateResponse;
+  }
+
+  const rawRecord = (raw && typeof raw === 'object') ? (raw as Record<string, unknown>) : {};
+  const rawMode = rawRecord.mode;
+  const mode: 'auto' | 'full' = rawMode === 'full' ? 'full' : 'auto';
+  const message = typeof rawRecord.message === 'string'
+    ? rawRecord.message
+    : 'Orchestrator fallback response received.';
+
+  return {
+    combinedDecision: {
+      immediateAction: 'Continue with monitored plan',
+      suggestedAdjustments: [message],
+      confidence: 0.55,
+      rationale: 'Normalized from simplified orchestrator payload.',
+    },
+    errors: [],
+    meta: {
+      requestId: `normalized-${Date.now()}`,
+      mode,
+      executedAgents: [],
+      modelRouting: {
+        fatigueModel: 'fallback',
+        riskModel: 'fallback',
+        tacticalModel: 'fallback',
+        fallbacksUsed: ['normalized-simple-orchestrate-response'],
+      },
+      usedFallbackAgents: [],
+      timingsMs: {
+        total: 1,
+      },
+    },
+  };
 }
 
 export async function getApiHealth(
