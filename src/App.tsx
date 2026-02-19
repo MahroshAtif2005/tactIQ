@@ -1169,7 +1169,7 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen w-full flex flex-col bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 overflow-x-hidden overflow-y-auto relative">
+    <div className="min-h-screen h-screen w-full flex flex-col overflow-hidden bg-[#020408] text-slate-100 font-sans selection:bg-emerald-500/30 relative">
       {/* Global Mouse Glow Cursor - Only on Landing Page */}
       {page === 'landing' && <MouseGlow />}
 
@@ -1317,7 +1317,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <main className={`relative z-10 flex-1 w-full flex flex-col dashboard-main-offset ${page === 'dashboard' ? 'min-h-0 overflow-hidden' : ''}`}>
+      <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col overflow-hidden dashboard-main-offset">
         <AnimatePresence mode="wait">
           {page === 'landing' && (
             <LandingPage key="landing" onStart={() => navigateTo('setup')} />
@@ -1845,12 +1845,11 @@ function Dashboard({
     scrollCoachOutputToBottom('smooth');
   }, [agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, agentWarning, substitutionRecommendation, isCoachOutputState]);
 
-
   return (
     <motion.div 
       initial={{ opacity: 0 }} 
       animate={{ opacity: 1 }}
-      className="px-4 md:px-6 pt-5 pb-6 w-full flex flex-col flex-1 min-h-0"
+      className="px-4 md:px-6 pt-5 pb-6 w-full flex flex-col flex-1 h-full min-h-0"
     >
       {/* Context Bar */}
       <div className="flex-none bg-[#0F172A] border border-white/5 rounded-xl px-3 py-4 flex flex-wrap items-center gap-6 mb-6">
@@ -1924,11 +1923,11 @@ function Dashboard({
         </div>
       </div>
 
-      <div className="w-full flex-1 min-h-0 overflow-hidden">
-      <div className="h-full min-h-0 grid lg:grid-cols-12 gap-6 mt-0 items-stretch">
+      <div className="w-full flex-1 min-h-0">
+      <div data-testid="dashboard-grid" className="h-full min-h-0 grid lg:grid-cols-12 gap-6 mt-0 items-stretch">
         
         {/* LEFT: ROSTER (EDITABLE) */}
-        <div className="lg:col-span-3 flex flex-col gap-4 h-full min-h-0">
+        <div className="lg:col-span-3 flex flex-col gap-4 min-h-0 h-full">
           <div className="bg-[#0F172A] border border-white/5 rounded-2xl h-full min-h-0 flex-1 flex flex-col overflow-hidden">
             <div className="px-5 py-6 border-b border-white/5 bg-slate-900/50 flex items-center justify-between">
                <h3 className="text-sm dashboard-panel-title-tall font-bold text-slate-400 flex items-center gap-2">
@@ -1939,7 +1938,7 @@ function Dashboard({
                )}
             </div>
             
-            <div className="px-4 py-5 space-y-3 overflow-visible flex-1 h-full">
+            <div className="px-4 py-5 space-y-3 flex-1 min-h-0 overflow-y-auto">
               {players.filter((p: Player) => p.inRoster !== false).map((player: Player, index: number) => {
                 const isSub = index >= 11;
                 return (
@@ -2038,8 +2037,8 @@ function Dashboard({
         </div>
 
         {/* CENTER: METRICS */}
-        <div className="lg:col-span-6 flex flex-col gap-4 h-full min-h-0">
-          <div className={`bg-[#0F172A] border rounded-2xl h-full min-h-0 flex-1 px-6 py-6 dashboard-center-panel-y relative overflow-hidden flex flex-col transition-all duration-500 ${
+        <div className="lg:col-span-6 flex flex-col gap-4 min-h-0 h-full">
+          <div className={`bg-[#0F172A] border rounded-2xl h-full min-h-0 flex-1 px-6 py-6 dashboard-center-panel-y relative flex flex-col overflow-hidden transition-all duration-500 ${
             (activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High')
               ? 'border-rose-500/50 shadow-[0_0_30px_rgba(225,29,72,0.15)]' 
               : 'border-white/5'
@@ -2047,7 +2046,7 @@ function Dashboard({
             {/* Background Decor */}
              <div className="absolute top-0 right-0 w-64 h-64 bg-emerald-500/5 blur-[80px] rounded-full pointer-events-none" />
 
-            <div className="flex justify-between items-start mb-8 relative z-10">
+            <div className="flex justify-between items-start mb-8 relative z-10 shrink-0">
               <div>
                  <div className="flex items-center gap-2 mb-1">
                    <Activity className={`w-6 h-6 dashboard-icon-tall-lg ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500 animate-pulse' : 'text-emerald-400'}`} />
@@ -2065,17 +2064,18 @@ function Dashboard({
             </div>
 
             {/* Main Stats Panels */}
-            {activePlayer ? (
-            <AnimatePresence mode="wait" initial={false}>
-              {activePlayer.role === 'Batsman' ? (
-                <motion.div
-                  key="batsman-telemetry"
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -8 }}
-                  transition={{ duration: 0.2 }}
-                  className="relative z-10 min-h-[560px] flex flex-col flex-1 overflow-visible"
-                >
+            <div className="relative z-10 flex-1 min-h-0 overflow-y-auto overscroll-contain pr-2">
+              {activePlayer ? (
+              <AnimatePresence mode="wait" initial={false}>
+                {activePlayer.role === 'Batsman' ? (
+                  <motion.div
+                    key="batsman-telemetry"
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={{ duration: 0.2 }}
+                    className="min-h-0 flex flex-col"
+                  >
                   <div className="grid grid-cols-2 gap-4 mb-8">
                     <div className="bg-[#162032] rounded-xl p-5 border border-white/5 text-center">
                       <div className="text-xs font-bold uppercase mb-2 text-slate-500">Runs</div>
@@ -2269,16 +2269,16 @@ function Dashboard({
                       </button>
                     </div>
                   </div>
-                </motion.div>
-              ) : (
-                <motion.div
-                  key="bowler-telemetry"
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -8 }}
-                  transition={{ duration: 0.2 }}
-                  className="relative z-10 min-h-[560px] flex flex-col flex-1 overflow-visible"
-                >
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="bowler-telemetry"
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={{ duration: 0.2 }}
+                    className="min-h-0 flex flex-col"
+                  >
                   {(activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High') && (
                     <div className="mb-6 bg-rose-950/40 border border-rose-500/30 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4 animate-in fade-in slide-in-from-top-4 backdrop-blur-md shadow-2xl shadow-rose-900/10">
                       <div className="flex items-center gap-4 w-full sm:w-auto">
@@ -2476,321 +2476,330 @@ function Dashboard({
                       </button>
                     </div>
                   </div>
-                </motion.div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              ) : (
+                 <div className="flex flex-1 min-h-0 flex-col items-center justify-center text-slate-500">
+                   <Users className="w-14 h-14 mb-4 opacity-50" />
+                   <p>Select a player from the roster to view metrics.</p>
+                 </div>
               )}
-            </AnimatePresence>
-            ) : (
-               <div className="flex flex-col items-center justify-center h-full text-slate-500">
-                 <Users className="w-14 h-14 mb-4 opacity-50" />
-                 <p>Select a player from the roster to view metrics.</p>
-               </div>
-            )}
+            </div>
 
           </div>
         </div>
 
         {/* RIGHT: COACH AGENT */}
-        <div className="lg:col-span-3 flex flex-col gap-4 h-full min-h-0">
-           <div className="h-full min-h-0 flex-1 flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
-              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50 rounded-t-2xl" />
-              
-              <div className="flex-none p-6 pb-3">
-                <div className="w-full flex items-center justify-between">
-                  <span className="text-xl dashboard-panel-title-tall font-bold text-slate-300 flex items-center gap-2">
-                    <Shield className="w-10 h-10 dashboard-title-icon-tall text-emerald-400 drop-shadow-[0_0_6px_rgba(16,185,129,0.6)]" /> Tactical Coach AI
-                  </span>
-                </div>
+        <div className="lg:col-span-3 flex flex-col gap-4 min-h-0 h-full">
+          <div
+            data-testid="coach-panel"
+            className="h-full min-h-0 flex-1 flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative"
+          >
+            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50 rounded-t-2xl" />
+
+            <div className="flex-none shrink-0 p-6 pb-3">
+              <div className="w-full flex items-center justify-between">
+                <span className="text-xl dashboard-panel-title-tall font-bold text-slate-300 flex items-center gap-2">
+                  <Shield className="w-10 h-10 dashboard-title-icon-tall text-emerald-400 drop-shadow-[0_0_6px_rgba(16,185,129,0.6)]" /> Tactical Coach AI
+                </span>
               </div>
+            </div>
 
-              <div className="flex-1 min-h-0 flex flex-col overflow-hidden px-6 py-5">
-              
+            <div className="flex-1 min-h-0 flex flex-col px-6 py-5">
               {activePlayer ? (
-              <>
-              {/* EMPTY_STATE_MARKER */}
-              {!isCoachOutputState && !substitutionRecommendation && (
-                <div className="flex-1 flex flex-col items-center justify-center">
-                  <div className="w-full flex flex-col items-center gap-2">
-                    <div className="w-24 h-24 dashboard-coach-shield-container-tall dashboard-coach-shift-up rounded-3xl flex items-center justify-center bg-gradient-to-br from-indigo-500/25 via-purple-500/20 to-blue-500/15 border border-white/10 shadow-[0_0_40px_rgba(99,102,241,0.25)] backdrop-blur-md">
-                      <div className="relative overflow-visible">
-                        <div
-                          className="absolute inset-0 -z-10 rounded-full blur-xl"
-                          style={{
-                            width: 80,
-                            height: 88,
-                            left: '50%',
-                            top: '50%',
-                            transform: 'translate(-50%, -50%)',
-                            background: 'rgba(16,185,129,0.18)',
-                            boxShadow: '0 0 35px rgba(16,185,129,0.35)',
-                          }}
-                        />
-                        <div
-                          className="relative rounded-full p-4"
-                          style={{
-                            boxShadow: '0 0 18px rgba(16,185,129,0.25)',
-                          }}
-                        >
-                          <Shield
-                            className="w-14 h-14 dashboard-coach-shield-glyph-tall text-emerald-400"
-                            style={{
-                              filter: 'drop-shadow(0 0 10px rgba(16,185,129,0.7))',
-                            }}
-                          />
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      aria-label="Run Coach Agent"
-                      onClick={() => {
-                        primeCoachAutoScroll();
-                        runAgent('auto', 'button_click');
-                      }}
-                      onMouseEnter={() => setIsRunCoachHovered(true)}
-                      onMouseLeave={() => setIsRunCoachHovered(false)}
-                      className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A]"
-                      style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
-                    >
-                      <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {isCoachOutputState && (
-                <div ref={scrollRef} onScroll={handleTacticalScroll} className="tactical-scroll flex-1 min-h-0 overflow-y-auto pr-2">
-                  <div className="space-y-5">
-                  <div className="rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
-                    {agentState === 'thinking' ? 'Analyzing...' : 'Analysis Output'}
-                  </div>
-                  {agentWarning && (
-                    <div className="w-full">
-                      <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-3 py-2 text-left">
-                        {agentWarning}
-                      </div>
-                    </div>
-                  )}
-                  {showBatsmanAiAlert && (
-                    <motion.div
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="w-full"
-                    >
-                      <div className={`rounded-xl p-5 relative overflow-hidden border ${isPressureCritical ? 'bg-rose-950/20 border-rose-500/30' : 'bg-amber-950/20 border-amber-500/30'}`}>
-                        <div className="flex items-start gap-3">
-                          <div className={`w-9 h-9 rounded-lg flex items-center justify-center border shrink-0 ${isPressureCritical ? 'bg-rose-500/15 border-rose-500/40' : 'bg-amber-500/15 border-amber-500/40'}`}>
-                            <AlertTriangle className={`w-5 h-5 ${isPressureCritical ? 'text-rose-400' : 'text-amber-300'}`} />
-                          </div>
-                          <div className="text-left">
-                            <h4 className={`text-xs font-bold uppercase tracking-wide mb-2 ${isPressureCritical ? 'text-rose-300' : 'text-amber-200'}`}>
-                              {tacticalAlertTitle}
-                            </h4>
-                            <p className="text-xs text-slate-200 mb-2">{tacticalAlertText}</p>
-                            <p className="text-xs text-slate-300 mb-3">
-                              Pressure {pressureIndex.toFixed(1)}/10 | RR {currentRunRate.toFixed(2)} (Req {requiredRunRate.toFixed(2)}) | SR {batsmanStrikeRate.toFixed(1)} / Req {requiredStrikeRate.toFixed(1)}
-                            </p>
-                            <p className="text-[11px] text-slate-400 mb-3">
-                              {alertWhyLine}
-                            </p>
-                            <div className="space-y-1.5">
-                              {batsmanRecommendations.map((tip, index) => (
-                                <p key={index} className="text-xs text-slate-200 leading-relaxed">• {tip}</p>
-                              ))}
+                <>
+                  {!isCoachOutputState && (
+                    <div className="flex-1 min-h-0 flex flex-col items-center justify-center">
+                      <div className="w-full flex flex-col items-center gap-2">
+                        <div className="w-24 h-24 dashboard-coach-shield-container-tall dashboard-coach-shift-up rounded-3xl flex items-center justify-center bg-gradient-to-br from-indigo-500/25 via-purple-500/20 to-blue-500/15 border border-white/10 shadow-[0_0_40px_rgba(99,102,241,0.25)] backdrop-blur-md">
+                          <div className="relative">
+                            <div
+                              className="absolute inset-0 -z-10 rounded-full blur-xl"
+                              style={{
+                                width: 80,
+                                height: 88,
+                                left: '50%',
+                                top: '50%',
+                                transform: 'translate(-50%, -50%)',
+                                background: 'rgba(16,185,129,0.18)',
+                                boxShadow: '0 0 35px rgba(16,185,129,0.35)',
+                              }}
+                            />
+                            <div
+                              className="relative rounded-full p-4"
+                              style={{
+                                boxShadow: '0 0 18px rgba(16,185,129,0.25)',
+                              }}
+                            >
+                              <Shield
+                                className="w-14 h-14 dashboard-coach-shield-glyph-tall text-emerald-400"
+                                style={{
+                                  filter: 'drop-shadow(0 0 10px rgba(16,185,129,0.7))',
+                                }}
+                              />
                             </div>
                           </div>
                         </div>
+                        <div className="w-full mt-6">
+                          <button
+                            type="button"
+                            aria-label="Run Coach Agent"
+                            onClick={() => {
+                              primeCoachAutoScroll();
+                              runAgent('auto', 'button_click');
+                            }}
+                            onMouseEnter={() => setIsRunCoachHovered(true)}
+                            onMouseLeave={() => setIsRunCoachHovered(false)}
+                            disabled={agentState === 'thinking'}
+                            className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A] disabled:opacity-70 disabled:cursor-not-allowed"
+                            style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
+                          >
+                            <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                          </button>
+                        </div>
                       </div>
-                    </motion.div>
+                    </div>
                   )}
-                  {substitutionRecommendation && (
-                    <motion.div
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="w-full"
+
+                  {isCoachOutputState && (
+                    <div
+                      ref={scrollRef}
+                      onScroll={handleTacticalScroll}
+                      className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain pr-2 coach-output"
                     >
-                      <div className="bg-rose-950/20 border border-rose-500/20 rounded-xl p-6 relative overflow-hidden group">
-                        <div className="absolute top-0 right-0 w-32 h-32 bg-rose-500/5 blur-[40px] rounded-full pointer-events-none group-hover:bg-rose-500/10 transition-colors" />
-                        <div className="flex items-start gap-4 relative z-10">
-                          <div className="w-10 h-10 rounded-lg bg-rose-500/10 flex items-center justify-center border border-rose-500/20 shrink-0">
-                            <AlertTriangle className="w-6 h-6 text-rose-400" />
+                      <div className="space-y-5">
+                        <div className="rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
+                          {agentState === 'thinking' ? 'Analyzing...' : 'Analysis Output'}
+                        </div>
+                        {agentWarning && (
+                          <div className="w-full">
+                            <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-3 py-2 text-left">
+                              {agentWarning}
+                            </div>
                           </div>
-                          <div>
-                            <h4 className="text-xs font-bold text-rose-400 uppercase tracking-wide mb-2 flex items-center gap-2">
-                              Strategic Intervention
-                              <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-rose-500 shadow-[0_0_8px_#f43f5e]" />
-                            </h4>
-                            <p className="text-sm text-rose-100/90 leading-relaxed font-medium">
-                              {substitutionRecommendation}
+                        )}
+                        {showBatsmanAiAlert && (
+                          <motion.div
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="w-full"
+                          >
+                            <div className={`rounded-xl p-5 relative overflow-hidden border ${isPressureCritical ? 'bg-rose-950/20 border-rose-500/30' : 'bg-amber-950/20 border-amber-500/30'}`}>
+                              <div className="flex items-start gap-3">
+                                <div className={`w-9 h-9 rounded-lg flex items-center justify-center border shrink-0 ${isPressureCritical ? 'bg-rose-500/15 border-rose-500/40' : 'bg-amber-500/15 border-amber-500/40'}`}>
+                                  <AlertTriangle className={`w-5 h-5 ${isPressureCritical ? 'text-rose-400' : 'text-amber-300'}`} />
+                                </div>
+                                <div className="text-left">
+                                  <h4 className={`text-xs font-bold uppercase tracking-wide mb-2 ${isPressureCritical ? 'text-rose-300' : 'text-amber-200'}`}>
+                                    {tacticalAlertTitle}
+                                  </h4>
+                                  <p className="text-xs text-slate-200 mb-2">{tacticalAlertText}</p>
+                                  <p className="text-xs text-slate-300 mb-3">
+                                    Pressure {pressureIndex.toFixed(1)}/10 | RR {currentRunRate.toFixed(2)} (Req {requiredRunRate.toFixed(2)}) | SR {batsmanStrikeRate.toFixed(1)} / Req {requiredStrikeRate.toFixed(1)}
+                                  </p>
+                                  <p className="text-[11px] text-slate-400 mb-3">
+                                    {alertWhyLine}
+                                  </p>
+                                  <div className="space-y-1.5">
+                                    {batsmanRecommendations.map((tip, index) => (
+                                      <p key={index} className="text-xs text-slate-200 leading-relaxed">• {tip}</p>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+                        {substitutionRecommendation && (
+                          <motion.div
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="w-full"
+                          >
+                            <div className="bg-rose-950/20 border border-rose-500/20 rounded-xl p-6 relative overflow-hidden group">
+                              <div className="absolute top-0 right-0 w-32 h-32 bg-rose-500/5 blur-[40px] rounded-full pointer-events-none group-hover:bg-rose-500/10 transition-colors" />
+                              <div className="flex items-start gap-4 relative z-10">
+                                <div className="w-10 h-10 rounded-lg bg-rose-500/10 flex items-center justify-center border border-rose-500/20 shrink-0">
+                                  <AlertTriangle className="w-6 h-6 text-rose-400" />
+                                </div>
+                                <div>
+                                  <h4 className="text-xs font-bold text-rose-400 uppercase tracking-wide mb-2 flex items-center gap-2">
+                                    Strategic Intervention
+                                    <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-rose-500 shadow-[0_0_8px_#f43f5e]" />
+                                  </h4>
+                                  <p className="text-sm text-rose-100/90 leading-relaxed font-medium">
+                                    {substitutionRecommendation}
+                                  </p>
+                                </div>
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+                        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full text-left pr-1 space-y-5">
+                          <div className="p-4 rounded-xl border border-indigo-400/35 bg-[#162032]">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-sm font-bold text-white">Tactical Coach AI</h4>
+                              <span className="text-[10px] px-2 py-0.5 rounded border border-indigo-400/40 text-indigo-200 bg-indigo-500/10">
+                                {orchestrateMeta?.mode === 'full' ? 'FULL COMBINED' : 'AUTO ROUTING'}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-400 mt-1">Router intent: {routerDecision?.intent || 'monitor'}</p>
+                          </div>
+
+                          <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
+                            <p className="text-xs font-bold text-slate-200 mb-2">Model Router</p>
+                            <div className="flex flex-wrap gap-1.5 mb-2">
+                              {(routerDecision?.selectedAgents || orchestrateMeta?.executedAgents || []).map((agent) => (
+                                <span key={agent} className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200 bg-slate-800">
+                                  {agent.toUpperCase()}
+                                </span>
+                              ))}
+                            </div>
+                            <p className="text-xs text-slate-300 mb-2">{routerDecision?.reason || 'Router selecting agents from current signals.'}</p>
+                            <button
+                              onClick={() => setShowRouterSignals((v) => !v)}
+                              className="text-[11px] text-slate-400 hover:text-slate-200"
+                            >
+                              {showRouterSignals ? 'Hide Signals' : 'Show Signals'}
+                            </button>
+                            {showRouterSignals && (
+                              <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-slate-400">
+                                {Object.entries(routerDecision?.signals || {}).map(([k, v]) => (
+                                  <div key={k} className="flex justify-between gap-2 border border-slate-800 rounded px-2 py-1">
+                                    <span>{k}</span>
+                                    <span className="text-slate-200">{String(v)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          {[
+                            {
+                              key: 'fatigue' as const,
+                              title: 'Fatigue Agent',
+                              subtitle: 'Workload and recovery drift',
+                              status: toStatusLabel(agentFeedStatus.fatigue, selectedAgentSet.has('fatigue'), orchestrateMeta?.usedFallbackAgents.includes('fatigue')),
+                              summary: aiAnalysis ? `${aiAnalysis.headline}` : 'No output',
+                              detail: aiAnalysis ? `Fatigue ${safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1)} · ${aiAnalysis.recommendation}` : 'Skipped by router',
+                              severity: aiAnalysis?.severity,
+                            },
+                            {
+                              key: 'risk' as const,
+                              title: 'Risk Agent',
+                              subtitle: 'Injury and no-ball risk',
+                              status: toStatusLabel(agentFeedStatus.risk, selectedAgentSet.has('risk'), orchestrateMeta?.usedFallbackAgents.includes('risk')),
+                              summary: riskAnalysis ? `${riskAnalysis.headline}` : 'No output',
+                              detail: riskAnalysis ? `Risk ${Math.round(safeNum(riskAnalysis.riskScore, 0))} · ${riskAnalysis.recommendation}` : 'Skipped by router',
+                              severity: riskAnalysis?.severity,
+                            },
+                            {
+                              key: 'tactical' as const,
+                              title: 'Tactical Agent',
+                              subtitle: 'Substitution and next action',
+                              status: toStatusLabel(agentFeedStatus.tactical, selectedAgentSet.has('tactical'), tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')),
+                              summary: tacticalAnalysis ? tacticalAnalysis.immediateAction : 'No output',
+                              detail: tacticalAnalysis ? tacticalAnalysis.rationale : 'Skipped by router',
+                              severity: tacticalAnalysis ? `${Math.round((tacticalAnalysis.confidence || 0) * 100)}%` : undefined,
+                            },
+                          ].map((step) => (
+                            <div key={step.key} className={`p-4 rounded-xl border ${selectedAgentSet.has(step.key) || orchestrateMeta?.mode === 'full' ? 'border-slate-700 bg-[#162032]' : 'border-slate-800 bg-slate-900/30 opacity-70'}`}>
+                              <div className="flex items-center justify-between mb-1">
+                                <div className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${
+                                    step.status === 'OK' ? 'bg-emerald-400' :
+                                    step.status === 'RUNNING' ? 'bg-indigo-400 animate-pulse' :
+                                    step.status === 'FALLBACK' ? 'bg-amber-400' :
+                                    step.status === 'ERROR' ? 'bg-rose-400' : 'bg-slate-600'
+                                  }`} />
+                                  <p className="text-xs font-bold text-white">{step.title}</p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  {step.status === 'FALLBACK' && <span className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300">Fallback logic</span>}
+                                  <span className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200">{step.status}</span>
+                                </div>
+                              </div>
+                              <p className="text-[11px] text-slate-500 mb-1">{step.subtitle}</p>
+                              {step.status === 'SKIPPED' ? (
+                                <p className="text-xs text-slate-500">Skipped by router</p>
+                              ) : (
+                                <>
+                                  <p className="text-xs text-slate-200 line-clamp-2">{step.summary}</p>
+                                  <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{step.detail}</p>
+                                </>
+                              )}
+                            </div>
+                          ))}
+
+                          {combinedDecision && (
+                            <div className="p-5 rounded-xl border border-indigo-400/35 bg-gradient-to-b from-indigo-500/12 to-[#162032] border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]">
+                              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-300 mb-1">Final Recommendation</p>
+                              <h3 className="text-lg font-bold text-white mb-2">{combinedDecision.immediateAction}</h3>
+                              <ul className="text-xs text-slate-300 space-y-1 mb-2">
+                                <li>• {combinedDecision.rationale}</li>
+                                {(combinedDecision.suggestedAdjustments || []).slice(0, 2).map((item, idx) => (
+                                  <li key={`${item}-${idx}`}>• {item}</li>
+                                ))}
+                              </ul>
+                              {orchestrateMeta?.mode === 'full' && (
+                                <p className="text-[11px] text-indigo-200">
+                                  Consensus: Risk {riskAnalysis?.severity || 'N/A'} | Fatigue {aiAnalysis ? safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1) : 'N/A'} | Tactical {tacticalAnalysis ? 'Action-ready' : 'N/A'}
+                                </p>
+                              )}
+                              {orchestrateMeta?.mode === 'auto' && orchestrateMeta.executedAgents.length <= 1 && (
+                                <p className="text-[11px] text-slate-400 mt-2">
+                                  Auto routing ran: {orchestrateMeta.executedAgents.join(', ')}. Run full analysis for a combined view.
+                                </p>
+                              )}
+                            </div>
+                          )}
+
+                          {(tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')) && (
+                            <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                              Fallback mode active (Azure OpenAI not configured).
+                              <Info className="w-3 h-3 text-slate-500" title="Set AOAI env vars in local settings or Azure App Service to enable Azure OpenAI." />
                             </p>
-                          </div>
-                        </div>
+                          )}
+                        </motion.div>
+                        <div ref={bottomRef} />
                       </div>
-                    </motion.div>
-                  )}
-                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full text-left pr-1 space-y-5">
-                  <div className="p-4 rounded-xl border border-indigo-400/35 bg-[#162032]">
-                    <div className="flex items-center justify-between">
-                      <h4 className="text-sm font-bold text-white">Tactical Coach AI</h4>
-                      <span className="text-[10px] px-2 py-0.5 rounded border border-indigo-400/40 text-indigo-200 bg-indigo-500/10">
-                        {orchestrateMeta?.mode === 'full' ? 'FULL COMBINED' : 'AUTO ROUTING'}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-400 mt-1">Router intent: {routerDecision?.intent || 'monitor'}</p>
-                  </div>
-
-                  <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
-                    <p className="text-xs font-bold text-slate-200 mb-2">Model Router</p>
-                    <div className="flex flex-wrap gap-1.5 mb-2">
-                      {(routerDecision?.selectedAgents || orchestrateMeta?.executedAgents || []).map((agent) => (
-                        <span key={agent} className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200 bg-slate-800">
-                          {agent.toUpperCase()}
-                        </span>
-                      ))}
-                    </div>
-                    <p className="text-xs text-slate-300 mb-2">{routerDecision?.reason || 'Router selecting agents from current signals.'}</p>
-                    <button
-                      onClick={() => setShowRouterSignals((v) => !v)}
-                      className="text-[11px] text-slate-400 hover:text-slate-200"
-                    >
-                      {showRouterSignals ? 'Hide Signals' : 'Show Signals'}
-                    </button>
-                    {showRouterSignals && (
-                      <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-slate-400">
-                        {Object.entries(routerDecision?.signals || {}).map(([k, v]) => (
-                          <div key={k} className="flex justify-between gap-2 border border-slate-800 rounded px-2 py-1">
-                            <span>{k}</span>
-                            <span className="text-slate-200">{String(v)}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {[
-                    {
-                      key: 'fatigue' as const,
-                      title: 'Fatigue Agent',
-                      subtitle: 'Workload and recovery drift',
-                      status: toStatusLabel(agentFeedStatus.fatigue, selectedAgentSet.has('fatigue'), orchestrateMeta?.usedFallbackAgents.includes('fatigue')),
-                      summary: aiAnalysis ? `${aiAnalysis.headline}` : 'No output',
-                      detail: aiAnalysis ? `Fatigue ${safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1)} · ${aiAnalysis.recommendation}` : 'Skipped by router',
-                      severity: aiAnalysis?.severity,
-                    },
-                    {
-                      key: 'risk' as const,
-                      title: 'Risk Agent',
-                      subtitle: 'Injury and no-ball risk',
-                      status: toStatusLabel(agentFeedStatus.risk, selectedAgentSet.has('risk'), orchestrateMeta?.usedFallbackAgents.includes('risk')),
-                      summary: riskAnalysis ? `${riskAnalysis.headline}` : 'No output',
-                      detail: riskAnalysis ? `Risk ${Math.round(safeNum(riskAnalysis.riskScore, 0))} · ${riskAnalysis.recommendation}` : 'Skipped by router',
-                      severity: riskAnalysis?.severity,
-                    },
-                    {
-                      key: 'tactical' as const,
-                      title: 'Tactical Agent',
-                      subtitle: 'Substitution and next action',
-                      status: toStatusLabel(agentFeedStatus.tactical, selectedAgentSet.has('tactical'), tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')),
-                      summary: tacticalAnalysis ? tacticalAnalysis.immediateAction : 'No output',
-                      detail: tacticalAnalysis ? tacticalAnalysis.rationale : 'Skipped by router',
-                      severity: tacticalAnalysis ? `${Math.round((tacticalAnalysis.confidence || 0) * 100)}%` : undefined,
-                    },
-                  ].map((step) => (
-                    <div key={step.key} className={`p-4 rounded-xl border ${selectedAgentSet.has(step.key) || orchestrateMeta?.mode === 'full' ? 'border-slate-700 bg-[#162032]' : 'border-slate-800 bg-slate-900/30 opacity-70'}`}>
-                      <div className="flex items-center justify-between mb-1">
-                        <div className="flex items-center gap-2">
-                          <span className={`w-2 h-2 rounded-full ${
-                            step.status === 'OK' ? 'bg-emerald-400' :
-                            step.status === 'RUNNING' ? 'bg-indigo-400 animate-pulse' :
-                            step.status === 'FALLBACK' ? 'bg-amber-400' :
-                            step.status === 'ERROR' ? 'bg-rose-400' : 'bg-slate-600'
-                          }`} />
-                          <p className="text-xs font-bold text-white">{step.title}</p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {step.status === 'FALLBACK' && <span className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300">Fallback logic</span>}
-                          <span className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200">{step.status}</span>
-                        </div>
-                      </div>
-                      <p className="text-[11px] text-slate-500 mb-1">{step.subtitle}</p>
-                      {step.status === 'SKIPPED' ? (
-                        <p className="text-xs text-slate-500">Skipped by router</p>
-                      ) : (
-                        <>
-                          <p className="text-xs text-slate-200 line-clamp-2">{step.summary}</p>
-                          <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{step.detail}</p>
-                        </>
-                      )}
-                    </div>
-                  ))}
-
-                  {combinedDecision && (
-                    <div className="p-5 rounded-xl border border-indigo-400/35 bg-gradient-to-b from-indigo-500/12 to-[#162032] border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]">
-                      <p className="text-[11px] font-bold uppercase tracking-wide text-slate-300 mb-1">Final Recommendation</p>
-                      <h3 className="text-lg font-bold text-white mb-2">{combinedDecision.immediateAction}</h3>
-                      <ul className="text-xs text-slate-300 space-y-1 mb-2">
-                        <li>• {combinedDecision.rationale}</li>
-                        {(combinedDecision.suggestedAdjustments || []).slice(0, 2).map((item, idx) => (
-                          <li key={`${item}-${idx}`}>• {item}</li>
-                        ))}
-                      </ul>
-                      {orchestrateMeta?.mode === 'full' && (
-                        <p className="text-[11px] text-indigo-200">
-                          Consensus: Risk {riskAnalysis?.severity || 'N/A'} | Fatigue {aiAnalysis ? safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1) : 'N/A'} | Tactical {tacticalAnalysis ? 'Action-ready' : 'N/A'}
-                        </p>
-                      )}
-                      {orchestrateMeta?.mode === 'auto' && orchestrateMeta.executedAgents.length <= 1 && (
-                        <p className="text-[11px] text-slate-400 mt-2">
-                          Auto routing ran: {orchestrateMeta.executedAgents.join(', ')}. Run full analysis for a combined view.
-                        </p>
-                      )}
                     </div>
                   )}
-
-                  {(tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')) && (
-                    <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
-                      Fallback mode active (Azure OpenAI not configured).
-                      <Info className="w-3 h-3 text-slate-500" title="Set AOAI env vars in local settings or Azure App Service to enable Azure OpenAI." />
-                    </p>
-                  )}
-
-                </motion.div>
-                <div ref={bottomRef} />
-                </div>
-                </div>
-              )}
-              </>
+                </>
               ) : (
                 <div className="mt-8 text-slate-500 text-sm">Select a player to analyze</div>
               )}
-              </div>
-              {activePlayer && (
-                <div className="flex-none p-6 pt-3 border-t border-white/5 bg-[#0F172A]">
-                  <div className="space-y-3">
-                    {isCoachOutputState && (
-                      <>
-                    <button
-                      onClick={() => {
-                        primeCoachAutoScroll();
-                        runAgent('full', 'button_click');
-                      }}
-                      disabled={agentState === 'thinking'}
-                      className={`w-full py-3 rounded-lg border text-sm transition-colors ${agentState === 'thinking' ? 'border-slate-700 text-slate-500 cursor-not-allowed' : 'border-indigo-400/30 text-indigo-200 hover:text-white hover:bg-indigo-500/10'}`}
-                    >
-                      {agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}
-                    </button>
+            </div>
 
-                    <button
-                      onClick={handleDismissAnalysis}
-                      className="w-full py-3 rounded-lg border border-slate-700 text-slate-400 text-sm hover:text-white hover:bg-slate-800 transition-colors"
-                    >
-                      Dismiss Analysis
-                    </button>
-                      </>
-                    )}
-                  </div>
+	            {activePlayer && isCoachOutputState && (
+	              <div className="flex-none shrink-0 p-6 pt-3 border-t border-white/5 bg-[#0F172A]">
+	                <div className="space-y-3">
+	                  {isCoachOutputState && (
+	                    <>
+	                      <button
+                        onClick={() => {
+                          primeCoachAutoScroll();
+                          runAgent('full', 'button_click');
+                        }}
+                        disabled={agentState === 'thinking'}
+                        className={`w-full py-3 rounded-lg border text-sm transition-colors ${agentState === 'thinking' ? 'border-slate-700 text-slate-500 cursor-not-allowed' : 'border-indigo-400/30 text-indigo-200 hover:text-white hover:bg-indigo-500/10'}`}
+                      >
+                        {agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}
+                      </button>
+
+                      <button
+                        onClick={handleDismissAnalysis}
+                        className="w-full py-3 rounded-lg border border-slate-700 text-slate-400 text-sm hover:text-white hover:bg-slate-800 transition-colors"
+                      >
+                        Dismiss Analysis
+                      </button>
+                    </>
+                  )}
                 </div>
-              )}
-           </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
       </div>
