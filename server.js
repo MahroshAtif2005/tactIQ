@@ -190,6 +190,17 @@ app.post("/api/tactical", async (req, res) => {
   return res.status(200).json(getLocalAgentResponse("tactical"));
 });
 
+app.get("/api/health", async (req, res) => {
+  const upstream = await proxyToUpstream(req, res, "/api/health");
+  if (upstream) return upstream;
+  return res.status(200).json({
+    status: "ok",
+    service: "tactiq-server",
+    upstreamProxyEnabled: Boolean(AGENTS_BASE_URL),
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Forward all other API routes (e.g. /api/orchestrate, /api/tactical) to upstream backend.
 app.all("/api/*", async (req, res) => {
   const upstream = await proxyToUpstream(req, res, req.path);
