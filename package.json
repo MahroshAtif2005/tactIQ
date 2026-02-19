@@ -66,9 +66,11 @@
   "scripts": {
     "dev:client": "vite",
     "dev:functions": "cross-env-shell \"cd api && func start --typescript --port ${FUNCTION_PORT:-7071}\"",
-    "dev": "concurrently \"npm run dev:functions\" \"npm run dev:client\"",
+    "dev": "vite",
+    "dev:full": "concurrently \"npm run dev:functions\" \"npm run dev:client\"",
     "api:start": "npm --prefix api run start",
     "build": "vite build",
+    "preview": "vite preview",
     "start": "npx serve -s dist -l $PORT"
   }
 }

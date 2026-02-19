@@ -94,6 +94,15 @@ If port `7071` is busy, run with a different port:
 
 Frontend runs on `http://localhost:5173` and Azure Functions runs on `http://localhost:7071`.
 
+## Production Preview (Important)
+
+- `npm run dev` runs Vite dev mode, which is not identical to production behavior.
+- To reproduce live/Azure UI issues (for example CSS differences after production build), use:
+  - `npm run build`
+  - `npm run preview`
+- To force a specific preview port:
+  - `npm run preview -- --port 4173`
+
 ## API endpoints
 
 - `POST http://localhost:7071/api/agents/fatigue`
