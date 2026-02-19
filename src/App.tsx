@@ -1915,11 +1915,11 @@ function Dashboard({
       </div>
 
       <div className="w-full">
-      <div className="grid lg:grid-cols-12 gap-6 mt-0 dashboard-grid-stretch">
+      <div className="grid lg:grid-cols-12 gap-6 mt-0 items-stretch">
         
         {/* LEFT: ROSTER (EDITABLE) */}
         <div className="lg:col-span-3 flex flex-col gap-4 h-full">
-          <div className="bg-[#0F172A] border border-white/5 rounded-2xl dashboard-card-min-h h-full flex-1 flex flex-col overflow-visible">
+          <div className="bg-[#0F172A] border border-white/5 rounded-2xl min-h-[70vh] h-full flex-1 flex flex-col overflow-visible">
             <div className="px-5 py-6 border-b border-white/5 bg-slate-900/50 flex items-center justify-between">
                <h3 className="text-sm dashboard-panel-title-tall font-bold text-slate-400 flex items-center gap-2">
                  <Users className="w-5 h-5 dashboard-icon-tall" /> Roster ({totalCount}/13)
@@ -2029,7 +2029,7 @@ function Dashboard({
 
         {/* CENTER: METRICS */}
         <div className="lg:col-span-6 flex flex-col gap-4 h-full">
-          <div className={`bg-[#0F172A] border rounded-2xl dashboard-card-min-h h-full flex-1 px-6 py-6 dashboard-center-panel-y relative overflow-visible flex flex-col transition-all duration-500 ${
+          <div className={`bg-[#0F172A] border rounded-2xl min-h-[70vh] h-full flex-1 px-6 py-6 dashboard-center-panel-y relative overflow-visible flex flex-col transition-all duration-500 ${
             (activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High')
               ? 'border-rose-500/50 shadow-[0_0_30px_rgba(225,29,72,0.15)]' 
               : 'border-white/5'
@@ -2481,7 +2481,7 @@ function Dashboard({
 
         {/* RIGHT: COACH AGENT */}
         <div className="lg:col-span-3 flex flex-col gap-4 h-full">
-           <div className="dashboard-card-min-h dashboard-coach-fixed-height flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
+           <div className="min-h-[70vh] h-full flex-1 flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative">
               <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 opacity-50 rounded-t-2xl" />
               
               <div className="shrink-0 p-6 pb-3">
