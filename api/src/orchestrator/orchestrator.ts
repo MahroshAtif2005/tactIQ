@@ -1,9 +1,19 @@
+/**
+ * Repo audit checklist (requested):
+ * [x] Found `api/src/llm/azureOpenAI.ts` (single Azure client + `safeJsonParse`).
+ * [x] Found `api/src/functions/router.ts` (router endpoint).
+ * [x] Found `api/src/agents/fatigueAgent.ts`, `api/src/agents/riskAgent.ts`, `api/src/agents/tacticalAgent.ts`.
+ * [x] Found `api/src/orchestrator/orchestrator.ts` (this merge/orchestration module).
+ * [x] Found frontend caller at `src/lib/apiClient.ts`.
+ * [x] Updated this file to emit compatibility aliases (`routerIntent`, `agentResults`, `finalRecommendation`) without breaking existing UI fields.
+ */
 import { randomUUID } from 'crypto';
 import { InvocationContext } from '@azure/functions';
-import { runFatigueAgent } from '../agents/fatigueAgent';
-import { runRiskAgent } from '../agents/riskAgent';
-import { runTacticalAgent } from '../agents/tacticalAgent';
+import { buildFatigueFallback, FatigueAgentRunResult, runFatigueAgent } from '../agents/fatigueAgent';
+import { buildRiskFallback, RiskAgentRunResult, runRiskAgent } from '../agents/riskAgent';
+import { buildTacticalFallback, runTacticalAgent } from '../agents/tacticalAgent';
 import {
+  AgentStatus,
   AgentError,
   OrchestrateIntent,
   OrchestrateRequest,
@@ -23,6 +33,24 @@ const severityToConfidence = (severity?: string): number => {
   if (upper === 'HIGH') return 0.58;
   if (upper === 'MED' || upper === 'MEDIUM') return 0.68;
   return 0.78;
+};
+
+const toAgentStatus = (status: string | undefined, isSelected: boolean): AgentStatus => {
+  if (!isSelected) return 'SKIPPED';
+  if (status === 'fallback') return 'FALLBACK';
+  if (status === 'error') return 'ERROR';
+  return 'OK';
+};
+
+const toSummaryText = (value: unknown, fallback: string): string => {
+  const text = String(value || '').trim();
+  return text || fallback;
+};
+
+const toSummarySignals = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const signals = value.filter((item): item is string => typeof item === 'string').slice(0, 8);
+  return signals.length > 0 ? signals : undefined;
 };
 
 function computeTriggers(input: OrchestrateRequest): TriggerScores {
@@ -71,7 +99,7 @@ function computeTriggers(input: OrchestrateRequest): TriggerScores {
   };
 }
 
-function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateRequest): RouterDecision {
+export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateRequest): RouterDecision {
   if (mode === 'full') {
     return {
       intent: 'full',
@@ -146,6 +174,21 @@ function buildCombinedDecision(result: {
   risk?: OrchestrateResponse['risk'];
   tactical?: OrchestrateResponse['tactical'];
 }) {
+  const riskSeverity = String(result.risk?.severity || '').toUpperCase();
+  const riskIsCritical = riskSeverity === 'CRITICAL' || riskSeverity === 'HIGH';
+
+  // Safety-first merge: critical/high risk overrides tactical creativity.
+  if (riskIsCritical && result.risk) {
+    const tacticalAdds = result.tactical?.suggestedAdjustments || [];
+    return {
+      immediateAction: result.risk.recommendation || 'Protect workload and rotate immediately',
+      substitutionAdvice: result.tactical?.substitutionAdvice,
+      suggestedAdjustments: [result.risk.recommendation, ...tacticalAdds].filter(Boolean).slice(0, 4) as string[],
+      confidence: Math.max(0.7, result.tactical?.confidence || 0, severityToConfidence(result.risk.severity)),
+      rationale: `Safety-first merge: ${result.risk.headline}${result.tactical ? ` | Tactical: ${result.tactical.immediateAction}` : ''}`,
+    };
+  }
+
   if (result.tactical) {
     return {
       immediateAction: result.tactical.immediateAction,
@@ -157,12 +200,11 @@ function buildCombinedDecision(result: {
   }
 
   return {
-    immediateAction:
-      String(result.risk?.severity || '').toUpperCase() === 'CRITICAL' || String(result.risk?.severity || '').toUpperCase() === 'HIGH'
-        ? 'Protect workload and rotate immediately'
-        : String(result.fatigue?.severity || '').toUpperCase() === 'HIGH'
-          ? 'Reduce spell intensity and monitor closely'
-          : 'Continue with monitored plan',
+    immediateAction: riskIsCritical
+      ? 'Protect workload and rotate immediately'
+      : String(result.fatigue?.severity || '').toUpperCase() === 'HIGH'
+        ? 'Reduce spell intensity and monitor closely'
+        : 'Continue with monitored plan',
     suggestedAdjustments: [
       result.fatigue?.recommendation || 'Monitor fatigue trend over next over.',
       result.risk?.recommendation || 'Track risk indicators before next decision.',
@@ -197,68 +239,101 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     if (!executedAgents.includes('tactical')) executedAgents.push('tactical');
   }
 
-  if (executedAgents.includes('fatigue')) {
-    const fatigueStart = Date.now();
-    try {
-      const fatigueResult = await runFatigueAgent(toFatigueRequest(input, `${input.telemetry.playerId}:${Date.now()}`));
-      fatigue = { ...fatigueResult.output, status: fatigueResult.fallbacksUsed.length > 0 ? 'fallback' : 'ok' };
-      fatigueModel = fatigueResult.model;
-      timingsMs.fatigue = Date.now() - fatigueStart;
-      fallbacksUsed.push(...fatigueResult.fallbacksUsed);
-    } catch (error) {
-      timingsMs.fatigue = Date.now() - fatigueStart;
-      const message = error instanceof Error ? error.message : 'Fatigue agent failed';
-      errors.push({ agent: 'fatigue', message });
-      context.error('orchestrator fatigue failed', { requestId, message });
-    }
+  const fatiguePromise: Promise<FatigueAgentRunResult | undefined> = executedAgents.includes('fatigue')
+    ? (async () => {
+        const fatigueStart = Date.now();
+        try {
+          const result = await runFatigueAgent(toFatigueRequest(input, `${input.telemetry.playerId}:${Date.now()}`));
+          timingsMs.fatigue = Date.now() - fatigueStart;
+          return result;
+        } catch (error) {
+          timingsMs.fatigue = Date.now() - fatigueStart;
+          const message = error instanceof Error ? error.message : 'Fatigue agent failed';
+          context.error('orchestrator fatigue failed', { requestId, message });
+          errors.push({ agent: 'fatigue', message });
+          return buildFatigueFallback(toFatigueRequest(input, `${input.telemetry.playerId}:${Date.now()}`), `orchestrator-error:${message}`);
+        }
+      })()
+    : Promise.resolve(undefined);
+
+  const riskPromise: Promise<RiskAgentRunResult | undefined> = executedAgents.includes('risk')
+    ? (async () => {
+        const riskStart = Date.now();
+        try {
+          const result = await runRiskAgent(toRiskRequest(input));
+          timingsMs.risk = Date.now() - riskStart;
+          return result;
+        } catch (error) {
+          timingsMs.risk = Date.now() - riskStart;
+          const message = error instanceof Error ? error.message : 'Risk agent failed';
+          context.error('orchestrator risk failed', { requestId, message });
+          errors.push({ agent: 'risk', message });
+          return buildRiskFallback(toRiskRequest(input), `orchestrator-error:${message}`);
+        }
+      })()
+    : Promise.resolve(undefined);
+
+  const tacticalPromise = executedAgents.includes('tactical')
+    ? (async () => {
+        const tacticalStart = Date.now();
+        const [fatigueResult, riskResult] = await Promise.all([fatiguePromise, riskPromise]);
+        try {
+          const result = await runTacticalAgent({
+            requestId,
+            intent,
+            matchContext: input.matchContext,
+            telemetry: input.telemetry,
+            players: input.players,
+            fatigueOutput: fatigueResult?.output,
+            riskOutput: riskResult?.output,
+          });
+          timingsMs.tactical = Date.now() - tacticalStart;
+          return result;
+        } catch (error) {
+          timingsMs.tactical = Date.now() - tacticalStart;
+          const message = error instanceof Error ? error.message : 'Tactical agent failed';
+          context.error('orchestrator tactical failed', { requestId, message });
+          errors.push({ agent: 'tactical', message });
+          return buildTacticalFallback(
+            {
+              requestId,
+              intent,
+              matchContext: input.matchContext,
+              telemetry: input.telemetry,
+              players: input.players,
+              fatigueOutput: fatigueResult?.output,
+              riskOutput: riskResult?.output,
+            },
+            `orchestrator-error:${message}`
+          );
+        }
+      })()
+    : Promise.resolve(undefined);
+
+  const [fatigueResult, riskResult, tacticalResult] = await Promise.all([fatiguePromise, riskPromise, tacticalPromise]);
+
+  if (fatigueResult) {
+    fatigue = {
+      ...fatigueResult.output,
+      status: fatigueResult.output.status || (fatigueResult.fallbacksUsed.length > 0 ? 'fallback' : 'ok'),
+    };
+    fatigueModel = fatigueResult.model;
+    fallbacksUsed.push(...fatigueResult.fallbacksUsed);
   }
 
-  if (executedAgents.includes('risk')) {
-    const riskStart = Date.now();
-    try {
-      const riskResult = await runRiskAgent(toRiskRequest(input));
-      risk = { ...riskResult.output, status: 'ok' };
-      riskModel = riskResult.model;
-      timingsMs.risk = Date.now() - riskStart;
-      fallbacksUsed.push(...riskResult.fallbacksUsed);
-    } catch (error) {
-      timingsMs.risk = Date.now() - riskStart;
-      const message = error instanceof Error ? error.message : 'Risk agent failed';
-      errors.push({ agent: 'risk', message });
-      context.error('orchestrator risk failed', { requestId, message });
-    }
+  if (riskResult) {
+    risk = {
+      ...riskResult.output,
+      status: riskResult.output.status || (riskResult.fallbacksUsed.length > 0 ? 'fallback' : 'ok'),
+    };
+    riskModel = riskResult.model;
+    fallbacksUsed.push(...riskResult.fallbacksUsed);
   }
 
-  if (executedAgents.includes('tactical')) {
-    const tacticalStart = Date.now();
-    try {
-      const tacticalResult = await runTacticalAgent({
-        requestId,
-        intent,
-        matchContext: input.matchContext,
-        telemetry: input.telemetry,
-        players: input.players,
-        fatigueOutput: fatigue,
-        riskOutput: risk,
-      });
-      tactical = tacticalResult.output;
-      tacticalModel = tacticalResult.model;
-      timingsMs.tactical = Date.now() - tacticalStart;
-      fallbacksUsed.push(...tacticalResult.fallbacksUsed);
-    } catch (error) {
-      timingsMs.tactical = Date.now() - tacticalStart;
-      const message = error instanceof Error ? error.message : 'Tactical agent failed';
-      tactical = {
-        status: 'error',
-        immediateAction: 'Tactical recommendation unavailable',
-        rationale: message,
-        suggestedAdjustments: ['Continue with conservative plan until tactical service is restored.'],
-        confidence: 0.4,
-        keySignalsUsed: ['error'],
-      };
-      errors.push({ agent: 'tactical', message });
-      context.error('orchestrator tactical failed', { requestId, message });
-    }
+  if (tacticalResult) {
+    tactical = tacticalResult.output;
+    tacticalModel = tacticalResult.model;
+    fallbacksUsed.push(...tacticalResult.fallbacksUsed);
   }
 
   timingsMs.total = Date.now() - startedAt;
@@ -295,14 +370,21 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     } catch (error) {
       timingsMs.tactical = Date.now() - tacticalStart;
       const message = error instanceof Error ? error.message : 'Tactical agent failed';
-      tactical = {
-        status: 'error',
-        immediateAction: 'Tactical recommendation unavailable',
-        rationale: message,
-        suggestedAdjustments: ['Continue with conservative plan until tactical service is restored.'],
-        confidence: 0.4,
-        keySignalsUsed: ['error'],
-      };
+      const fallback = buildTacticalFallback(
+        {
+          requestId,
+          intent,
+          matchContext: input.matchContext,
+          telemetry: input.telemetry,
+          players: input.players,
+          fatigueOutput: fatigue,
+          riskOutput: risk,
+        },
+        `orchestrator-error:${message}`
+      );
+      tactical = fallback.output;
+      tacticalModel = fallback.model;
+      fallbacksUsed.push(...fallback.fallbacksUsed);
       errors.push({ agent: 'tactical', message });
       context.error('orchestrator tactical failed (suggestFullAnalysis)', { requestId, message });
     }
@@ -314,6 +396,60 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
   if (fatigue?.status === 'fallback') usedFallbackAgents.push('fatigue');
   if (risk?.status === 'fallback') usedFallbackAgents.push('risk');
   if (tactical?.status === 'fallback') usedFallbackAgents.push('tactical');
+  const routerDecisionWithExecution = {
+    ...routerDecision,
+    selectedAgents: executedAgents,
+    reason:
+      mode === 'full'
+        ? routerDecision.reason
+        : hasRiskOrFatigueTrigger && !routerDecision.selectedAgents.includes('tactical')
+          ? `${routerDecision.reason} Tactical agent auto-appended for action synthesis.`
+          : routerDecision.reason,
+  };
+  const runFlags = {
+    fatigue: executedAgents.includes('fatigue'),
+    risk: executedAgents.includes('risk'),
+    tactical: executedAgents.includes('tactical'),
+  };
+  const fatigueStatus = toAgentStatus(fatigue?.status, runFlags.fatigue);
+  const riskStatus = toAgentStatus(risk?.status, runFlags.risk);
+  const tacticalStatus = toAgentStatus(tactical?.status, runFlags.tactical);
+  const hasFallback = fatigueStatus === 'FALLBACK' || riskStatus === 'FALLBACK' || tacticalStatus === 'FALLBACK';
+  const finalRecommendation = {
+    title: toSummaryText(combinedDecision.immediateAction, 'Continue with monitored plan'),
+    bulletReasons: [
+      toSummaryText(combinedDecision.rationale, 'Derived from executed agents.'),
+      ...(combinedDecision.suggestedAdjustments || []).slice(0, 3).map((item) => toSummaryText(item, '')),
+    ].filter(Boolean),
+    confidence: Number(Math.max(0, Math.min(1, Number(combinedDecision.confidence) || 0.55)).toFixed(2)),
+    source: (hasFallback ? 'FALLBACK' : 'MODEL') as 'MODEL' | 'FALLBACK',
+  };
+  const agentResults: OrchestrateResponse['agentResults'] = {
+    fatigue: {
+      status: fatigueStatus,
+      summaryTitle: toSummaryText(fatigue?.headline, 'Fatigue analysis'),
+      summary: toSummaryText(fatigue?.recommendation || fatigue?.explanation, runFlags.fatigue ? 'No fatigue summary available.' : 'Skipped by router.'),
+      signals: toSummarySignals(fatigue?.signals),
+      ...(fatigue ? { data: fatigue as unknown as Record<string, unknown> } : {}),
+      ...(fatigueStatus === 'FALLBACK' ? { fallbackReason: 'Rule-based fallback used for fatigue analysis.' } : {}),
+    },
+    risk: {
+      status: riskStatus,
+      summaryTitle: toSummaryText(risk?.headline, 'Risk analysis'),
+      summary: toSummaryText(risk?.recommendation || risk?.explanation, runFlags.risk ? 'No risk summary available.' : 'Skipped by router.'),
+      signals: toSummarySignals(risk?.signals),
+      ...(risk ? { data: risk as unknown as Record<string, unknown> } : {}),
+      ...(riskStatus === 'FALLBACK' ? { fallbackReason: 'Rule-based fallback used for risk analysis.' } : {}),
+    },
+    tactical: {
+      status: tacticalStatus,
+      summaryTitle: toSummaryText(tactical?.immediateAction, 'Tactical recommendation'),
+      summary: toSummaryText(tactical?.rationale, runFlags.tactical ? 'No tactical summary available.' : 'Skipped by router.'),
+      signals: toSummarySignals(tactical?.keySignalsUsed),
+      ...(tactical ? { data: tactical as unknown as Record<string, unknown> } : {}),
+      ...(tacticalStatus === 'FALLBACK' ? { fallbackReason: 'Heuristic fallback used for tactical analysis.' } : {}),
+    },
+  };
 
   return {
     ...(fatigue ? { fatigue } : {}),
@@ -326,17 +462,17 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     },
     finalDecision,
     combinedDecision,
+    finalRecommendation,
     errors,
-    routerDecision: {
-      ...routerDecision,
-      selectedAgents: executedAgents,
-      reason:
-        mode === 'full'
-          ? routerDecision.reason
-          : hasRiskOrFatigueTrigger && !routerDecision.selectedAgents.includes('tactical')
-            ? `${routerDecision.reason} Tactical agent auto-appended for action synthesis.`
-            : routerDecision.reason,
+    routerIntent: routerDecisionWithExecution.intent,
+    router: {
+      status: 'OK',
+      intent: routerDecisionWithExecution.intent,
+      run: runFlags,
+      reason: routerDecisionWithExecution.reason,
     },
+    agentResults,
+    routerDecision: routerDecisionWithExecution,
     meta: {
       requestId,
       mode,

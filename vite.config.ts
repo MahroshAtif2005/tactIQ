@@ -1,9 +1,20 @@
 
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react-swc';
 import path from 'path';
 
-export default defineConfig({
+const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '');
+
+export default defineConfig(({ mode }) => {
+    const env = loadEnv(mode, process.cwd(), '');
+    const configuredApiBase = trimTrailingSlashes((env.VITE_API_BASE_URL || '').trim());
+    const functionsPort = (env.VITE_FUNCTIONS_PORT || env.FUNCTION_PORT || '7071').trim();
+    const proxyTarget = configuredApiBase || `http://localhost:${functionsPort}`;
+    const configuredAgentFrameworkBase = trimTrailingSlashes((env.VITE_AGENT_FRAMEWORK_BASE_URL || '').trim());
+    const agentFrameworkPort = (env.VITE_AGENT_FRAMEWORK_PORT || '3978').trim();
+    const agentFrameworkProxyTarget = configuredAgentFrameworkBase || `http://localhost:${agentFrameworkPort}`;
+
+    return {
     plugins: [react()],
     resolve: {
       extensions: ['.js', '.jsx', '.ts', '.tsx', '.json'],
@@ -57,10 +68,17 @@ export default defineConfig({
       port: 5173,
       open: true,
       proxy: {
-        '/api': {
-          target: 'http://localhost:8080',
+        '/api/messages': {
+          target: agentFrameworkProxyTarget,
           changeOrigin: true,
+          secure: false,
+        },
+        '/api': {
+          target: proxyTarget,
+          changeOrigin: true,
+          secure: false,
         },
       },
     },
-  });
+  };
+});

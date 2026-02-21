@@ -40,7 +40,15 @@ import {
   YAxis,
 } from 'recharts';
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse, TacticalCombinedDecision } from './types/agents';
-import { ApiClientError, apiHealthUrl, apiOrchestrateUrl, getApiHealth, postOrchestrate } from './lib/apiClient';
+import {
+  ApiClientError,
+  apiAgentFrameworkMessagesUrl,
+  apiHealthUrl,
+  apiOrchestrateUrl,
+  checkHealth,
+  postAgentFrameworkOrchestrate,
+  postOrchestrate,
+} from './lib/apiClient';
 import {
   clamp,
   computeBaselineRecoveryScore,
@@ -502,7 +510,7 @@ const formatMMSS = (s: number): string => {
 };
 
 interface AgentFailureDetail {
-  status: number | 'network';
+  status: number | 'network' | 'timeout' | 'cors';
   url: string;
   message: string;
   hint: string | null;
@@ -531,14 +539,29 @@ const normalizeApiFailureBody = (body?: string): string | null => {
 
 const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailureDetail => {
   if (error instanceof ApiClientError) {
-    const status = error.status ?? 'network';
-    const hint = error.url.includes('/api/health')
-      ? 'Check /api/health and confirm backend deployment.'
-      : null;
+    const isHealthEndpoint = error.url.includes('/api/health');
+    const status = error.status ?? (error.kind === 'timeout' ? 'timeout' : error.kind === 'cors' ? 'cors' : 'network');
+    let message = normalizeApiFailureBody(error.body) ?? error.message;
+    let hint: string | null = null;
+
+    if (error.kind === 'timeout' || error.kind === 'network') {
+      message = 'Backend not reachable. Start the API or set VITE_API_BASE_URL.';
+      hint = 'Confirm the backend is running and reachable from this frontend.';
+    } else if (error.kind === 'cors') {
+      message = 'Request blocked (CORS). Check API CORS settings or VITE_API_BASE_URL.';
+      hint = 'If API is cross-origin, allow this frontend origin in CORS settings.';
+    } else if (error.status === 404 && isHealthEndpoint) {
+      message = 'Health endpoint not found (/api/health). Check proxy/routes.';
+      hint = 'Ensure /api/health exists and Vite proxy forwards /api to the backend.';
+    } else if (typeof error.status === 'number' && error.status >= 500) {
+      message = `Backend error (${error.status}). Check API logs.`;
+      hint = 'Server responded with an internal error.';
+    }
+
     return {
       status,
       url: error.url,
-      message: normalizeApiFailureBody(error.body) ?? error.message,
+      message,
       hint,
     };
   }
@@ -546,8 +569,8 @@ const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailure
   return {
     status: 'network',
     url: fallbackUrl,
-    message: error instanceof Error ? error.message : 'Request failed before receiving an API response.',
-    hint: 'Check backend deployment and /api route availability.',
+    message: 'Backend not reachable. Start the API or set VITE_API_BASE_URL.',
+    hint: error instanceof Error ? error.message : 'Request failed before receiving an API response.',
   };
 };
 
@@ -560,6 +583,7 @@ const RECOVERY_RATE_BY_HRR: Record<RecoveryLevel, number> = {
 // --- Main App Component ---
 
 export default function App() {
+  const useAgentFramework = String(import.meta.env.VITE_USE_AGENT_FRAMEWORK || '').trim().toLowerCase() === 'true';
   const [showSplash, setShowSplash] = useState(true);
   const [page, setPage] = useState<Page>('landing');
   const [matchContext, setMatchContext] = useState<MatchContext>({
@@ -1054,6 +1078,9 @@ export default function App() {
     mode: 'auto' | 'full' = 'auto',
     reason: 'button_click' | 'non_button' = 'non_button'
   ) => {
+    const orchestrateRequestUrl = useAgentFramework ? apiAgentFrameworkMessagesUrl : apiOrchestrateUrl;
+    const frameworkMode = mode === 'full' ? 'all' : 'route';
+
     if (reason !== 'button_click') {
       if (import.meta.env.DEV) {
         console.warn('Coach analysis blocked', { reason });
@@ -1147,13 +1174,15 @@ export default function App() {
       },
     };
     if (import.meta.env.DEV) {
-      console.log('[agent] calling', apiOrchestrateUrl);
+      console.log('[agent] calling', orchestrateRequestUrl, { useAgentFramework, mode: frameworkMode });
       console.log('Orchestrate payload', payload);
     }
 
     try {
-      await getApiHealth(controller.signal);
-      const result: OrchestrateResponse = await postOrchestrate(payload, controller.signal);
+      await checkHealth(controller.signal);
+      const result: OrchestrateResponse = useAgentFramework
+        ? await postAgentFrameworkOrchestrate(payload, frameworkMode, controller.signal)
+        : await postOrchestrate(payload, controller.signal);
       if (requestId !== fatigueRequestSeq.current) return;
       const fatigueMapped = result.fatigue ? buildAiAnalysis(result.fatigue, 'fatigue') : null;
       const riskMapped = result.risk ? buildAiAnalysis(result.risk, 'risk') : null;
@@ -1199,7 +1228,7 @@ export default function App() {
         tactical: prev.tactical === 'loading' ? 'error' : prev.tactical,
       }));
       setAgentWarning(null);
-      setAgentFailure(toAgentFailureDetail(error, apiOrchestrateUrl));
+      setAgentFailure(toAgentFailureDetail(error, orchestrateRequestUrl));
       setAgentState('offline');
       setAnalysisActive(false);
     }
@@ -1795,15 +1824,13 @@ function FatigueForecastChart({
                 label={{ value: 'Fatigue (0–10)', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.55)' }}
               />
               <Tooltip
-                cursor={{ stroke: 'rgba(255,255,255,0.10)', strokeWidth: 1 }}
                 contentStyle={{
-                  background: 'rgba(10,15,30,0.95)',
-                  border: '1px solid rgba(255,255,255,0.10)',
-                  borderRadius: '12px',
-                  color: 'rgba(255,255,255,0.85)',
+                  backgroundColor: '#0f172a',
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  borderRadius: '12px'
                 }}
-                formatter={(val: number | string) => [`${val}`, 'Fatigue']}
-                labelFormatter={(value: number | string) => (Number(value) === 0 ? 'Now' : `+${value} overs`)}
+                formatter={(value: number) => value}
+                labelFormatter={(label) => `+${label} overs`}
               />
               <ReferenceLine
                 y={7}
@@ -1814,19 +1841,9 @@ function FatigueForecastChart({
               <Line
                 type="monotone"
                 dataKey="fatigue"
-                stroke="url(#fatigueLine)"
-                strokeWidth={8}
-                opacity={0.18}
-                dot={false}
-                activeDot={false}
-              />
-              <Line
-                type="monotone"
-                dataKey="fatigue"
-                stroke="url(#fatigueLine)"
+                stroke="#22d3ee"
                 strokeWidth={3}
-                dot={{ r: 4, stroke: 'rgba(34,211,238,0.95)', strokeWidth: 2, fill: 'rgba(10,15,30,1)' }}
-                activeDot={{ r: 6, stroke: 'rgba(34,211,238,1)', strokeWidth: 2, fill: 'rgba(16,185,129,0.20)' }}
+                dot={{ r: 5 }}
               />
             </LineChart>
           </ResponsiveContainer>
@@ -2024,6 +2041,11 @@ function Dashboard({
   const sixesCount = boundaryEvents.filter((event) => event === '6').length;
   const selectedAgents = routerDecision?.selectedAgents || orchestrateMeta?.executedAgents || [];
   const selectedAgentSet = new Set(selectedAgents);
+  const agentBorderColor: Record<'fatigue' | 'risk' | 'tactical', string> = {
+    fatigue: 'rgb(96, 165, 250)',
+    risk: 'rgb(74, 222, 128)',
+    tactical: 'rgb(252, 211, 77)',
+  };
   const toStatusLabel = (status: 'idle' | 'loading' | 'done' | 'error', isSelected: boolean, isFallback?: boolean): 'OK' | 'RUNNING' | 'SKIPPED' | 'FALLBACK' | 'ERROR' => {
     if (!isSelected && orchestrateMeta?.mode === 'auto') return 'SKIPPED';
     if (status === 'loading') return 'RUNNING';
@@ -2827,9 +2849,9 @@ function Dashboard({
                           <div className="w-full mt-3">
                             <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-left">
                               <p className="text-[10px] uppercase tracking-wide font-semibold text-rose-100">Coach Agent failed</p>
-                              <p className="mt-1 text-[11px] text-rose-200">
-                                {`${String(agentFailure.status)} at ${agentFailure.url} - ${agentFailure.message}`}
-                              </p>
+                              <p className="mt-1 text-[11px] text-rose-200">{agentFailure.message}</p>
+                              <p className="mt-1 text-[10px] text-rose-200/80">{`Status: ${String(agentFailure.status)}`}</p>
+                              <p className="mt-1 text-[10px] font-mono text-rose-200/80 break-all">{agentFailure.url}</p>
                               {agentFailure.hint && (
                                 <p className="mt-1 text-[11px] text-rose-200/90">{agentFailure.hint}</p>
                               )}
@@ -2868,7 +2890,7 @@ function Dashboard({
                       <div
                         ref={scrollRef}
                         onScroll={handleTacticalScroll}
-                        className="max-h-[45vh] overflow-y-auto overscroll-contain pr-1 coach-output"
+                        className="h-auto min-h-full overflow-hidden pr-1 coach-output"
                       >
                         <div className="space-y-5">
                         <div className="rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
@@ -3006,7 +3028,11 @@ function Dashboard({
                               severity: tacticalAnalysis ? `${Math.round((tacticalAnalysis.confidence || 0) * 100)}%` : undefined,
                             },
                           ].map((step) => (
-                            <div key={step.key} className={`p-4 rounded-xl border ${selectedAgentSet.has(step.key) || orchestrateMeta?.mode === 'full' ? 'border-slate-700 bg-[#162032]' : 'border-slate-800 bg-slate-900/30 opacity-70'}`}>
+                            <div
+                              key={step.key}
+                              className={`p-4 rounded-xl border border-l-4 ${selectedAgentSet.has(step.key) || orchestrateMeta?.mode === 'full' ? 'border-slate-700 bg-[#162032]' : 'border-slate-800 bg-slate-900/30 opacity-70'}`}
+                              style={{ borderLeftColor: agentBorderColor[step.key] }}
+                            >
                               <div className="flex items-center justify-between mb-1">
                                 <div className="flex items-center gap-2">
                                   <span className={`w-2 h-2 rounded-full ${

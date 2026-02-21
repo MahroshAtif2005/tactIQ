@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
-import { analyzeRisk } from '../shared/riskModel';
 import { RiskAgentRequest, RiskAgentResponse } from '../shared/types';
+import { runRiskAgent } from '../agents/riskAgent';
 
 const sanitizeRequest = (payload: Partial<RiskAgentRequest>): RiskAgentRequest => {
   const toNum = (value: unknown, fallback: number) => {
@@ -47,19 +47,29 @@ export async function riskHandler(request: HttpRequest, context: InvocationConte
       console.log('Risk payload', input);
     }
 
-    const result: RiskAgentResponse = analyzeRisk(input);
-    const pointsHint = result.explanation.match(/score (\d+)/)?.[1];
+    const result = await runRiskAgent(input);
+    const response: RiskAgentResponse = {
+      ...result.output,
+      status: result.output.status || (result.fallbacksUsed.length > 0 ? 'fallback' : 'ok'),
+    };
+    const pointsHint = response.explanation.match(/score (\d+)/)?.[1];
     if (process.env.NODE_ENV !== 'production') {
       console.log('Risk computed', {
         points: pointsHint ? Number(pointsHint) : undefined,
-        severity: result.severity,
-        signals: result.signals,
+        severity: response.severity,
+        signals: response.signals,
       });
     }
 
     return {
       status: 200,
-      jsonBody: result,
+      jsonBody: {
+        ...response,
+        meta: {
+          model: result.model,
+          fallbacksUsed: result.fallbacksUsed,
+        },
+      },
     };
   } catch (error) {
     context.error('Risk agent error', error);

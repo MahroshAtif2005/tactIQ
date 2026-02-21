@@ -34,7 +34,7 @@ const pickBenchReplacement = (input: TacticalAgentInput): string => {
   return bench[0];
 };
 
-function heuristicTacticalFallback(input: TacticalAgentInput, reason: string): TacticalAgentResult {
+export function buildTacticalFallback(input: TacticalAgentInput, reason: string): TacticalAgentResult {
   const fatigueIndex = Number(input.telemetry.fatigueIndex) || 0;
   const injuryRisk = String(input.telemetry.injuryRisk || 'MEDIUM').toUpperCase();
   const noBallRisk = String(input.telemetry.noBallRisk || 'MEDIUM').toUpperCase();
@@ -81,7 +81,7 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
   const routing = routeModel({ task: 'tactical', needsJson: true, complexity: 'high' });
   const aoai = getAoaiConfig();
   if (!aoai.ok || !routing.deployment) {
-    return heuristicTacticalFallback(input, `missing:${(aoai.ok ? ['AOAI_DEPLOYMENT_STRONG'] : aoai.missing).join(',')}`);
+    return buildTacticalFallback(input, `missing:${(aoai.ok ? ['AZURE_OPENAI_DEPLOYMENT'] : aoai.missing).join(',')}`);
   }
 
   const messages: LLMMessage[] = [
@@ -124,6 +124,7 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
       fallbacksUsed: result.fallbacksUsed,
     };
   } catch (error) {
-    return heuristicTacticalFallback(input, 'llm-error');
+    const message = error instanceof Error ? error.message : 'llm-error';
+    return buildTacticalFallback(input, `llm-error:${message}`);
   }
 }

@@ -13,6 +13,7 @@ export async function healthHandler(_request: HttpRequest): Promise<HttpResponse
         fatigue: `/api/${ROUTES.fatigue}`,
         risk: `/api/${ROUTES.risk}`,
         tactical: `/api/${ROUTES.tactical}`,
+        router: `/api/${ROUTES.router}`,
         orchestrate: `/api/${ROUTES.orchestrate}`,
       },
       availableAgents: ['fatigue', 'risk', 'tactical'],

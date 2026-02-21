@@ -23,15 +23,14 @@ export type AoaiConfigResult =
 export function getAoaiConfig(): AoaiConfigResult {
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT || '';
   const apiKey = process.env.AZURE_OPENAI_API_KEY || '';
-  const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
-  const legacyDeployment = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || '';
-  const strongDeployment = process.env.AOAI_DEPLOYMENT_STRONG || legacyDeployment;
-  const fallbackDeployment = process.env.AOAI_DEPLOYMENT_FALLBACK || strongDeployment || legacyDeployment;
+  const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
+  const defaultDeployment = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || '';
+  const strongDeployment = process.env.AOAI_DEPLOYMENT_STRONG || defaultDeployment;
+  const fallbackDeployment = process.env.AOAI_DEPLOYMENT_FALLBACK || strongDeployment || defaultDeployment;
   const missing: string[] = [];
   if (!endpoint) missing.push('AZURE_OPENAI_ENDPOINT');
   if (!apiKey) missing.push('AZURE_OPENAI_API_KEY');
-  if (!strongDeployment) missing.push('AOAI_DEPLOYMENT_STRONG');
-  if (!fallbackDeployment) missing.push('AOAI_DEPLOYMENT_FALLBACK');
+  if (!defaultDeployment) missing.push('AZURE_OPENAI_DEPLOYMENT');
 
   if (missing.length > 0) {
     return { ok: false, missing };
@@ -53,11 +52,11 @@ export function getAoaiConfig(): AoaiConfigResult {
 export function getModelRegistry(): ModelRegistry {
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT || '';
   const apiKey = process.env.AZURE_OPENAI_API_KEY || '';
-  const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
-  const legacyDeployment = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || '';
-  const fastDeployment = process.env.AOAI_DEPLOYMENT_FAST || legacyDeployment;
-  const strongDeployment = process.env.AOAI_DEPLOYMENT_STRONG || fastDeployment || legacyDeployment;
-  const fallbackDeployment = process.env.AOAI_DEPLOYMENT_FALLBACK || strongDeployment || fastDeployment || legacyDeployment;
+  const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
+  const defaultDeployment = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || '';
+  const fastDeployment = process.env.AOAI_DEPLOYMENT_FAST || defaultDeployment;
+  const strongDeployment = process.env.AOAI_DEPLOYMENT_STRONG || fastDeployment || defaultDeployment;
+  const fallbackDeployment = process.env.AOAI_DEPLOYMENT_FALLBACK || strongDeployment || fastDeployment || defaultDeployment;
   const aoai = getAoaiConfig();
 
   return {
@@ -67,6 +66,6 @@ export function getModelRegistry(): ModelRegistry {
     fastDeployment,
     strongDeployment,
     fallbackDeployment,
-    enabled: aoai.ok && Boolean(fastDeployment || strongDeployment || fallbackDeployment),
+    enabled: aoai.ok && Boolean(defaultDeployment || fastDeployment || strongDeployment || fallbackDeployment),
   };
 }
