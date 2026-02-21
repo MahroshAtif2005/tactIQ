@@ -206,7 +206,7 @@ Users (Coach / Analyst)
 ```
 
 
-                 ##                    MICROSOFT-BASED ARCHITECTURE (tactIQ)
+                                     MICROSOFT ARCHITECTURE (tactIQ)
                    (Microsoft Foundry + Agent Framework + Azure Services + GitHub/Copilot)
 ```txt
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
