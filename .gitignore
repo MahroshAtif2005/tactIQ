@@ -2,4 +2,7 @@ node_modules/
 build/
 dist/
 .env
+.env.local
 api/local.settings.json
+api/.env.local
+server/agent-framework/.env

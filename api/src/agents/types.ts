@@ -69,6 +69,16 @@ export interface TacticalAgentOutput {
 }
 
 export type AgentStepStatus = 'ok' | 'fallback' | 'error' | 'running' | 'skipped';
+export type AgentStatus = 'OK' | 'SKIPPED' | 'FALLBACK' | 'ERROR';
+
+export interface AgentSummary {
+  status: AgentStatus;
+  summaryTitle: string;
+  summary: string;
+  signals?: string[];
+  data?: Record<string, unknown>;
+  fallbackReason?: string;
+}
 
 export interface RouterDecision {
   intent: RouterIntent;
@@ -137,6 +147,28 @@ export interface OrchestrateResponse {
     rationale: string;
   };
   errors: AgentError[];
+  routerIntent?: string;
+  router?: {
+    status: AgentStatus;
+    intent: string;
+    run: {
+      fatigue: boolean;
+      risk: boolean;
+      tactical: boolean;
+    };
+    reason: string;
+  };
+  agentResults?: {
+    fatigue: AgentSummary;
+    risk: AgentSummary;
+    tactical: AgentSummary;
+  };
+  finalRecommendation?: {
+    title: string;
+    bulletReasons: string[];
+    confidence: number;
+    source: 'MODEL' | 'FALLBACK';
+  };
   routerDecision: RouterDecision;
   meta: {
     requestId: string;

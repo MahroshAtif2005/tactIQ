@@ -1,3 +1,4 @@
+import { callAzureChat, getAzureErrorStatus, safeJsonParse } from './azureOpenAI';
 import { getModelRegistry } from './modelRegistry';
 
 export interface LLMMessage {
@@ -21,41 +22,22 @@ export async function callLLM(input: CallLLMInput): Promise<string> {
     throw new Error('No deployment selected');
   }
 
-  const url = `${registry.endpoint.replace(/\/$/, '')}/openai/deployments/${input.deployment}/chat/completions?api-version=${registry.apiVersion}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'api-key': registry.apiKey,
-    },
-    body: JSON.stringify({
+  try {
+    return await callAzureChat({
+      deployment: input.deployment,
       messages: input.messages,
       temperature: input.temperature ?? 0.2,
-      max_tokens: input.maxTokens ?? 400,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`LLM request failed (${response.status}): ${errorText.slice(0, 300)}`);
+      max_tokens: Math.min(200, Math.max(1, input.maxTokens ?? 200)),
+    });
+  } catch (error) {
+    const status = getAzureErrorStatus(error);
+    const message = error instanceof Error ? error.message : 'Unknown Azure OpenAI error';
+    if (typeof status === 'number') {
+      throw new Error(`LLM request failed (${status}): ${message}`);
+    }
+    throw new Error(`LLM request failed: ${message}`);
   }
-
-  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('LLM response missing content');
-  }
-  return content;
 }
-
-const parseJsonContent = (raw: string): unknown => {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('```')) {
-    const stripped = trimmed.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
-    return JSON.parse(stripped);
-  }
-  return JSON.parse(trimmed);
-};
 
 export interface JsonRetryInput<T> {
   deployment: string;
@@ -96,7 +78,11 @@ export async function callLLMJsonWithRetry<T>(input: JsonRetryInput<T>): Promise
         temperature: input.temperature,
         maxTokens: input.maxTokens,
       });
-      const parsed = parseJsonContent(text);
+      const parsedResult = safeJsonParse(text);
+      if (!parsedResult.ok) {
+        throw new Error(`Invalid JSON from LLM: ${parsedResult.error || 'parse-failed'}`);
+      }
+      const parsed = parsedResult.data;
       if (!input.validate(parsed)) {
         throw new Error('LLM JSON failed schema validation');
       }

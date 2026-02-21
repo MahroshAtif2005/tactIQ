@@ -94,6 +94,25 @@ If port `7071` is busy, run with a different port:
 
 Frontend runs on `http://localhost:5173` and Azure Functions runs on `http://localhost:7071`.
 
+### Optional Agent Framework orchestration layer
+
+This repo now supports an opt-in Microsoft Bot Framework orchestration service that forwards to the existing tactIQ agent endpoints.
+
+1. Install Agent Framework service dependencies:
+   - `npm --prefix server/agent-framework install`
+2. Configure Agent Framework env:
+   - `cp server/agent-framework/.env.example server/agent-framework/.env`
+   - Keep `EXISTING_API_BASE_URL=http://localhost:7071` (or your Functions URL)
+3. Start services:
+   - Terminal 1: `cd api && func start`
+   - Terminal 2: `npm --prefix server/agent-framework run dev`
+   - Terminal 3: `VITE_USE_AGENT_FRAMEWORK=true npm run dev`
+
+Notes:
+- Default behavior is unchanged (`VITE_USE_AGENT_FRAMEWORK=false`): frontend keeps calling `/api/orchestrate`.
+- When `VITE_USE_AGENT_FRAMEWORK=true`, frontend sends orchestration through `/api/messages` (proxied to `http://localhost:3978` by Vite in dev).
+- If Agent Framework is hosted elsewhere, set `VITE_AGENT_FRAMEWORK_BASE_URL`.
+
 ## Production Preview (Important)
 
 - `npm run dev` runs Vite dev mode, which is not identical to production behavior.
@@ -108,9 +127,16 @@ Frontend runs on `http://localhost:5173` and Azure Functions runs on `http://loc
 - `POST http://localhost:7071/api/agents/fatigue`
 - `POST http://localhost:7071/api/agents/risk`
 - `POST http://localhost:7071/api/agents/tactical`
+- `POST http://localhost:7071/api/router`
 - `POST http://localhost:7071/api/orchestrate`
 - `GET  http://localhost:7071/api/health`
 - Frontend calls relative paths like `/api/orchestrate` via Vite proxy.
+
+## Bot Framework runtime layer
+
+- Endpoint: `POST /api/messages`
+- This endpoint adds Microsoft Bot Framework runtime support on top of the existing orchestration.
+- Current UI flow is unchanged: the dashboard can continue calling existing orchestrator endpoints exactly as before.
 
 If you change Vite proxy settings, restart the Vite dev server.
 
@@ -129,7 +155,8 @@ Fatigue Agent supports two modes:
 Set these in `api/local.settings.json` (or environment):
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_API_VERSION` (defaults to `2024-10-21` if not set)
+- `AZURE_OPENAI_DEPLOYMENT`
+- `AZURE_OPENAI_API_VERSION` (defaults to `2024-02-15-preview` if not set)
 - `AOAI_DEPLOYMENT_STRONG`
 - `AOAI_DEPLOYMENT_FALLBACK`
 

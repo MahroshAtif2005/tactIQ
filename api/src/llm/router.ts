@@ -22,8 +22,8 @@ export function routeModel(input: RouteModelInput): RouteModelResult {
 
   const deployment = useStrong ? registry.strongDeployment : registry.fastDeployment;
   const fallbackDeployment = registry.fallbackDeployment || deployment;
-  const temperature = input.task === 'tactical' ? 0.25 : 0.1;
-  const maxTokens = input.task === 'tactical' ? 700 : 350;
+  const temperature = 0.2;
+  const maxTokens = 200;
 
   return {
     deployment,

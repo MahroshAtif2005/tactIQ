@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
-import { analyzeFatigue } from '../shared/analysisProvider';
 import { FatigueAgentRequest, FatigueAgentResponse } from '../shared/types';
+import { runFatigueAgent } from '../agents/fatigueAgent';
 
 const sanitizeRequest = (payload: Partial<FatigueAgentRequest>): FatigueAgentRequest => {
   const toNum = (value: unknown, fallback: number) => {
@@ -49,21 +49,21 @@ export async function fatigueHandler(request: HttpRequest, context: InvocationCo
       consecutiveOvers: input.consecutiveOvers,
       heartRateRecovery: input.heartRateRecovery,
     });
-    const { output, mode } = await analyzeFatigue(input);
-    context.log('Fatigue analysis output mode', { mode });
+    const result = await runFatigueAgent(input);
     const response: FatigueAgentResponse = {
-      severity: output.severity,
-      headline: output.headline,
-      explanation: output.explanation,
-      recommendation: output.recommendation,
-      signals: output.signals,
-      echo: output.echo,
-      ...(output.suggestedTweaks ? { suggestedTweaks: output.suggestedTweaks } : {}),
+      ...result.output,
+      status: result.output.status || (result.fallbacksUsed.length > 0 ? 'fallback' : 'ok'),
     };
 
     return {
       status: 200,
-      jsonBody: response,
+      jsonBody: {
+        ...response,
+        meta: {
+          model: result.model,
+          fallbacksUsed: result.fallbacksUsed,
+        },
+      },
     };
   } catch (error) {
     context.error('Fatigue agent error', error);
