@@ -144,69 +144,8 @@ Quick setup:
 Deployed on Azure App Service via GitHub Actions (CI/CD).
 Every push to `main` triggers build + deploy.
 
-## Application Architecture 
-```txt
 
-Users (Coach / Analyst)
-        |
-        v
-+---------------------------+
-| Web UI (Vite + React)     |
-| - Run Coach Agent         |
-| - Player / Match Inputs   |
-+-------------+-------------+
-              |
-              v
-+---------------------------+
-| Node.js + Express API     |
-| - validates request       |
-| - creates session context |
-+-------------+-------------+
-              |
-              v
-+------------------------------------------------------+
-| Agent Framework Orchestrator (Supervisor)            |
-| - maintains session state                            |
-| - decides which specialist agent(s) to run           |
-| - merges outputs into one final recommendation       |
-+----------------------+-------------------------------+
-                       |
-                       v
-            +----------------------------------+
-            | Model Router / Policy Layer      |
-            | - cost-aware routing             |
-            | - selects model tier             |
-            +---------+-----------+------------+
-                      |           |
-                      v           v
-        +------------------+   +------------------+
-        | Fatigue Agent    |   | Risk Agent       |
-        | - workload trend |   | - injury flags   |
-        | - safe spell     |   | - risk scoring   |
-        +--------+---------+   +--------+---------+
-                 \              /
-                  \            /
-                   v          v
-              +----------------------+
-              | Tactical Agent       |
-              | - match context      |
-              | - field/bowler plan  |
-              | - substitution logic |
-              +----------+-----------+
-                         |
-                         v
-              +----------------------+
-              | Final Output         |
-              | - recommendation     |
-              | - Next Best Action  |
-              +----------+-----------+
-                         |
-                         v
-                  UI renders result
-```
-
-
-                                     MICROSOFT ARCHITECTURE (tactIQ)
+                                     ARCHITECTURE (tactIQ)
                    (Microsoft Foundry + Agent Framework + Azure Services + GitHub/Copilot)
 ```txt
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
