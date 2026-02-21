@@ -144,7 +144,7 @@ Quick setup:
 Deployed on Azure App Service via GitHub Actions (CI/CD).
 Every push to `main` triggers build + deploy.
 
-## ARCHITECTURE 
+## Application Architecture 
 ```txt
 
 Users (Coach / Analyst)
@@ -204,3 +204,70 @@ Users (Coach / Analyst)
                          v
                   UI renders result
 ```
+
+
+                 ##                    MICROSOFT-BASED ARCHITECTURE (tactIQ)
+                   (Microsoft Foundry + Agent Framework + Azure Services + GitHub/Copilot)
+```txt
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Users (Coach / Analyst / Judges)                                                                        │
+│ Web UI: Vite + React (Dashboard + “Run Agent” + “Run All Agents” controls)                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                          │ HTTPS
+                                          v
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Azure Cloud                                                                                              │
+│                                                                                                          │
+│  ┌───────────────────────────────┐         ┌────────────────────────────────────────────────────────┐   │
+│  │ Azure App Service (Web/API)   │  REST   │ Node.js / Express API Layer                              │   │
+│  │ - Hosts UI + API endpoints    ├────────►│ - Validates inputs, builds session context              │   │
+│  │ - Public demo endpoint        │         │ - Exposes /api/orchestrate + /api/agent/* endpoints     │   │
+│  └───────────────────────────────┘         └────────────────────────────────────────────────────────┘   │
+│                                          │
+│                                          │ invokes
+│                                          v
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Microsoft Agent Framework (Agent Runtime + Tools)                                                 │   │
+│  │ - Supervisor/Orchestrator agent (conversation state + routing policy)                              │   │
+│  │ - Tools = callable specialist agents (Risk, Fatigue, Tactical)                                     │   │
+│  │ - Supports “Run Selected Agent” and “Run All Agents” flows                                         │   │
+│  └──────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                          │
+│                                          │ model calls
+│                                          v
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Microsoft Foundry (Azure AI Foundry / Azure OpenAI)                                                │   │
+│  │ - Model deployments                                                                                │   │
+│  │ - Secure endpoints + keys                                                                          │   │
+│  │                                                                                                    │   │
+│  │   ┌──────────────────────────────┐      ┌─────────────────────────────────────────────────────┐   │
+│  │   │ Model Router / Policy Layer  │─────►│ Specialist Agents (3)                                │   │
+│  │   │ - Intent detection           │      │ 1) Fatigue Agent  → workload + recovery drift        │   │
+│  │   │ - Cost/latency-aware choice  │      │ 2) Risk Agent     → injury/no-ball risk + alerts     │   │
+│  │   │ - Safe fallback routing      │      │ 3) Tactical Agent → substitution + next-action plan │   │
+│  │   └──────────────────────────────┘      └─────────────────────────────────────────────────────┘   │
+│  │                    │
+│  │                    └──────────────► Final Recommendation Synthesizer
+│  │                                     - Merges agent outputs into one decision
+│  └──────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          │ response JSON
+                                          v
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ UI “Analysis Output” Panel                                                                              │
+│ - Shows router intent + signals                                                                          │
+│ - Displays agent cards (skipped/ok/fallback)                                                              │
+│ - “Run All Agents” button → forces full multi-agent pass + final output                                  │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+DEV + DELIVERY TOOLING (MICROSOFT + GITHUB)
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ GitHub Repository                                                                                        │
+│ - Source code, issues, README, architecture diagram                                                      │
+│ GitHub Actions (CI/CD)                                                                                   │
+│ - Build + deploy to Azure App Service                                                                     │
+│ GitHub Copilot                                                                                           │
+│ - Assisted coding for UI, API endpoints, Agent Framework glue code, tests, refactors                      │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
