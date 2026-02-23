@@ -277,6 +277,29 @@ const getConfig = () => ({
     DEFAULT_CONTAINER,
 });
 
+const parseCosmosAccount = (config) => {
+  if (config.endpoint) {
+    try {
+      const { host } = new URL(config.endpoint);
+      return host || null;
+    } catch {
+      return null;
+    }
+  }
+  if (config.connectionString) {
+    const match = config.connectionString.match(/AccountEndpoint=https?:\/\/([^;\/]+)/i);
+    return match && match[1] ? match[1] : null;
+  }
+  return null;
+};
+
+const createCosmosUnavailableError = (message = 'Cosmos not configured or unavailable.') => {
+  const error = new Error(message);
+  error.code = 'COSMOS_NOT_CONFIGURED';
+  error.statusCode = 503;
+  return error;
+};
+
 let cosmosEnvLogged = false;
 const logCosmosEnvOnce = () => {
   if (cosmosEnvLogged) return;
@@ -363,41 +386,44 @@ const chunk = (items, size) => {
 
 const getAllBaselines = async () => {
   logCosmosEnvOnce();
-  if (!isCosmosConfigured()) return cloneFallbackBaselines().filter((item) => item.active !== false);
+  if (!isCosmosConfigured()) {
+    throw createCosmosUnavailableError('Cosmos baselines are unavailable: missing configuration.');
+  }
 
   const container = await getContainer();
-  if (!container) return cloneFallbackBaselines().filter((item) => item.active !== false);
+  if (!container) {
+    throw createCosmosUnavailableError('Cosmos baselines are unavailable: container not initialized.');
+  }
 
   let resources;
   try {
     const result = await container.items
       .query({
-        query:
-          'SELECT * FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type) AND (c.active = true OR NOT IS_DEFINED(c.active))',
+        query: 'SELECT * FROM c WHERE c.type = @type',
         parameters: [{ name: '@type', value: 'playerBaseline' }],
       })
       .fetchAll();
     resources = result.resources;
   } catch (error) {
     logCosmosConnectFail(error);
-    return cloneFallbackBaselines().filter((item) => item.active !== false);
+    throw error;
   }
 
   const normalized = (Array.isArray(resources) ? resources : []).map(
     (item) => validateAndNormalizeBaseline(item, { strict: false }).value
   );
-  return sortBaselines(normalized.filter((item) => item.active !== false));
+  return sortBaselines(normalized);
 };
 
 const getRosterBaselines = async () => {
   logCosmosEnvOnce();
   if (!isCosmosConfigured()) {
-    return cloneFallbackBaselines().filter((item) => item.active !== false && item.inRoster === true);
+    throw createCosmosUnavailableError('Cosmos baselines are unavailable: missing configuration.');
   }
 
   const container = await getContainer();
   if (!container) {
-    return cloneFallbackBaselines().filter((item) => item.active !== false && item.inRoster === true);
+    throw createCosmosUnavailableError('Cosmos baselines are unavailable: container not initialized.');
   }
 
   let resources;
@@ -412,13 +438,13 @@ const getRosterBaselines = async () => {
     resources = result.resources;
   } catch (error) {
     logCosmosConnectFail(error);
-    return cloneFallbackBaselines().filter((item) => item.active !== false && item.inRoster === true);
+    throw error;
   }
 
   const normalized = (Array.isArray(resources) ? resources : []).map(
     (item) => validateAndNormalizeBaseline(item, { strict: false }).value
   );
-  return sortBaselines(normalized.filter((item) => item.active !== false && item.inRoster === true));
+  return sortBaselines(normalized.filter((item) => item.inRoster === true));
 };
 
 const fetchExistingOrderIndexMap = async (container) => {
@@ -521,64 +547,12 @@ const upsertBaselines = async (players) => {
   const dedupedEntries = [...dedupedById.values()];
 
   if (!isCosmosConfigured()) {
-    const merged = new Map(
-      fallbackBaselines.map((item) => [normalizeId(item.id).toLowerCase(), validateAndNormalizeBaseline(item, { strict: false }).value])
-    );
-    const maxFromExisting = getMaxOrderIndex([...merged.values()].map((item) => item.orderIndex));
-    const maxFromIncoming = getMaxOrderIndex(
-      dedupedEntries.map((entry) => (entry.hasIncomingOrderIndex ? entry.incomingOrderIndex : 0))
-    );
-    let nextOrderIndex = Math.max(maxFromExisting, maxFromIncoming);
-
-    dedupedEntries.forEach((entry) => {
-      const key = normalizeId(entry.value.id).toLowerCase();
-      const existing = merged.get(key);
-      const normalized = { ...entry.value };
-      if (entry.hasIncomingOrderIndex) {
-        normalized.orderIndex = entry.incomingOrderIndex;
-      } else if (existing && hasPositiveOrderIndex(existing.orderIndex)) {
-        normalized.orderIndex = normalizeOrderIndex(existing.orderIndex);
-      } else {
-        nextOrderIndex += 1;
-        normalized.orderIndex = nextOrderIndex;
-      }
-      merged.set(key, normalized);
-    });
-
-    fallbackBaselines = sortBaselines([...merged.values()]);
-    writeFallbackBaselinesToDisk();
-    return { count: dedupedEntries.length };
+    throw createCosmosUnavailableError('Cannot save baselines: Cosmos is not configured.');
   }
 
   const container = await getContainer();
   if (!container) {
-    const merged = new Map(
-      fallbackBaselines.map((item) => [normalizeId(item.id).toLowerCase(), validateAndNormalizeBaseline(item, { strict: false }).value])
-    );
-    const maxFromExisting = getMaxOrderIndex([...merged.values()].map((item) => item.orderIndex));
-    const maxFromIncoming = getMaxOrderIndex(
-      dedupedEntries.map((entry) => (entry.hasIncomingOrderIndex ? entry.incomingOrderIndex : 0))
-    );
-    let nextOrderIndex = Math.max(maxFromExisting, maxFromIncoming);
-
-    dedupedEntries.forEach((entry) => {
-      const key = normalizeId(entry.value.id).toLowerCase();
-      const existing = merged.get(key);
-      const normalized = { ...entry.value };
-      if (entry.hasIncomingOrderIndex) {
-        normalized.orderIndex = entry.incomingOrderIndex;
-      } else if (existing && hasPositiveOrderIndex(existing.orderIndex)) {
-        normalized.orderIndex = normalizeOrderIndex(existing.orderIndex);
-      } else {
-        nextOrderIndex += 1;
-        normalized.orderIndex = nextOrderIndex;
-      }
-      merged.set(key, normalized);
-    });
-
-    fallbackBaselines = sortBaselines([...merged.values()]);
-    writeFallbackBaselinesToDisk();
-    return { count: dedupedEntries.length };
+    throw createCosmosUnavailableError('Cannot save baselines: Cosmos container unavailable.');
   }
 
   const existingOrderById = await fetchExistingOrderIndexMap(container);
@@ -692,24 +666,12 @@ const resetBaselines = async (options = {}) => {
   const shouldSeed = options.seed !== false;
 
   if (!isCosmosConfigured()) {
-    const deleted = fallbackBaselines.length;
-    fallbackBaselines = shouldSeed ? buildDefaultBaselines() : [];
-    writeFallbackBaselinesToDisk();
-    return {
-      deleted,
-      seeded: shouldSeed ? fallbackBaselines.length : 0,
-    };
+    throw createCosmosUnavailableError('Cannot reset baselines: Cosmos is not configured.');
   }
 
   const container = await getContainer();
   if (!container) {
-    const deleted = fallbackBaselines.length;
-    fallbackBaselines = shouldSeed ? buildDefaultBaselines() : [];
-    writeFallbackBaselinesToDisk();
-    return {
-      deleted,
-      seeded: shouldSeed ? fallbackBaselines.length : 0,
-    };
+    throw createCosmosUnavailableError('Cannot reset baselines: Cosmos container unavailable.');
   }
 
   const { resources } = await container.items
@@ -741,14 +703,34 @@ const resetBaselines = async (options = {}) => {
 
 const getCosmosDiagnostics = () => {
   const config = getConfig();
+  const account = parseCosmosAccount(config);
   return {
     configured: isCosmosConfigured(),
     sdkAvailable: loadCosmosClientCtor() !== null,
+    account,
     databaseId: config.databaseId,
     containerId: config.containerId,
     initialized: Boolean(cachedContainer),
     initError: initError ? String(initError.message || initError) : null,
   };
+};
+
+const getBaselineCount = async () => {
+  if (!isCosmosConfigured()) {
+    throw createCosmosUnavailableError('Cannot count baselines: Cosmos is not configured.');
+  }
+  const container = await getContainer();
+  if (!container) {
+    throw createCosmosUnavailableError('Cannot count baselines: Cosmos container unavailable.');
+  }
+  const result = await container.items
+    .query({
+      query: 'SELECT VALUE COUNT(1) FROM c WHERE c.type = @type',
+      parameters: [{ name: '@type', value: 'playerBaseline' }],
+    })
+    .fetchAll();
+  const count = Array.isArray(result.resources) ? Number(result.resources[0] || 0) : 0;
+  return Number.isFinite(count) ? count : 0;
 };
 
 module.exports = {
@@ -766,4 +748,5 @@ module.exports = {
   deleteBaseline,
   resetBaselines,
   getCosmosDiagnostics,
+  getBaselineCount,
 };

@@ -51,7 +51,7 @@ import {
   resetBaselines,
   saveBaselines,
 } from './lib/apiClient';
-import { getRosterIds, ROSTER_STORAGE_KEY, setRosterIds } from './lib/rosterStorage';
+import { getRosterIds, removeFromRosterSession, ROSTER_STORAGE_KEY, setBaselineDraftCache, setRosterIds } from './lib/rosterStorage';
 import { Baseline, BaselineRole } from './types/baseline';
 import {
   clamp,
@@ -972,9 +972,7 @@ export default function App() {
           });
         }
         setBaselineSource(response.source);
-        setBaselineWarning(
-          response.warning || (response.source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null)
-        );
+        setBaselineWarning(response.warning || null);
         applyBaselinesToRoster(rows, reason);
       } catch (error) {
         if (requestId !== rosterLoadRequestIdRef.current) return;
@@ -1244,27 +1242,8 @@ export default function App() {
   };
 
   const movePlayerToSub = (playerId: string) => {
-    // Regression guard: roster operations never call baseline APIs.
-    const idx = players.findIndex(p => p.id === playerId);
-    if (idx !== -1) {
-      const rosterBefore = players.filter(p => p.inRoster !== false);
-      const rosterIndex = rosterBefore.findIndex(p => p.id === playerId);
-      const copy = [...players];
-      const [moved] = copy.splice(idx, 1);
-      moved.isSub = true;
-      moved.inRoster = false;
-      moved.isActive = false;
-      copy.push(moved);
-      if (activePlayerId === playerId) {
-        let nextActiveId = rosterIndex > 0 ? rosterBefore[rosterIndex - 1]?.id : undefined;
-        if (!nextActiveId) {
-          const rosterAfter = copy.filter(p => p.inRoster !== false);
-          nextActiveId = rosterAfter[0]?.id;
-        }
-        if (nextActiveId) setActivePlayerId(nextActiveId);
-      }
-      setPlayers(copy);
-    }
+    // "Remove from Active Squad" follows the same local-session roster removal path.
+    deleteRosterPlayer(playerId);
   };
 
   const applyRosterIdsToState = useCallback((nextIdsInput: string[], reason: string): string[] => {
@@ -1330,8 +1309,16 @@ export default function App() {
       });
     }
     const removedRosterIndex = previousRosterIds.findIndex((id) => baselineKey(id) === normalizedKey);
-    const nextIds = previousRosterIds.filter((id) => baselineKey(id) !== normalizedKey);
-    const nextResolvedIds = applyMatchRosterIds(nextIds);
+    const nextIds = removeFromRosterSession(normalizedId, previousRosterIds);
+    const nextResolvedIds = applyRosterIdsToState(nextIds, 'roster_remove');
+    const nextKeys = nextIds.map((id) => baselineKey(id));
+    const resolvedKeys = nextResolvedIds.map((id) => baselineKey(id));
+    if (
+      nextKeys.length !== resolvedKeys.length ||
+      nextKeys.some((key, index) => key !== resolvedKeys[index])
+    ) {
+      setRosterIds(nextResolvedIds);
+    }
     if (import.meta.env.DEV) {
       console.log('[roster-delete] optimistic applied', {
         id: normalizedId,
@@ -1866,7 +1853,7 @@ export default function App() {
     rosterInitializedRef.current = true;
     setWorkingBaselines(syncedBaselines);
     setBaselineSource(source);
-    setBaselineWarning(warning || (source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null));
+    setBaselineWarning(warning || null);
     setMatchRosterIds(resolvedRosterIds);
     if ((options?.addToRosterIds || []).length > 0) {
       setRosterIds(resolvedRosterIds);
@@ -4205,17 +4192,17 @@ function Baselines({
         });
       }
       setRuntimeSource(response.source);
-      setRuntimeWarning(
-        response.warning || (response.source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null)
-      );
+      setRuntimeWarning(response.warning || null);
       onBaselinesSynced(draftRowsToBaselines(normalized), response.source, response.warning);
       setBaselineFetchFailed(false);
       if (showSuccess) setSuccessMessage(showSuccess);
     } catch (error) {
       const warning = 'Failed to load baselines from backend.';
-      setRuntimeSource('fallback');
+      setRuntimeSource('cosmos');
       setRuntimeWarning(warning);
       setBaselineFetchFailed(true);
+      setSavedBaselines([]);
+      setDraftBaselines([]);
       setErrorMessage(error instanceof Error ? error.message : 'Failed to load baselines.');
     } finally {
       setIsLoadingBaselines(false);
@@ -4239,6 +4226,10 @@ function Baselines({
     setDraftBaselines((prev) => prev.map(syncRow));
     setSavedBaselines((prev) => prev.map(syncRow));
   }, [matchRosterIds]);
+
+  useEffect(() => {
+    setBaselineDraftCache(draftBaselines.map((row) => ({ ...row })));
+  }, [draftBaselines]);
 
   useEffect(() => {
     const handlePointerDownOutside = (event: MouseEvent | TouchEvent) => {
@@ -4546,9 +4537,9 @@ function Baselines({
         </div>
       </div>
 
-      {!isLoadingBaselines && baselineFetchFailed && (runtimeSource === 'fallback' || runtimeWarning) && (
+      {!isLoadingBaselines && runtimeWarning && !errorMessage && (
         <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-amber-200 text-sm">
-          {runtimeWarning || 'Cosmos DB is unavailable; using fallback baseline profiles.'}
+          {runtimeWarning}
         </div>
       )}
       {errorMessage && (
@@ -4643,7 +4634,7 @@ function Baselines({
                </tr>
              </thead>
 	             <tbody className="divide-y divide-white/5 text-sm">
-	               {(!baselineFetchFailed && draftBaselines.length === 0) ? (
+		               {draftBaselines.length === 0 ? (
                  <tr>
                    <td colSpan={12} className="px-6 py-16">
                      <div className="flex flex-col items-center justify-center text-center">
