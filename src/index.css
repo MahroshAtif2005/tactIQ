@@ -3315,3 +3315,16 @@ body {
   line-height: 1 !important;
   font-weight: 600 !important;
 }
+
+@keyframes neon-breathe {
+  0%, 100% {
+    box-shadow: 0 0 15px rgba(16, 185, 129, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 40px rgba(16, 185, 129, 0.9);
+  }
+}
+
+.neon-breathe {
+  animation: neon-breathe 2.5s ease-in-out infinite;
+}

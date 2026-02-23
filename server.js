@@ -11,10 +11,11 @@ const {
   getAllBaselines,
   getBaseline,
   getContainer,
+  getRosterBaselines,
   getCosmosDiagnostics,
   isCosmosConfigured,
+  patchBaseline,
   resetBaselines,
-  setBaselineActive,
   upsertBaselines,
   validateAndNormalizeBaseline,
 } = require("./server/db/cosmos");
@@ -76,6 +77,8 @@ console.log("[env] cosmos", {
 getContainer()
   .then((container) => {
     if (container) {
+      const { databaseId, containerId } = getCosmosDiagnostics();
+      console.log(`Cosmos connected: db=${databaseId} container=${containerId}`);
       console.log("[cosmos] container ready.");
     } else {
       console.warn("[cosmos] not configured or unavailable. Using fallback baselines.");
@@ -365,6 +368,7 @@ app.get("/api/health", (_req, res) => {
     routes: [
       "/api/health",
       "/api/baselines",
+      "/api/roster",
       "/api/baselines/:id",
       "/api/baselines/reset",
       "/api/router",
@@ -398,6 +402,21 @@ app.get("/api/baselines", async (_req, res) => {
   } catch (error) {
     console.error("Baselines GET error", error);
     return res.status(500).json({ error: "Failed to load baselines." });
+  }
+});
+
+app.get("/api/roster", async (_req, res) => {
+  try {
+    const baselineSource = await resolveBaselineSource();
+    const players = await getRosterBaselines();
+    return res.status(200).json({
+      players,
+      source: baselineSource.source,
+      ...(baselineSource.warning ? { warning: baselineSource.warning } : {}),
+    });
+  } catch (error) {
+    console.error("Roster GET error", error);
+    return res.status(500).json({ error: "Failed to load roster." });
   }
 });
 
@@ -453,11 +472,33 @@ app.patch("/api/baselines/:id", async (req, res) => {
       return res.status(400).json({ error: "id is required." });
     }
 
-    if (!isRecord(req.body) || typeof req.body.active !== "boolean") {
-      return res.status(400).json({ error: "Body must include boolean field: active." });
+    if (!isRecord(req.body)) {
+      return res.status(400).json({ error: "Body must include at least one patch field." });
+    }
+    const hasActive = Object.prototype.hasOwnProperty.call(req.body, "active");
+    const hasInRoster =
+      Object.prototype.hasOwnProperty.call(req.body, "inRoster") ||
+      Object.prototype.hasOwnProperty.call(req.body, "roster");
+    if (!hasActive && !hasInRoster) {
+      return res.status(400).json({ error: "Body must include active and/or inRoster." });
+    }
+    if (hasActive && typeof req.body.active !== "boolean") {
+      return res.status(400).json({ error: "Field active must be boolean." });
+    }
+    const nextInRoster = Object.prototype.hasOwnProperty.call(req.body, "inRoster")
+      ? req.body.inRoster
+      : req.body.roster;
+    if (hasInRoster && typeof nextInRoster !== "boolean") {
+      return res.status(400).json({ error: "Field inRoster must be boolean." });
     }
 
-    const updated = await setBaselineActive(id, req.body.active);
+    const updated = await patchBaseline(id, {
+      ...(hasActive ? { active: req.body.active } : {}),
+      ...(hasInRoster ? { inRoster: nextInRoster } : {}),
+    });
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[baselines] patch", { id, status: 200, hasActive, hasInRoster });
+    }
     return res.status(200).json({ ok: true, player: updated });
   } catch (error) {
     console.error("Baselines PATCH error", error);

@@ -438,7 +438,16 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
   const controlBaseline = Number(item.control ?? item.controlBaseline);
   const speed = Number(item.speed);
   const power = Number(item.power);
-  const isActive = typeof item.active === 'boolean' ? item.active : Boolean(item.isActive);
+  const isActive = typeof item.active === 'boolean'
+    ? item.active
+    : typeof item.isActive === 'boolean'
+      ? item.isActive
+      : true;
+  const inRoster = typeof item.inRoster === 'boolean'
+    ? item.inRoster
+    : typeof item.roster === 'boolean'
+      ? item.roster
+      : false;
   const name = String(item.name || id).trim() || id;
 
   return {
@@ -457,6 +466,7 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
     recovery: Number.isFinite(recoveryMinutes) ? clamp(recoveryMinutes, 0, 240) : 45,
     control: Number.isFinite(controlBaseline) ? clamp(controlBaseline, 0, 100) : 78,
     active: isActive,
+    inRoster,
     orderIndex: normalizeOrderIndex(item.orderIndex),
     createdAt: typeof item.createdAt === 'string' ? item.createdAt : undefined,
     updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : undefined,
@@ -493,6 +503,7 @@ export async function getBaselines(signal?: AbortSignal): Promise<Baseline[]> {
 export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal): Promise<Baseline[]> {
   const players: PlayerBaseline[] = baselines.map((row) => ({
     id: String(row.id || row.playerId || '').trim(),
+    type: 'playerBaseline',
     role: row.role,
     sleep: clamp(toNumberOr(row.sleep ?? row.sleepHoursToday, 7), 0, 12),
     recovery: clamp(toNumberOr(row.recovery ?? row.recoveryMinutes, 45), 0, 240),
@@ -500,7 +511,6 @@ export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal)
     control: clamp(toNumberOr(row.control ?? row.controlBaseline, 78), 0, 100),
     speed: clamp(toNumberOr(row.speed, 7), 0, 100),
     power: clamp(toNumberOr(row.power, 0), 0, 100),
-    active: typeof row.active === 'boolean' ? row.active : Boolean(row.isActive),
     name: String(row.name || row.id || row.playerId || '').trim() || undefined,
     ...(normalizeOrderIndex(row.orderIndex) > 0 ? { orderIndex: normalizeOrderIndex(row.orderIndex) } : {}),
     createdAt: row.createdAt,
@@ -530,8 +540,48 @@ export async function updateBaselineActive(
   active: boolean,
   signal?: AbortSignal
 ): Promise<Baseline | null> {
-  const id = encodeURIComponent(String(baselineId || '').trim());
-  const raw = await patchJson<unknown>(`${baselinesEndpoint}/${id}`, { active }, signal);
+  return updateBaseline(baselineId, { active }, signal);
+}
+
+export async function updateBaseline(
+  baselineId: string,
+  patch: { active?: boolean; inRoster?: boolean },
+  signal?: AbortSignal
+): Promise<Baseline | null> {
+  const normalizedId = String(baselineId || '').trim();
+  if (!normalizedId) {
+    throw new ApiClientError({
+      message: 'Cannot update baseline: missing player id.',
+      kind: 'http',
+      url: `${baselinesEndpoint}/:id`,
+      status: 400,
+    });
+  }
+  const id = encodeURIComponent(normalizedId);
+  const payload: Record<string, unknown> = {};
+  if (typeof patch.active === 'boolean') payload.active = patch.active;
+  if (typeof patch.inRoster === 'boolean') payload.inRoster = patch.inRoster;
+  payload.updatedAt = new Date().toISOString();
+  const url = `${baselinesEndpoint}/${id}`;
+  if (import.meta.env.DEV) {
+    console.log('[api] PATCH baseline', { url, payload });
+  }
+  const { status, text } = await requestText(
+    url,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal,
+    }
+  );
+  if (import.meta.env.DEV) {
+    console.log('[api] PATCH baseline status', { url, status });
+    if (patch.inRoster === false) {
+      console.log(`Removed from roster: ${normalizedId} status=${status}`);
+    }
+  }
+  const raw = parseJsonResponse<unknown>(text, url, status);
   if (raw && typeof raw === 'object') {
     const record = raw as Record<string, unknown>;
     const candidate = normalizeBaseline(record.player ?? record.baseline ?? record);
