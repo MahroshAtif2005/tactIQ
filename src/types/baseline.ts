@@ -2,6 +2,7 @@ export type BaselineRole = 'FAST' | 'SPIN' | 'BAT' | 'AR';
 
 export interface PlayerBaseline {
   id: string;
+  type?: 'playerBaseline';
   role: BaselineRole;
   sleep: number;
   recovery: number;
@@ -10,6 +11,7 @@ export interface PlayerBaseline {
   speed: number;
   power: number;
   active: boolean;
+  inRoster: boolean;
   name?: string;
   orderIndex?: number;
   createdAt?: string;
