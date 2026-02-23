@@ -134,21 +134,6 @@ const normalizeActive = (raw, strict, errors) => {
   return Boolean(raw);
 };
 
-const normalizeInRoster = (raw, fallbackRaw, strict, errors) => {
-  if (typeof raw === 'boolean') return raw;
-  if (typeof fallbackRaw === 'boolean') return fallbackRaw;
-  if (raw === undefined || raw === null) {
-    if (strict) errors.push('inRoster is required');
-    return false;
-  }
-
-  if (strict) {
-    errors.push('inRoster must be a boolean');
-    return false;
-  }
-  return Boolean(raw);
-};
-
 const validateAndNormalizeBaseline = (raw, options = {}) => {
   const strict = options.strict === true;
   const errors = [];
@@ -164,7 +149,6 @@ const validateAndNormalizeBaseline = (raw, options = {}) => {
   const normalized = {
     id: id || 'Unknown Player',
     type: 'playerBaseline',
-    name: typeof payload.name === 'string' && payload.name.trim().length > 0 ? payload.name.trim() : (id || 'Unknown Player'),
     role,
     sleep: parseNumericField(
       payload.sleep !== undefined ? payload.sleep : payload.sleepHoursToday,
@@ -197,11 +181,14 @@ const validateAndNormalizeBaseline = (raw, options = {}) => {
     speed: parseNumericField(payload.speed, 'speed', 0, 100, 7, strict, errors),
     power: parseNumericField(payload.power, 'power', 0, 100, 0, strict, errors),
     active: normalizeActive(payload.active !== undefined ? payload.active : payload.isActive, strict, errors),
-    inRoster: normalizeInRoster(payload.inRoster, payload.roster, strict, errors),
     orderIndex: normalizeOrderIndex(payload.orderIndex),
     createdAt: normalizeIsoTimestamp(payload.createdAt),
     updatedAt: normalizeIsoTimestamp(payload.updatedAt),
   };
+
+  if (typeof payload.name === 'string' && payload.name.trim().length > 0) {
+    normalized.name = payload.name.trim();
+  }
 
   if (errors.length > 0) {
     return { ok: false, errors, value: normalized };
@@ -365,60 +352,23 @@ const chunk = (items, size) => {
 
 const getAllBaselines = async () => {
   logCosmosEnvOnce();
-  if (!isCosmosConfigured()) {
-    return cloneFallbackBaselines().filter((item) => item.active !== false);
-  }
+  if (!isCosmosConfigured()) return cloneFallbackBaselines();
 
   const container = await getContainer();
-  if (!container) {
-    return cloneFallbackBaselines().filter((item) => item.active !== false);
-  }
+  if (!container) return cloneFallbackBaselines();
 
   let resources;
   try {
     const result = await container.items
       .query({
-        query:
-          'SELECT * FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type) AND (c.active = true OR NOT IS_DEFINED(c.active))',
+        query: 'SELECT * FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type)',
         parameters: [{ name: '@type', value: 'playerBaseline' }],
       })
       .fetchAll();
     resources = result.resources;
   } catch (error) {
     logCosmosConnectFail(error);
-    return cloneFallbackBaselines().filter((item) => item.active !== false);
-  }
-
-  const normalized = (Array.isArray(resources) ? resources : []).map(
-    (item) => validateAndNormalizeBaseline(item, { strict: false }).value
-  );
-  return sortBaselines(normalized);
-};
-
-const getRosterBaselines = async () => {
-  logCosmosEnvOnce();
-  if (!isCosmosConfigured()) {
-    return cloneFallbackBaselines().filter((item) => item.active !== false && item.inRoster === true);
-  }
-
-  const container = await getContainer();
-  if (!container) {
-    return cloneFallbackBaselines().filter((item) => item.active !== false && item.inRoster === true);
-  }
-
-  let resources;
-  try {
-    const result = await container.items
-      .query({
-        query:
-          'SELECT * FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type) AND (c.active = true OR NOT IS_DEFINED(c.active)) AND c.inRoster = true',
-        parameters: [{ name: '@type', value: 'playerBaseline' }],
-      })
-      .fetchAll();
-    resources = result.resources;
-  } catch (error) {
-    logCosmosConnectFail(error);
-    return cloneFallbackBaselines().filter((item) => item.active !== false && item.inRoster === true);
+    return cloneFallbackBaselines();
   }
 
   const normalized = (Array.isArray(resources) ? resources : []).map(
@@ -633,93 +583,44 @@ const deleteBaseline = async (id) => {
 
   if (!isCosmosConfigured()) {
     const lowered = normalizedId.toLowerCase();
-    const existing = fallbackBaselines.find((item) => normalizeId(item.id).toLowerCase() === lowered);
-    const exists = Boolean(existing);
+    const exists = fallbackBaselines.some((item) => normalizeId(item.id).toLowerCase() === lowered);
     if (!exists) {
       const error = new Error(`Baseline ${normalizedId} not found.`);
       error.code = 404;
       throw error;
     }
-    fallbackBaselines = fallbackBaselines.map((item) =>
-      normalizeId(item.id).toLowerCase() === lowered
-        ? { ...item, active: false, inRoster: false, updatedAt: new Date().toISOString() }
-        : item
-    );
+    fallbackBaselines = fallbackBaselines.filter((item) => normalizeId(item.id).toLowerCase() !== lowered);
     writeFallbackBaselinesToDisk();
-    return { ok: true, softDeleted: true };
+    return { ok: true };
   }
 
   const container = await getContainer();
   if (!container) {
     const lowered = normalizedId.toLowerCase();
-    const existing = fallbackBaselines.find((item) => normalizeId(item.id).toLowerCase() === lowered);
-    const exists = Boolean(existing);
+    const exists = fallbackBaselines.some((item) => normalizeId(item.id).toLowerCase() === lowered);
     if (!exists) {
       const error = new Error(`Baseline ${normalizedId} not found.`);
       error.code = 404;
       throw error;
     }
-    fallbackBaselines = fallbackBaselines.map((item) =>
-      normalizeId(item.id).toLowerCase() === lowered
-        ? { ...item, active: false, inRoster: false, updatedAt: new Date().toISOString() }
-        : item
-    );
+    fallbackBaselines = fallbackBaselines.filter((item) => normalizeId(item.id).toLowerCase() !== lowered);
     writeFallbackBaselinesToDisk();
-    return { ok: true, softDeleted: true };
+    return { ok: true };
   }
 
-  const existing = await getBaseline(normalizedId);
-  if (!existing) {
-    const error = new Error(`Baseline ${normalizedId} not found.`);
-    error.code = 404;
-    throw error;
-  }
-
-  const normalized = validateAndNormalizeBaseline(
-    {
-      ...existing,
-      active: false,
-      inRoster: false,
-      updatedAt: new Date().toISOString(),
-    },
-    { strict: true }
-  );
-  if (!normalized.ok) {
-    const error = new Error('Invalid baseline soft delete payload.');
-    error.code = 'VALIDATION_ERROR';
-    error.details = normalized.errors;
-    throw error;
-  }
-
-  await upsertBaselines([normalized.value]);
-  return { ok: true, softDeleted: true };
+  await container.item(normalizedId, normalizedId).delete();
+  return { ok: true };
 };
 
-const patchBaseline = async (id, patch = {}) => {
+const setBaselineActive = async (id, active) => {
   const normalizedId = normalizeId(id);
   if (!normalizedId) {
     const error = new Error('id is required');
     error.code = 'VALIDATION_ERROR';
     throw error;
   }
-
-  if (!isRecord(patch) || (!Object.prototype.hasOwnProperty.call(patch, 'active') && !Object.prototype.hasOwnProperty.call(patch, 'inRoster') && !Object.prototype.hasOwnProperty.call(patch, 'roster'))) {
-    const error = new Error('patch must include at least one of: active, inRoster');
-    error.code = 'VALIDATION_ERROR';
-    throw error;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, 'active') && typeof patch.active !== 'boolean') {
+  if (typeof active !== 'boolean') {
     const error = new Error('active must be boolean');
-    error.code = 'VALIDATION_ERROR';
-    throw error;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, 'inRoster') && typeof patch.inRoster !== 'boolean') {
-    const error = new Error('inRoster must be boolean');
-    error.code = 'VALIDATION_ERROR';
-    throw error;
-  }
-  if (!Object.prototype.hasOwnProperty.call(patch, 'inRoster') && Object.prototype.hasOwnProperty.call(patch, 'roster') && typeof patch.roster !== 'boolean') {
-    const error = new Error('roster must be boolean when provided');
     error.code = 'VALIDATION_ERROR';
     throw error;
   }
@@ -734,14 +635,8 @@ const patchBaseline = async (id, patch = {}) => {
   const normalized = validateAndNormalizeBaseline(
     {
       ...existing,
-      ...(Object.prototype.hasOwnProperty.call(patch, 'active')
-        ? { active: patch.active, isActive: patch.active }
-        : {}),
-      ...(Object.prototype.hasOwnProperty.call(patch, 'inRoster')
-        ? { inRoster: patch.inRoster }
-        : Object.prototype.hasOwnProperty.call(patch, 'roster')
-          ? { inRoster: patch.roster }
-          : {}),
+      active,
+      isActive: active,
       updatedAt: new Date().toISOString(),
     },
     { strict: true }
@@ -757,8 +652,6 @@ const patchBaseline = async (id, patch = {}) => {
   await upsertBaselines([normalized.value]);
   return (await getBaseline(normalizedId)) || normalized.value;
 };
-
-const setBaselineActive = async (id, active) => patchBaseline(id, { active });
 
 const resetBaselines = async (options = {}) => {
   const shouldSeed = options.seed !== false;
@@ -830,10 +723,8 @@ module.exports = {
   isCosmosConfigured,
   getContainer,
   getAllBaselines,
-  getRosterBaselines,
   getBaseline,
   upsertBaselines,
-  patchBaseline,
   setBaselineActive,
   deleteBaseline,
   resetBaselines,
