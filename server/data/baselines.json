@@ -2,6 +2,7 @@
   {
     "id": "Babar Azam",
     "type": "playerBaseline",
+    "name": "Babar Azam",
     "role": "BAT",
     "sleep": 7,
     "recovery": 45,
@@ -10,14 +11,15 @@
     "speed": 7,
     "power": 6,
     "active": true,
+    "inRoster": false,
     "orderIndex": 0,
     "createdAt": "2026-02-22T13:40:07.919Z",
-    "updatedAt": "2026-02-22T12:12:00.019Z",
-    "name": "Babar Azam"
+    "updatedAt": "2026-02-22T12:12:00.019Z"
   },
   {
     "id": "R. Khan",
     "type": "playerBaseline",
+    "name": "R. Khan",
     "role": "SPIN",
     "sleep": 7.1,
     "recovery": 40,
@@ -26,9 +28,9 @@
     "speed": 8,
     "power": 0,
     "active": true,
+    "inRoster": false,
     "orderIndex": 0,
     "createdAt": "2026-02-22T13:40:07.920Z",
-    "updatedAt": "2026-02-22T12:12:00.019Z",
-    "name": "R. Khan"
+    "updatedAt": "2026-02-22T12:12:00.019Z"
   }
 ]

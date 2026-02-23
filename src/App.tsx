@@ -50,6 +50,7 @@ import {
   postOrchestrate,
   resetBaselines,
   saveBaselines,
+  updateBaseline,
 } from './lib/apiClient';
 import { Baseline, BaselineRole } from './types/baseline';
 import {
@@ -608,6 +609,7 @@ const baselineRoleToPlayerRole = (role: BaselineRole): Player['role'] => {
 
 const normalizeBaselineRecord = (baseline: Partial<Baseline>): Baseline => ({
   id: normalizeBaselineId(baseline.id || baseline.playerId || baseline.name),
+  type: 'playerBaseline',
   playerId: normalizeBaselineId(baseline.playerId || baseline.id || baseline.name),
   name: String(baseline.name || baseline.id || baseline.playerId || 'Unknown Player').trim() || 'Unknown Player',
   role: baseline.role,
@@ -622,6 +624,7 @@ const normalizeBaselineRecord = (baseline: Partial<Baseline>): Baseline => ({
   recovery: clamp(safeNum(baseline.recovery ?? baseline.recoveryMinutes, 45), 0, 240),
   control: clamp(safeNum(baseline.control ?? baseline.controlBaseline, 78), 0, 100),
   active: baseline.active ?? baseline.isActive ?? true,
+  inRoster: typeof baseline.inRoster === 'boolean' ? baseline.inRoster : false,
   orderIndex: Math.max(0, Math.floor(safeNum(baseline.orderIndex, 0))),
   createdAt: baseline.createdAt,
   updatedAt: baseline.updatedAt,
@@ -705,64 +708,11 @@ const getLocalDefaultBaselines = (): Baseline[] =>
   LOCAL_BASELINE_DEFAULTS.map((row) => normalizeBaselineRecord(row));
 
 const MAX_ROSTER = 11;
-const BASELINES_STORAGE_KEY = 'tactiq.baselines';
-const BASELINES_CHANGED_EVENT = 'tactiq-baselines-changed';
-const MATCH_ROSTER_IDS_STORAGE_KEY = 'tactiq_matchRosterIds';
-
-const serializeBaselinesForStorage = (rows: Baseline[]): string =>
-  JSON.stringify(rows.map((row) => normalizeBaselineRecord(row)));
-
-const readBaselinesFromStorage = (): Baseline[] | null => {
-  if (typeof window === 'undefined') return null;
-  const raw = window.localStorage.getItem(BASELINES_STORAGE_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    return parsed.map((entry) => normalizeBaselineRecord(entry));
-  } catch {
-    return null;
-  }
-};
-
-const writeBaselinesToStorage = (rows: Baseline[]): void => {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(BASELINES_STORAGE_KEY, serializeBaselinesForStorage(rows));
-    window.dispatchEvent(new Event(BASELINES_CHANGED_EVENT));
-  } catch {
-    // Ignore storage write failures in restricted browser modes.
-  }
-};
-
-const readMatchRosterIdsFromStorage = (): string[] | null => {
-  if (typeof window === 'undefined') return null;
-  const raw = window.localStorage.getItem(MATCH_ROSTER_IDS_STORAGE_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    return parsed
-      .map((entry) => normalizeBaselineId(String(entry || '')))
-      .filter((entry, index, list) => entry.length > 0 && list.indexOf(entry) === index);
-  } catch {
-    return null;
-  }
-};
-
-const writeMatchRosterIdsToStorage = (ids: string[]): void => {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(MATCH_ROSTER_IDS_STORAGE_KEY, JSON.stringify(ids));
-  } catch {
-    // Ignore storage write failures in restricted browser modes.
-  }
-};
 
 const getEligibleRosterBaselineIds = (rows: Baseline[]): string[] =>
   orderBaselinesForDisplay(rows)
     .map((row) => normalizeBaselineRecord(row))
-    .filter((row) => row.active === true || row.isActive === true)
+    .filter((row) => (row.active === true || row.isActive === true) && row.inRoster === true)
     .map((row) => normalizeBaselineId(row.id || row.playerId || row.name))
     .filter((id, index, list) => id.length > 0 && list.indexOf(id) === index);
 
@@ -807,6 +757,7 @@ const baselineFromPlayer = (player: Player): Baseline =>
     control: safeNum(player.controlBaseline, 78),
     speed: safeNum(player.speed, 7),
     power: safeNum(player.power, 6),
+    inRoster: player.inRoster !== false,
     updatedAt: new Date().toISOString(),
   });
 
@@ -1012,15 +963,20 @@ export default function App() {
   const previousActivePlayerIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    let rosterIdsRef = readMatchRosterIdsFromStorage();
+    let cancelled = false;
 
-    const applyBaselinesToRoster = (rows: Baseline[]) => {
+    const applyBaselinesToRoster = (
+      rows: Baseline[],
+      source: 'cosmos' | 'fallback',
+      warning?: string | null
+    ) => {
       const orderedRows = orderBaselinesForDisplay(rows);
+      const resolvedIds = getEligibleRosterBaselineIds(orderedRows).slice(0, MAX_ROSTER);
+      if (cancelled) return;
       setWorkingBaselines(orderedRows);
-      const resolvedIds = resolveMatchRosterIds(orderedRows, rosterIdsRef);
-      rosterIdsRef = resolvedIds;
+      setBaselineSource(source);
+      setBaselineWarning(warning || (source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null));
       setMatchRosterIds(resolvedIds);
-      writeMatchRosterIdsToStorage(resolvedIds);
       setPlayers((prev) => {
         const derivedRoster = buildRosterPlayersFromBaselines(prev, orderedRows, resolvedIds);
         setActivePlayerId((currentId) => {
@@ -1031,60 +987,25 @@ export default function App() {
       });
     };
 
-    const loadFromStorage = (warning?: string) => {
-      const stored = readBaselinesFromStorage();
-      const rows = orderBaselinesForDisplay(stored !== null ? stored : getLocalDefaultBaselines());
-      if (!stored) writeBaselinesToStorage(rows);
-      setBaselineSource('fallback');
-      setBaselineWarning(warning || null);
-      applyBaselinesToRoster(rows);
-    };
-
     const loadFromBackend = async () => {
       try {
         const response = await getBaselinesWithMeta();
-        const rows = orderBaselinesForDisplay(response.baselines);
-        setBaselineSource(response.source);
-        setBaselineWarning(
-          response.warning || (response.source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null)
-        );
-        writeBaselinesToStorage(rows);
-        applyBaselinesToRoster(rows);
+        applyBaselinesToRoster(response.baselines, response.source, response.warning);
       } catch (error) {
         if (import.meta.env.DEV) {
           console.warn('[baselines] backend load failed; using local fallback', error);
         }
-        loadFromStorage('Failed to load baselines from backend. Using local defaults.');
+        applyBaselinesToRoster(
+          getLocalDefaultBaselines(),
+          'fallback',
+          'Failed to load baselines from backend. Using local defaults.'
+        );
       }
     };
 
-    const handleStorage = (event: StorageEvent) => {
-      if (event.key && event.key !== BASELINES_STORAGE_KEY && event.key !== MATCH_ROSTER_IDS_STORAGE_KEY) {
-        return;
-      }
-
-      if (event.key === MATCH_ROSTER_IDS_STORAGE_KEY) {
-        rosterIdsRef = readMatchRosterIdsFromStorage();
-        const storedBaselines = readBaselinesFromStorage();
-        if (storedBaselines) {
-          applyBaselinesToRoster(storedBaselines);
-        }
-        return;
-      }
-
-      loadFromStorage();
-    };
-
-    const handleLocalEvent = () => {
-      loadFromStorage();
-    };
-
-    loadFromBackend();
-    window.addEventListener('storage', handleStorage);
-    window.addEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
+    void loadFromBackend();
     return () => {
-      window.removeEventListener('storage', handleStorage);
-      window.removeEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
+      cancelled = true;
     };
   }, []);
 
@@ -1352,17 +1273,43 @@ export default function App() {
       }
       setPlayers(copy);
     }
+
+    const normalizedId = normalizeBaselineId(playerId);
+    if (!normalizedId) return;
+    const normalizedKey = baselineKey(normalizedId);
+    const nextBaselines = orderBaselinesForDisplay(workingBaselines).map((baseline) => {
+      const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+      if (baselineKey(baselineId) !== normalizedKey) return baseline;
+      return normalizeBaselineRecord({
+        ...baseline,
+        inRoster: false,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+    handleBaselinesSynced(nextBaselines, baselineSource, baselineWarning || undefined, { persist: false });
+    void updateBaseline(normalizedId, { inRoster: false }).catch((error) => {
+      if (import.meta.env.DEV) {
+        console.warn('[roster] failed to persist move-to-sub roster change', error);
+      }
+    });
   };
 
   const applyMatchRosterIds = (nextIdsInput: string[]) => {
-    const orderedBaselines = orderBaselinesForDisplay(
-      workingBaselines.length > 0 ? workingBaselines : (readBaselinesFromStorage() ?? getLocalDefaultBaselines())
-    );
-    const resolvedIds = resolveMatchRosterIds(orderedBaselines, nextIdsInput);
+    const orderedBaselines = orderBaselinesForDisplay(workingBaselines);
+    const nextIdSet = new Set(nextIdsInput.map((id) => baselineKey(id)));
+    const syncedBaselines = orderedBaselines.map((baseline) => {
+      const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+      const isActive = baseline.active !== false && baseline.isActive !== false;
+      return normalizeBaselineRecord({
+        ...baseline,
+        inRoster: isActive && nextIdSet.has(baselineKey(baselineId)),
+      });
+    });
+    const resolvedIds = getEligibleRosterBaselineIds(syncedBaselines).slice(0, MAX_ROSTER);
+    setWorkingBaselines(syncedBaselines);
     setMatchRosterIds(resolvedIds);
-    writeMatchRosterIdsToStorage(resolvedIds);
     setPlayers((prevPlayers) => {
-      const derivedRoster = buildRosterPlayersFromBaselines(prevPlayers, orderedBaselines, resolvedIds);
+      const derivedRoster = buildRosterPlayersFromBaselines(prevPlayers, syncedBaselines, resolvedIds);
       setActivePlayerId((currentId) => {
         if (derivedRoster.some((player) => player.id === currentId)) return currentId;
         return derivedRoster[0]?.id ?? '';
@@ -1371,30 +1318,56 @@ export default function App() {
     });
   };
 
-  const deleteRosterPlayer = (rosterPlayerId: string) => {
+  const deleteRosterPlayer = async (rosterPlayerId: string) => {
     const normalizedId = normalizeBaselineId(rosterPlayerId);
     if (!normalizedId) return;
     const normalizedKey = baselineKey(normalizedId);
 
-    // Keep baseline + roster in sync locally: removing from roster marks baseline inactive for this session.
     const nextBaselines = orderBaselinesForDisplay(
-      workingBaselines.length > 0 ? workingBaselines : (readBaselinesFromStorage() ?? getLocalDefaultBaselines())
+      workingBaselines.length > 0 ? workingBaselines : getLocalDefaultBaselines()
     ).map((baseline) => {
       const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
       if (baselineKey(baselineId) !== normalizedKey) return baseline;
       return normalizeBaselineRecord({
         ...baseline,
-        isActive: false,
-        active: false,
+        inRoster: false,
         updatedAt: new Date().toISOString(),
       });
     });
-    setWorkingBaselines(nextBaselines);
-    writeBaselinesToStorage(nextBaselines);
+    handleBaselinesSynced(nextBaselines, baselineSource, baselineWarning || undefined, { persist: false });
 
-    const currentIds = matchRosterIds.length > 0 ? matchRosterIds : (readMatchRosterIdsFromStorage() || []);
-    const nextIds = currentIds.filter((id) => baselineKey(id) !== normalizedKey);
-    applyMatchRosterIds(nextIds);
+    try {
+      const patched = await updateBaseline(normalizedId, { inRoster: false });
+      if (patched) {
+        const committedBaselines = nextBaselines.map((baseline) => {
+          const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+          if (baselineKey(baselineId) !== normalizedKey) return baseline;
+          return normalizeBaselineRecord({
+            ...baseline,
+            ...patched,
+            active: patched.active,
+            isActive: patched.isActive,
+            inRoster: patched.inRoster,
+          });
+        });
+        handleBaselinesSynced(committedBaselines, baselineSource, baselineWarning || undefined, { persist: false });
+      } else {
+        const response = await getBaselinesWithMeta();
+        handleBaselinesSynced(response.baselines, response.source, response.warning);
+      }
+    } catch (error) {
+      if (import.meta.env.DEV) {
+        console.warn('[roster] failed to persist inRoster=false; reloading baselines', error);
+      }
+      try {
+        const response = await getBaselinesWithMeta();
+        handleBaselinesSynced(response.baselines, response.source, response.warning);
+      } catch (reloadError) {
+        if (import.meta.env.DEV) {
+          console.warn('[roster] failed to reload baselines after patch failure', reloadError);
+        }
+      }
+    }
   };
 
   const handleAddOver = () => {
@@ -1851,37 +1824,24 @@ export default function App() {
     warning?: string,
     options?: { persist?: boolean; addToRosterIds?: string[] }
   ) => {
-    const shouldPersist = options?.persist !== false;
     const orderedBaselines = orderBaselinesForDisplay(baselines);
-    const storedRosterIds = readMatchRosterIdsFromStorage();
-    const currentRosterIds = matchRosterIds.length > 0 || storedRosterIds === null
-      ? matchRosterIds
-      : storedRosterIds;
-    const normalizedRosterIds = resolveMatchRosterIds(orderedBaselines, currentRosterIds);
-    const baselineIdSet = new Set(getEligibleRosterBaselineIds(orderedBaselines).map((id) => baselineKey(id)));
-    const seen = new Set(normalizedRosterIds.map((id) => baselineKey(id)));
-    const additions = (options?.addToRosterIds || [])
-      .map((id) => normalizeBaselineId(id))
-      .filter((id) => {
-        const key = baselineKey(id);
-        if (!key) return false;
-        if (seen.has(key)) return false;
-        if (!baselineIdSet.has(key)) return false;
-        seen.add(key);
-        return true;
+    const additions = new Set((options?.addToRosterIds || []).map((id) => baselineKey(id)).filter(Boolean));
+    const rosterReadyBaselines = orderedBaselines.map((baseline) => {
+      const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+      if (!additions.has(baselineKey(baselineId))) return baseline;
+      return normalizeBaselineRecord({
+        ...baseline,
+        inRoster: true,
       });
-    const resolvedRosterIds = [...normalizedRosterIds, ...additions].slice(0, MAX_ROSTER);
-    setWorkingBaselines(orderedBaselines);
+    });
+    const resolvedRosterIds = getEligibleRosterBaselineIds(rosterReadyBaselines).slice(0, MAX_ROSTER);
+    setWorkingBaselines(rosterReadyBaselines);
     setBaselineSource(source);
     setBaselineWarning(warning || (source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null));
     setMatchRosterIds(resolvedRosterIds);
-    writeMatchRosterIdsToStorage(resolvedRosterIds);
-    if (shouldPersist) {
-      writeBaselinesToStorage(orderedBaselines);
-    }
-    // IMPORTANT: Roster is derived from local match roster IDs only.
+    // IMPORTANT: Roster comes from persisted baseline.inRoster flags.
     setPlayers((prev) => {
-      const derivedRoster = buildRosterPlayersFromBaselines(prev, orderedBaselines, resolvedRosterIds);
+      const derivedRoster = buildRosterPlayersFromBaselines(prev, rosterReadyBaselines, resolvedRosterIds);
       if (!derivedRoster.some((player) => player.id === activePlayerId) && derivedRoster.length > 0) {
         setTimeout(() => setActivePlayerId(derivedRoster[0].id), 0);
       }
@@ -2565,8 +2525,6 @@ function Dashboard({
     setIsResettingBaselines(true);
     try {
       await resetBaselines();
-      const response = await getBaselinesWithMeta();
-      writeBaselinesToStorage(response.baselines);
     } catch (error) {
       setRosterEmptyError(error instanceof Error ? error.message : 'Failed to reset baselines.');
     } finally {
@@ -3964,7 +3922,10 @@ const baselineToDraftRow = (baseline: Baseline, rosterIdSet?: Set<string>): Base
     name,
     role: normalized.role,
     active: Boolean(normalized.isActive),
-    inRoster: Boolean(rosterIdSet?.has(resolvedRosterKey)),
+    inRoster:
+      typeof normalized.inRoster === 'boolean'
+        ? normalized.inRoster
+        : Boolean(rosterIdSet?.has(resolvedRosterKey)),
     sleep: clamp(safeNum(normalized.sleepHoursToday, 7), 0, 12),
     recovery: clamp(safeNum(normalized.recoveryMinutes, 45), 0, 240),
     fatigueLimit: clamp(safeNum(normalized.fatigueLimit, 6), 0, 10),
@@ -3988,6 +3949,7 @@ const draftRowToBaseline = (row: BaselineDraftRow): Baseline | null => {
     name,
     role: row.role,
     isActive: row.active,
+    inRoster: row.inRoster,
     sleepHoursToday: clamp(safeNum(row.sleep, 7), 0, 12),
     recoveryMinutes: clamp(safeNum(row.recovery, 45), 0, 240),
     fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), 0, 10),
@@ -4211,8 +4173,7 @@ function Baselines({
       setBaselineFetchFailed(false);
       if (showSuccess) setSuccessMessage(showSuccess);
     } catch (error) {
-      const storedBaselines = readBaselinesFromStorage();
-      const fallbackRows = orderBaselinesForDisplay(storedBaselines !== null ? storedBaselines : getLocalDefaultBaselines());
+      const fallbackRows = orderBaselinesForDisplay(getLocalDefaultBaselines());
       const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
       const fallback = fallbackRows.map((row) => baselineToDraftRow(row, rosterIdSet));
       const warning = 'Failed to load baselines from backend. Using local defaults.';
