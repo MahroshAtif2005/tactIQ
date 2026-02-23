@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { 
   Activity, 
   Users, 
@@ -51,6 +51,7 @@ import {
   resetBaselines,
   saveBaselines,
 } from './lib/apiClient';
+import { getRosterIds, ROSTER_STORAGE_KEY, setRosterIds } from './lib/rosterStorage';
 import { Baseline, BaselineRole } from './types/baseline';
 import {
   clamp,
@@ -612,6 +613,7 @@ const normalizeBaselineRecord = (baseline: Partial<Baseline>): Baseline => ({
   name: String(baseline.name || baseline.id || baseline.playerId || 'Unknown Player').trim() || 'Unknown Player',
   role: baseline.role,
   isActive: baseline.isActive ?? baseline.active ?? true,
+  inRoster: Boolean((baseline as Baseline).inRoster),
   sleepHoursToday: clamp(safeNum(baseline.sleepHoursToday ?? baseline.sleep, 7), 0, 12),
   recoveryMinutes: clamp(safeNum(baseline.recoveryMinutes ?? baseline.recovery, 45), 0, 240),
   fatigueLimit: clamp(safeNum(baseline.fatigueLimit, 6), 0, 10),
@@ -646,148 +648,32 @@ const orderBaselinesForDisplay = (rows: Baseline[]): Baseline[] => {
   return sortByOrderIndex(normalized);
 };
 
-const LOCAL_BASELINE_DEFAULTS: Array<Partial<Baseline>> = [
-  {
-    id: 'J. Archer',
-    playerId: 'J. Archer',
-    name: 'J. Archer',
-    role: 'FAST',
-    isActive: true,
-    sleepHoursToday: 7.5,
-    recoveryMinutes: 45,
-    fatigueLimit: 6,
-    controlBaseline: 80,
-    speed: 9,
-    power: 0,
-  },
-  {
-    id: 'R. Khan',
-    playerId: 'R. Khan',
-    name: 'R. Khan',
-    role: 'SPIN',
-    isActive: true,
-    sleepHoursToday: 7.1,
-    recoveryMinutes: 40,
-    fatigueLimit: 6,
-    controlBaseline: 86,
-    speed: 8,
-    power: 0,
-  },
-  {
-    id: 'B. Stokes',
-    playerId: 'B. Stokes',
-    name: 'B. Stokes',
-    role: 'AR',
-    isActive: true,
-    sleepHoursToday: 7.3,
-    recoveryMinutes: 55,
-    fatigueLimit: 6,
-    controlBaseline: 75,
-    speed: 8,
-    power: 7,
-  },
-  {
-    id: 'M. Starc',
-    playerId: 'M. Starc',
-    name: 'M. Starc',
-    role: 'FAST',
-    isActive: true,
-    sleepHoursToday: 6.8,
-    recoveryMinutes: 50,
-    fatigueLimit: 6,
-    controlBaseline: 79,
-    speed: 9,
-    power: 0,
-  },
-];
-
-const getLocalDefaultBaselines = (): Baseline[] =>
-  LOCAL_BASELINE_DEFAULTS.map((row) => normalizeBaselineRecord(row));
-
 const MAX_ROSTER = 11;
-const BASELINES_STORAGE_KEY = 'tactiq.baselines';
 const BASELINES_CHANGED_EVENT = 'tactiq-baselines-changed';
-const MATCH_ROSTER_IDS_STORAGE_KEY = 'tactiq_matchRosterIds';
 
-const serializeBaselinesForStorage = (rows: Baseline[]): string =>
-  JSON.stringify(rows.map((row) => normalizeBaselineRecord(row)));
-
-const readBaselinesFromStorage = (): Baseline[] | null => {
-  if (typeof window === 'undefined') return null;
-  const raw = window.localStorage.getItem(BASELINES_STORAGE_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    return parsed.map((entry) => normalizeBaselineRecord(entry));
-  } catch {
-    return null;
-  }
-};
-
-const writeBaselinesToStorage = (rows: Baseline[]): void => {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(BASELINES_STORAGE_KEY, serializeBaselinesForStorage(rows));
-    window.dispatchEvent(new Event(BASELINES_CHANGED_EVENT));
-  } catch {
-    // Ignore storage write failures in restricted browser modes.
-  }
-};
-
-const readMatchRosterIdsFromStorage = (): string[] | null => {
-  if (typeof window === 'undefined') return null;
-  const raw = window.localStorage.getItem(MATCH_ROSTER_IDS_STORAGE_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    return parsed
-      .map((entry) => normalizeBaselineId(String(entry || '')))
-      .filter((entry, index, list) => entry.length > 0 && list.indexOf(entry) === index);
-  } catch {
-    return null;
-  }
-};
-
-const writeMatchRosterIdsToStorage = (ids: string[]): void => {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(MATCH_ROSTER_IDS_STORAGE_KEY, JSON.stringify(ids));
-  } catch {
-    // Ignore storage write failures in restricted browser modes.
-  }
-};
-
-const getEligibleRosterBaselineIds = (rows: Baseline[]): string[] =>
-  orderBaselinesForDisplay(rows)
-    .map((row) => normalizeBaselineRecord(row))
-    .filter((row) => row.active === true || row.isActive === true)
-    .map((row) => normalizeBaselineId(row.id || row.playerId || row.name))
-    .filter((id, index, list) => id.length > 0 && list.indexOf(id) === index);
-
-const resolveMatchRosterIds = (
-  baselines: Baseline[],
-  storedIds: string[] | null
-): string[] => {
-  const orderedIds = getEligibleRosterBaselineIds(baselines);
-  if (storedIds === null || storedIds.length === 0) {
-    return orderedIds.slice(0, MAX_ROSTER);
-  }
-
-  const availableKeys = new Set(orderedIds.map((id) => baselineKey(id)));
-  const next: string[] = [];
-  const seen = new Set<string>();
-
-  storedIds.forEach((id) => {
-    const normalized = normalizeBaselineId(id);
-    const key = baselineKey(normalized);
-    if (!key || seen.has(key) || !availableKeys.has(key)) return;
-    next.push(normalized);
-    seen.add(key);
+const resolveRosterIdsFromBaselines = (candidateIds: string[], baselines: Baseline[]): string[] => {
+  const ordered = orderBaselinesForDisplay(baselines)
+    .map((row) => normalizeBaselineRecord(row));
+  const activeIdByKey = new Map<string, string>();
+  ordered.forEach((row) => {
+    const canonicalId = normalizeBaselineId(row.id || row.playerId || row.name);
+    const key = baselineKey(canonicalId);
+    if (!key || activeIdByKey.has(key)) return;
+    activeIdByKey.set(key, canonicalId);
   });
 
-  return next.slice(0, MAX_ROSTER);
+  const seen = new Set<string>();
+  const resolved: string[] = [];
+  candidateIds.forEach((id) => {
+    const key = baselineKey(id);
+    if (!key || seen.has(key)) return;
+    const canonicalId = activeIdByKey.get(key);
+    if (!canonicalId) return;
+    seen.add(key);
+    resolved.push(canonicalId);
+  });
+
+  return resolved.slice(0, MAX_ROSTER);
 };
 
 const baselineFromPlayer = (player: Player): Baseline =>
@@ -798,6 +684,7 @@ const baselineFromPlayer = (player: Player): Baseline =>
     role: playerRoleToBaselineRole(player.role),
     isActive: player.isActive !== false,
     active: player.isActive !== false,
+    inRoster: player.inRoster !== false,
     sleepHoursToday: safeNum(player.sleepHours, 7),
     sleep: safeNum(player.sleepHours, 7),
     recoveryMinutes: safeNum(player.recoveryTime, 45),
@@ -813,7 +700,7 @@ const baselineFromPlayer = (player: Player): Baseline =>
 const buildRosterPlayersFromBaselines = (
   currentPlayers: Player[],
   baselines: Baseline[],
-  matchRosterIds: string[]
+  rosterIds: string[]
 ): Player[] => {
   const byName = new Map<string, Player>();
   const byId = new Map<string, Player>();
@@ -822,21 +709,21 @@ const buildRosterPlayersFromBaselines = (
     byId.set(player.id, player);
   });
 
-  const baselineById = new Map<string, Baseline>();
+  const baselineByKey = new Map<string, Baseline>();
   orderBaselinesForDisplay(baselines)
     .map((baseline) => normalizeBaselineRecord(baseline))
     .forEach((baseline) => {
-      if (baseline.active !== true && baseline.isActive !== true) return;
       const id = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
-      if (!id) return;
-      baselineById.set(baselineKey(id), baseline);
+      const key = baselineKey(id);
+      if (!key || baselineByKey.has(key)) return;
+      baselineByKey.set(key, baseline);
     });
 
-  // Roster is derived strictly from local match roster IDs.
-  return matchRosterIds
-    .map((id) => baselineById.get(baselineKey(id)))
-    .filter((baseline): baseline is Baseline => Boolean(baseline))
-    .map((baseline) => {
+  const resolvedRosterIds = resolveRosterIdsFromBaselines(rosterIds, baselines);
+  return resolvedRosterIds
+    .map((id) => {
+      const baseline = baselineByKey.get(baselineKey(id));
+      if (!baseline) return null;
       const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
       const existing = byId.get(baselineId) || byName.get(baselineKey(baseline.name));
 
@@ -887,7 +774,8 @@ const buildRosterPlayersFromBaselines = (
         power: baseline.power,
         recoveryOffset: 0,
       } satisfies Player;
-    });
+    })
+    .filter((row): row is Player => Boolean(row));
 };
 
 const formatMMSS = (s: number): string => {
@@ -1003,8 +891,13 @@ export default function App() {
   const [manualRecovery, setManualRecovery] = useState<RecoveryLevel>('Moderate');
   const [baselineSource, setBaselineSource] = useState<'cosmos' | 'fallback'>('fallback');
   const [baselineWarning, setBaselineWarning] = useState<string | null>(null);
-  const [workingBaselines, setWorkingBaselines] = useState<Baseline[]>(getLocalDefaultBaselines());
-  const [matchRosterIds, setMatchRosterIds] = useState<string[]>([]);
+  const [rosterMutationError, setRosterMutationError] = useState<string | null>(null);
+  const [workingBaselines, setWorkingBaselines] = useState<Baseline[]>([]);
+  const [matchRosterIds, setMatchRosterIds] = useState<string[]>(() => getRosterIds());
+  const [isLoadingRosterPlayers, setIsLoadingRosterPlayers] = useState(true);
+  const rosterLoadRequestIdRef = useRef(0);
+  const rosterInitializedRef = useRef(false);
+  const matchRosterIdsRef = useRef<string[]>([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
@@ -1012,78 +905,98 @@ export default function App() {
   const previousActivePlayerIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    let rosterIdsRef = readMatchRosterIdsFromStorage();
+    matchRosterIdsRef.current = matchRosterIds;
+  }, [matchRosterIds]);
 
-    const applyBaselinesToRoster = (rows: Baseline[]) => {
+  useEffect(() => {
+    const applyBaselinesToRoster = (rows: Baseline[], reason: 'mount' | 'event') => {
       const orderedRows = orderBaselinesForDisplay(rows);
-      setWorkingBaselines(orderedRows);
-      const resolvedIds = resolveMatchRosterIds(orderedRows, rosterIdsRef);
-      rosterIdsRef = resolvedIds;
+      const previousRosterIds = matchRosterIdsRef.current;
+      const baseRosterIds = rosterInitializedRef.current
+        ? previousRosterIds
+        : getRosterIds();
+      const resolvedIds = resolveRosterIdsFromBaselines(baseRosterIds, orderedRows);
+      const rosterIdSet = new Set(resolvedIds.map((id) => baselineKey(id)));
+      const syncedBaselines = orderedRows.map((row) => {
+        const normalized = normalizeBaselineRecord(row);
+        const normalizedId = normalizeBaselineId(normalized.id || normalized.playerId || normalized.name);
+        return normalizeBaselineRecord({
+          ...normalized,
+          inRoster: rosterIdSet.has(baselineKey(normalizedId)),
+        });
+      });
+
+      rosterInitializedRef.current = true;
       setMatchRosterIds(resolvedIds);
-      writeMatchRosterIdsToStorage(resolvedIds);
+      setWorkingBaselines(syncedBaselines);
       setPlayers((prev) => {
-        const derivedRoster = buildRosterPlayersFromBaselines(prev, orderedRows, resolvedIds);
+        const derivedRoster = buildRosterPlayersFromBaselines(prev, syncedBaselines, resolvedIds);
         setActivePlayerId((currentId) => {
           if (derivedRoster.some((player) => player.id === currentId)) return currentId;
           return derivedRoster[0]?.id ?? '';
         });
         return derivedRoster;
       });
+      if (import.meta.env.DEV) {
+        console.log('[roster-sync] applyBaselinesToRoster', {
+          reason,
+          baselineCount: syncedBaselines.length,
+          rosterBefore: previousRosterIds.length,
+          rosterAfter: resolvedIds.length,
+        });
+      }
     };
 
-    const loadFromStorage = (warning?: string) => {
-      const stored = readBaselinesFromStorage();
-      const rows = orderBaselinesForDisplay(stored !== null ? stored : getLocalDefaultBaselines());
-      if (!stored) writeBaselinesToStorage(rows);
-      setBaselineSource('fallback');
-      setBaselineWarning(warning || null);
-      applyBaselinesToRoster(rows);
-    };
-
-    const loadFromBackend = async () => {
+    const loadFromBackend = async (reason: 'mount' | 'event') => {
+      const requestId = rosterLoadRequestIdRef.current + 1;
+      rosterLoadRequestIdRef.current = requestId;
+      setIsLoadingRosterPlayers(true);
+      if (import.meta.env.DEV) {
+        console.log('[roster-sync] fetch start', { requestId, reason });
+      }
       try {
         const response = await getBaselinesWithMeta();
+        if (requestId !== rosterLoadRequestIdRef.current) {
+          if (import.meta.env.DEV) {
+            console.log('[roster-sync] stale response ignored', { requestId });
+          }
+          return;
+        }
         const rows = orderBaselinesForDisplay(response.baselines);
+        if (import.meta.env.DEV) {
+          console.log('[roster-sync] fetch success', {
+            requestId,
+            reason,
+            source: response.source,
+            baselineCount: rows.length,
+          });
+        }
         setBaselineSource(response.source);
         setBaselineWarning(
           response.warning || (response.source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null)
         );
-        writeBaselinesToStorage(rows);
-        applyBaselinesToRoster(rows);
+        applyBaselinesToRoster(rows, reason);
       } catch (error) {
+        if (requestId !== rosterLoadRequestIdRef.current) return;
         if (import.meta.env.DEV) {
-          console.warn('[baselines] backend load failed; using local fallback', error);
+          console.warn('[roster-sync] fetch failed', { requestId, error });
         }
-        loadFromStorage('Failed to load baselines from backend. Using local defaults.');
-      }
-    };
-
-    const handleStorage = (event: StorageEvent) => {
-      if (event.key && event.key !== BASELINES_STORAGE_KEY && event.key !== MATCH_ROSTER_IDS_STORAGE_KEY) {
-        return;
-      }
-
-      if (event.key === MATCH_ROSTER_IDS_STORAGE_KEY) {
-        rosterIdsRef = readMatchRosterIdsFromStorage();
-        const storedBaselines = readBaselinesFromStorage();
-        if (storedBaselines) {
-          applyBaselinesToRoster(storedBaselines);
+        setBaselineSource('fallback');
+        setBaselineWarning('Failed to load baseline players from backend.');
+      } finally {
+        if (requestId === rosterLoadRequestIdRef.current) {
+          setIsLoadingRosterPlayers(false);
         }
-        return;
       }
-
-      loadFromStorage();
     };
 
     const handleLocalEvent = () => {
-      loadFromStorage();
+      void loadFromBackend('event');
     };
 
-    loadFromBackend();
-    window.addEventListener('storage', handleStorage);
+    void loadFromBackend('mount');
     window.addEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
     return () => {
-      window.removeEventListener('storage', handleStorage);
       window.removeEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
     };
   }, []);
@@ -1354,48 +1267,116 @@ export default function App() {
     }
   };
 
-  const applyMatchRosterIds = (nextIdsInput: string[]) => {
-    const orderedBaselines = orderBaselinesForDisplay(
-      workingBaselines.length > 0 ? workingBaselines : (readBaselinesFromStorage() ?? getLocalDefaultBaselines())
-    );
-    const resolvedIds = resolveMatchRosterIds(orderedBaselines, nextIdsInput);
+  const applyRosterIdsToState = useCallback((nextIdsInput: string[], reason: string): string[] => {
+    const idSet = new Set(nextIdsInput.map((id) => baselineKey(id)));
+    const orderedBaselines = orderBaselinesForDisplay(workingBaselines);
+    const nextBaselines = orderedBaselines.map((baseline) => {
+      const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+      return normalizeBaselineRecord({
+        ...baseline,
+        inRoster: idSet.has(baselineKey(baselineId)),
+      });
+    });
+    const previousIds = matchRosterIdsRef.current;
+    const resolvedIds = resolveRosterIdsFromBaselines(nextIdsInput, nextBaselines);
+    rosterInitializedRef.current = true;
+    setWorkingBaselines(nextBaselines);
     setMatchRosterIds(resolvedIds);
-    writeMatchRosterIdsToStorage(resolvedIds);
     setPlayers((prevPlayers) => {
-      const derivedRoster = buildRosterPlayersFromBaselines(prevPlayers, orderedBaselines, resolvedIds);
+      const derivedRoster = buildRosterPlayersFromBaselines(prevPlayers, nextBaselines, resolvedIds);
       setActivePlayerId((currentId) => {
         if (derivedRoster.some((player) => player.id === currentId)) return currentId;
         return derivedRoster[0]?.id ?? '';
       });
       return derivedRoster;
     });
-  };
+    if (import.meta.env.DEV) {
+      console.log('[roster-sync] applyMatchRosterIds', {
+        reason,
+        rosterBefore: previousIds.length,
+        rosterAfter: resolvedIds.length,
+      });
+      console.log('[DASHBOARD ROSTER BUILD]', { reason, ids: resolvedIds });
+    }
+    setRosterMutationError(null);
+    return resolvedIds;
+  }, [workingBaselines]);
+
+  const applyMatchRosterIds = useCallback((nextIdsInput: string[]): string[] => {
+    const resolvedIds = applyRosterIdsToState(nextIdsInput, 'explicit_user_action');
+    setRosterIds(resolvedIds);
+    return resolvedIds;
+  }, [applyRosterIdsToState]);
 
   const deleteRosterPlayer = (rosterPlayerId: string) => {
     const normalizedId = normalizeBaselineId(rosterPlayerId);
-    if (!normalizedId) return;
+    if (!normalizedId) {
+      setRosterMutationError('Cannot remove player: missing baseline id.');
+      return;
+    }
     const normalizedKey = baselineKey(normalizedId);
+    if (!normalizedKey) {
+      setRosterMutationError('Cannot remove player: invalid baseline id.');
+      return;
+    }
 
-    // Keep baseline + roster in sync locally: removing from roster marks baseline inactive for this session.
-    const nextBaselines = orderBaselinesForDisplay(
-      workingBaselines.length > 0 ? workingBaselines : (readBaselinesFromStorage() ?? getLocalDefaultBaselines())
-    ).map((baseline) => {
-      const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
-      if (baselineKey(baselineId) !== normalizedKey) return baseline;
-      return normalizeBaselineRecord({
-        ...baseline,
-        isActive: false,
-        active: false,
-        updatedAt: new Date().toISOString(),
+    const previousActiveId = activePlayerId;
+    const removedWasSelected = baselineKey(previousActiveId) === baselineKey(normalizedId);
+    const previousRosterIds = matchRosterIdsRef.current;
+    if (import.meta.env.DEV) {
+      console.log('[roster-delete] click', {
+        id: normalizedId,
+        rosterBefore: previousRosterIds.length,
       });
+    }
+    const removedRosterIndex = previousRosterIds.findIndex((id) => baselineKey(id) === normalizedKey);
+    const nextIds = previousRosterIds.filter((id) => baselineKey(id) !== normalizedKey);
+    const nextResolvedIds = applyMatchRosterIds(nextIds);
+    if (import.meta.env.DEV) {
+      console.log('[roster-delete] optimistic applied', {
+        id: normalizedId,
+        rosterAfter: nextResolvedIds.length,
+      });
+    }
+    setActivePlayerId((currentId) => {
+      if (!removedWasSelected) return currentId;
+      if (nextResolvedIds.length === 0) return '';
+      const replacementIndex =
+        removedRosterIndex >= 0 && removedRosterIndex < nextResolvedIds.length
+          ? removedRosterIndex
+          : nextResolvedIds.length - 1;
+      return nextResolvedIds[replacementIndex] ?? '';
     });
-    setWorkingBaselines(nextBaselines);
-    writeBaselinesToStorage(nextBaselines);
-
-    const currentIds = matchRosterIds.length > 0 ? matchRosterIds : (readMatchRosterIdsFromStorage() || []);
-    const nextIds = currentIds.filter((id) => baselineKey(id) !== normalizedKey);
-    applyMatchRosterIds(nextIds);
+    setRosterMutationError(null);
   };
+
+  useEffect(() => {
+    const syncRosterFromLocalStorage = () => {
+      const storedIds = getRosterIds();
+      const currentIds = matchRosterIdsRef.current;
+      const currentKeys = currentIds.map((id) => baselineKey(id));
+      const storedKeys = storedIds.map((id) => baselineKey(id));
+      if (
+        currentKeys.length === storedKeys.length &&
+        currentKeys.every((key, index) => key === storedKeys[index])
+      ) {
+        return;
+      }
+      applyMatchRosterIds(storedIds);
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key && event.key !== ROSTER_STORAGE_KEY) return;
+      syncRosterFromLocalStorage();
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('focus', syncRosterFromLocalStorage);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('focus', syncRosterFromLocalStorage);
+    };
+  }, [applyMatchRosterIds]);
 
   const handleAddOver = () => {
     if (!activePlayer) return;
@@ -1851,15 +1832,17 @@ export default function App() {
     warning?: string,
     options?: { persist?: boolean; addToRosterIds?: string[] }
   ) => {
-    const shouldPersist = options?.persist !== false;
     const orderedBaselines = orderBaselinesForDisplay(baselines);
-    const storedRosterIds = readMatchRosterIdsFromStorage();
-    const currentRosterIds = matchRosterIds.length > 0 || storedRosterIds === null
-      ? matchRosterIds
-      : storedRosterIds;
-    const normalizedRosterIds = resolveMatchRosterIds(orderedBaselines, currentRosterIds);
-    const baselineIdSet = new Set(getEligibleRosterBaselineIds(orderedBaselines).map((id) => baselineKey(id)));
-    const seen = new Set(normalizedRosterIds.map((id) => baselineKey(id)));
+    const previousRosterIds = matchRosterIdsRef.current;
+    const baselineIdSet = new Set(
+      orderedBaselines
+        .map((row) => normalizeBaselineRecord(row))
+        .map((row) => baselineKey(row.id || row.playerId || row.name))
+    );
+    const baseRosterIds = rosterInitializedRef.current
+      ? previousRosterIds
+      : getRosterIds();
+    const seen = new Set(baseRosterIds.map((id) => baselineKey(id)));
     const additions = (options?.addToRosterIds || [])
       .map((id) => normalizeBaselineId(id))
       .filter((id) => {
@@ -1870,23 +1853,39 @@ export default function App() {
         seen.add(key);
         return true;
       });
-    const resolvedRosterIds = [...normalizedRosterIds, ...additions].slice(0, MAX_ROSTER);
-    setWorkingBaselines(orderedBaselines);
+    const resolvedRosterIds = resolveRosterIdsFromBaselines([...baseRosterIds, ...additions], orderedBaselines);
+    const rosterKeySet = new Set(resolvedRosterIds.map((id) => baselineKey(id)));
+    const syncedBaselines = orderedBaselines.map((row) => {
+      const normalized = normalizeBaselineRecord(row);
+      return normalizeBaselineRecord({
+        ...normalized,
+        inRoster:
+          rosterKeySet.has(baselineKey(normalized.id || normalized.playerId || normalized.name)),
+      });
+    });
+    rosterInitializedRef.current = true;
+    setWorkingBaselines(syncedBaselines);
     setBaselineSource(source);
     setBaselineWarning(warning || (source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null));
     setMatchRosterIds(resolvedRosterIds);
-    writeMatchRosterIdsToStorage(resolvedRosterIds);
-    if (shouldPersist) {
-      writeBaselinesToStorage(orderedBaselines);
+    if ((options?.addToRosterIds || []).length > 0) {
+      setRosterIds(resolvedRosterIds);
     }
-    // IMPORTANT: Roster is derived from local match roster IDs only.
     setPlayers((prev) => {
-      const derivedRoster = buildRosterPlayersFromBaselines(prev, orderedBaselines, resolvedRosterIds);
-      if (!derivedRoster.some((player) => player.id === activePlayerId) && derivedRoster.length > 0) {
-        setTimeout(() => setActivePlayerId(derivedRoster[0].id), 0);
-      }
+      const derivedRoster = buildRosterPlayersFromBaselines(prev, syncedBaselines, resolvedRosterIds);
+      setActivePlayerId((currentId) => {
+        if (derivedRoster.some((player) => player.id === currentId)) return currentId;
+        return derivedRoster[0]?.id ?? '';
+      });
       return derivedRoster;
     });
+    if (import.meta.env.DEV) {
+      console.log('[roster-sync] handleBaselinesSynced', {
+        reason: 'baselines_page_sync',
+        rosterBefore: previousRosterIds.length,
+        rosterAfter: resolvedRosterIds.length,
+      });
+    }
   };
 
   return (
@@ -2086,6 +2085,8 @@ export default function App() {
               setRecoveryMode={setRecoveryMode}
               manualRecovery={manualRecovery}
               setManualRecovery={setManualRecovery}
+              isLoadingRosterPlayers={isLoadingRosterPlayers}
+              rosterMutationError={rosterMutationError}
               onGoToBaselines={() => navigateTo('baselines')}
               onBack={() => navigateTo('setup')}
             />
@@ -2520,6 +2521,8 @@ interface DashboardProps {
   setRecoveryMode: React.Dispatch<React.SetStateAction<RecoveryMode>>;
   manualRecovery: RecoveryLevel;
   setManualRecovery: React.Dispatch<React.SetStateAction<RecoveryLevel>>;
+  isLoadingRosterPlayers: boolean;
+  rosterMutationError: string | null;
   onGoToBaselines: () => void;
   onBack: () => void;
 }
@@ -2527,7 +2530,7 @@ interface DashboardProps {
 function Dashboard({
   matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, deleteRosterPlayer, movePlayerToSub,
   agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleNewSpell, handleRest, handleMarkUnfit,
-  recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, onGoToBaselines, onBack
+  recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, isLoadingRosterPlayers, rosterMutationError, onGoToBaselines, onBack
 }: DashboardProps) {
   const [arTelemetryView, setArTelemetryView] = useState<'batting' | 'bowling'>('batting');
   const [strainIndex, setStrainIndex] = useState(0);
@@ -2558,6 +2561,7 @@ function Dashboard({
   const rosterPlayers = players.filter((p: Player) => p.inRoster !== false);
   const totalCount = rosterPlayers.length;
   const hasRosterPlayers = rosterPlayers.length > 0;
+  const isRosterEmpty = rosterPlayers.length === 0;
   const isRosterFull = totalCount >= MAX_ROSTER;
 
   const handleResetBaselines = async () => {
@@ -2565,8 +2569,7 @@ function Dashboard({
     setIsResettingBaselines(true);
     try {
       await resetBaselines();
-      const response = await getBaselinesWithMeta();
-      writeBaselinesToStorage(response.baselines);
+      window.dispatchEvent(new Event(BASELINES_CHANGED_EVENT));
     } catch (error) {
       setRosterEmptyError(error instanceof Error ? error.message : 'Failed to reset baselines.');
     } finally {
@@ -2955,7 +2958,7 @@ function Dashboard({
       <div data-testid="dashboard-grid" className="h-full min-h-0 grid lg:grid-cols-12 gap-6 mt-0 items-stretch">
         
         {/* LEFT: ROSTER (EDITABLE) */}
-        <div className="lg:col-span-3 flex flex-col gap-4 min-h-0 h-full">
+        <div className="lg:col-span-3 h-full flex flex-col gap-4 min-h-0">
           <div className="bg-[#0F172A] border border-white/5 rounded-2xl h-full min-h-0 flex-1 flex flex-col overflow-hidden">
             <div className="px-5 py-6 border-b border-white/5 bg-slate-900/50 flex items-center justify-between">
                <h3 className="text-sm dashboard-panel-title-tall font-bold text-slate-400 flex items-center gap-2">
@@ -2969,6 +2972,11 @@ function Dashboard({
             </div>
             
             <div className="px-4 py-5 space-y-3 flex-1 min-h-0 overflow-y-auto">
+              {rosterMutationError && (
+                <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-200">
+                  {rosterMutationError}
+                </div>
+              )}
               {hasRosterPlayers ? rosterPlayers.map((player: Player) => {
                 const isSelected = activePlayer?.id === player.id;
                 return (
@@ -2995,59 +3003,58 @@ function Dashboard({
                         </div>
                         <div className="text-[10px] dashboard-roster-role-tall uppercase font-bold text-slate-500 truncate">{player.role}</div>
                       </div>
-                      {/* Only show Chevron if not hovering (to avoid clash with delete) or just keep it simple */}
-                      {isSelected && <ChevronRight className="w-5 h-5 text-emerald-500 ml-auto shrink-0 group-hover:hidden" />}
                     </button>
                     
                     {/* Delete Button (Hover) */}
                     <button 
-                      onClick={(e) => { e.stopPropagation(); removeFromRoster(player.baselineId || player.id); }}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg bg-rose-500/20 text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-rose-500 hover:text-white"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeFromRoster(player.id);
+                      }}
+                      disabled={!player.id}
+                      className="absolute right-2 top-1/2 z-20 -translate-y-1/2 p-2 rounded-lg bg-rose-500/20 text-rose-400 opacity-70 group-hover:opacity-100 transition-all hover:bg-rose-500 hover:text-white cursor-pointer shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
+                      aria-label={`Remove ${player.name} from roster`}
                     >
                       <Trash2 className="w-5 h-5" />
                     </button>
                   </div>
                 );
-              }) : (
-                <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-center">
-                  <p className="text-sm font-semibold text-slate-200">No players yet</p>
-                  <p className="mt-1 text-xs text-slate-400">
-                    Add your first player profile from the Add Player button below.
-                  </p>
-                  <div className="mt-4 flex flex-col gap-2">
-                    <button
-                      onClick={handleResetBaselines}
-                      disabled={isResettingBaselines}
-                      className="w-full rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs font-bold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-60 disabled:cursor-not-allowed"
-                    >
-                      {isResettingBaselines ? 'Resetting...' : 'Reset Baselines'}
-                    </button>
+              }) : isLoadingRosterPlayers ? (
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-center flex-1 flex items-center justify-center">
+                  <div className="flex flex-col items-center justify-center">
+                    <p className="text-sm font-semibold text-slate-200/80">Loading players...</p>
+                    <p className="mt-1 text-xs text-slate-400/70">
+                      Fetching baseline players from the API.
+                    </p>
                   </div>
-                  {rosterEmptyError && <p className="mt-3 text-[11px] text-rose-300">{rosterEmptyError}</p>}
                 </div>
+              ) : (
+                <div className="flex-1" />
               )}
 
-              <div className="mt-2 pt-2 border-t border-white/5">
-                <button
-                  onClick={onGoToBaselines}
-                  disabled={isRosterFull}
-                  title={isRosterFull ? `Roster is full (${MAX_ROSTER}/${MAX_ROSTER}).` : 'Open baselines to add a player.'}
-                  className="w-full py-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-all text-sm font-medium disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {isRosterFull ? `Roster Full (${MAX_ROSTER}/${MAX_ROSTER})` : 'Add Player'}
-                </button>
-                {isRosterFull && (
-                  <p className="mb-2 text-[11px] text-amber-300 text-center">
-                    Roster full. Deactivate a player in Baselines before adding another.
-                  </p>
-                )}
-              </div>
+              {!isRosterEmpty && (
+                <div className="mt-2 pt-2 border-t border-white/5">
+                  <button
+                    onClick={onGoToBaselines}
+                    disabled={isRosterFull}
+                    title={isRosterFull ? `Roster is full (${MAX_ROSTER}/${MAX_ROSTER}).` : 'Open baselines to add a player.'}
+                    className="w-full py-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-all text-sm font-medium disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {isRosterFull ? `Roster Full (${MAX_ROSTER}/${MAX_ROSTER})` : 'Add Player'}
+                  </button>
+                  {isRosterFull && (
+                    <p className="mb-2 text-[11px] text-amber-300 text-center">
+                      Roster full. Deactivate a player in Baselines before adding another.
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
 
         {/* CENTER: METRICS */}
-        <div className="lg:col-span-6 flex flex-col gap-4 min-h-0 h-full">
+        <div className="lg:col-span-6 h-full flex flex-col gap-4 min-h-0">
           <div className={`bg-[#0F172A] border rounded-2xl h-full min-h-0 flex-1 px-6 py-6 dashboard-center-panel-y relative flex flex-col overflow-hidden transition-all duration-500 ${
             (activePlayer && (activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical'))
               ? 'border-rose-500/50 shadow-[0_0_30px_rgba(225,29,72,0.15)]' 
@@ -3522,16 +3529,28 @@ function Dashboard({
                   </motion.div>
                 )}
               </AnimatePresence>
+              ) : isRosterEmpty ? (
+                <div className="h-full w-full min-h-[420px] flex items-center justify-center">
+                  <button
+                    onClick={onGoToBaselines}
+                    className="relative group inline-flex items-center justify-center px-10 py-4 rounded-2xl text-base font-semibold tracking-wide text-white bg-[#0E1625] border border-emerald-400/40 ring-1 ring-emerald-300/35 shadow-[0_18px_70px_rgba(0,0,0,0.6)] backdrop-blur neon-breathe transition hover:scale-[1.02] hover:ring-emerald-200/60 hover:border-white/20 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-emerald-300/70"
+                  >
+                    <span className="pointer-events-none absolute -inset-2 rounded-3xl bg-emerald-400/20 blur-2xl opacity-80 animate-pulse" />
+                    <span className="pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-emerald-300/50 shadow-[0_0_25px_rgba(16,185,129,0.6)]" />
+                    <span className="pointer-events-none absolute inset-0 rounded-2xl opacity-0 group-hover:opacity-100 transition overflow-hidden">
+                      <span className="absolute -left-1/2 top-0 h-full w-[200%] bg-gradient-to-r from-transparent via-white/10 to-transparent translate-x-[-40%] group-hover:translate-x-[40%] transition duration-700" />
+                    </span>
+                    <span className="relative z-10">+ Add a Player</span>
+                  </button>
+                </div>
               ) : (
-                 <div className="flex flex-1 min-h-0 flex-col items-center justify-center text-center text-slate-500">
-                   <Users className="w-14 h-14 mb-4 opacity-50" />
-                   <p className="text-slate-300 font-medium">
-                     {hasRosterPlayers ? 'Select a player from the roster to view telemetry.' : 'No players yet'}
-                   </p>
-                   <p className="mt-2 text-xs text-slate-500">
-                     {hasRosterPlayers ? 'Telemetry controls are disabled until a player is selected.' : 'Add a player or reset baselines to enable telemetry controls.'}
-                   </p>
-                 </div>
+                <div className="flex-1 flex items-center justify-center text-center px-6">
+                  <div>
+                    <Users className="w-12 h-12 mx-auto mb-3 opacity-50 text-slate-500" />
+                    <p className="text-slate-200/80 font-medium">Select a player from the roster to view telemetry.</p>
+                    <p className="mt-2 text-xs text-slate-400/70">Telemetry controls are disabled until a player is selected.</p>
+                  </div>
+                </div>
               )}
             </div>
 
@@ -3539,7 +3558,7 @@ function Dashboard({
         </div>
 
         {/* RIGHT: COACH AGENT */}
-        <div className="lg:col-span-3 flex flex-col gap-4 min-h-0 h-full">
+        <div className="lg:col-span-3 h-full flex flex-col gap-4 min-h-0">
           <div
             data-testid="coach-panel"
             className="h-full min-h-0 flex-1 flex flex-col rounded-2xl border border-white/5 bg-[#0F172A] overflow-hidden relative"
@@ -3859,12 +3878,16 @@ function Dashboard({
                 </>
               ) : (
                 <div className="flex-1 min-h-0 flex flex-col items-center justify-center text-center">
-                  <p className="text-sm text-slate-300 font-medium">
-                    {hasRosterPlayers ? 'Select a player to analyze' : 'No players available'}
-                  </p>
-                  <p className="mt-2 text-xs text-slate-500">
-                    {hasRosterPlayers ? 'Run Coach Agent will be enabled after player selection.' : 'Add players or reset baselines to run coach analysis.'}
-                  </p>
+                  {!isRosterEmpty && (
+                    <p className="text-sm text-slate-300 font-medium">
+                      Select a player to analyze
+                    </p>
+                  )}
+                  {!isRosterEmpty && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Run Coach Agent will be enabled after player selection.
+                    </p>
+                  )}
                   <button
                     type="button"
                     disabled
@@ -4110,32 +4133,6 @@ function Baselines({
     );
   };
 
-  const draftRosterIds = React.useMemo(() => {
-    const seen = new Set<string>();
-    return draftBaselines
-      .filter((row) => row.inRoster === true && row.active === true)
-      .map((row) => normalizeBaselineId(row.id || row.name))
-      .filter((id) => {
-        const key = baselineKey(id);
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, MAX_ROSTER);
-  }, [draftBaselines]);
-
-  useEffect(() => {
-    const currentKeys = matchRosterIds.map((id) => baselineKey(id));
-    const nextKeys = draftRosterIds.map((id) => baselineKey(id));
-    if (currentKeys.length === nextKeys.length && currentKeys.every((key, index) => key === nextKeys[index])) {
-      return;
-    }
-    if (import.meta.env.DEV) {
-      console.log('[baselines] roster re-derived', { current: matchRosterIds, next: draftRosterIds });
-    }
-    onMatchRosterIdsChange(draftRosterIds);
-  }, [draftRosterIds, matchRosterIds, onMatchRosterIdsChange]);
-
   const showRosterToast = (message: string) => {
     if (rosterToastTimerRef.current) {
       clearTimeout(rosterToastTimerRef.current);
@@ -4159,30 +4156,34 @@ function Baselines({
       setErrorMessage('Enter player name before adding to roster.');
       return;
     }
-    if (checked && row.active !== true) {
-      setErrorMessage('Only globally active players can be added to the current roster.');
+    const currentCount = matchRosterIds.length;
+    const alreadyInRoster = matchRosterIds.some((id) => baselineKey(id) === baselineKey(resolvedId));
+    if (checked && !alreadyInRoster && currentCount >= MAX_ROSTER) {
+      setErrorMessage(`Roster is full (${MAX_ROSTER}/${MAX_ROSTER}).`);
       return;
     }
 
-    setDraftBaselines((prev) => {
-      const currentRow = prev.find((entry) => entry._localId === row._localId);
-      const wasInRoster = Boolean(currentRow?.inRoster);
-      const currentCount = prev.filter((entry) => entry.inRoster === true && entry.active === true).length;
-      if (checked && !wasInRoster && currentCount >= MAX_ROSTER) {
-        setErrorMessage(`Roster is full (${MAX_ROSTER}/${MAX_ROSTER}).`);
-        return prev;
-      }
-      const nextRows = prev.map((entry) =>
+    const nextRosterIds = checked
+      ? [...matchRosterIds, resolvedId]
+      : matchRosterIds.filter((id) => baselineKey(id) !== baselineKey(resolvedId));
+    onMatchRosterIdsChange(nextRosterIds);
+
+    setDraftBaselines((prev) =>
+      prev.map((entry) =>
         entry._localId === row._localId ? { ...entry, inRoster: checked } : entry
-      );
-      if (import.meta.env.DEV) {
-        console.log('[baselines] roster checkbox toggled', {
-          id: resolvedId,
-          checked,
-        });
-      }
-      return nextRows;
-    });
+      )
+    );
+    setSavedBaselines((prev) =>
+      prev.map((entry) =>
+        entry._localId === row._localId ? { ...entry, inRoster: checked } : entry
+      )
+    );
+    if (import.meta.env.DEV) {
+      console.log('[ACTIVATE BASELINE]', {
+        id: resolvedId,
+        inRoster: checked,
+      });
+    }
     setSuccessMessage(null);
   };
 
@@ -4193,7 +4194,7 @@ function Baselines({
     try {
       const response = await getBaselinesWithMeta();
       const sourceRows = orderBaselinesForDisplay(response.baselines);
-      const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
+      const rosterIdSet = new Set((matchRosterIds.length > 0 ? matchRosterIds : getRosterIds()).map((id) => baselineKey(id)));
       const normalized = sourceRows.map((row) => baselineToDraftRow(row, rosterIdSet));
       setSavedBaselines(normalized);
       setDraftBaselines(normalized.map((row) => ({ ...row })));
@@ -4211,21 +4212,9 @@ function Baselines({
       setBaselineFetchFailed(false);
       if (showSuccess) setSuccessMessage(showSuccess);
     } catch (error) {
-      const storedBaselines = readBaselinesFromStorage();
-      const fallbackRows = orderBaselinesForDisplay(storedBaselines !== null ? storedBaselines : getLocalDefaultBaselines());
-      const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
-      const fallback = fallbackRows.map((row) => baselineToDraftRow(row, rosterIdSet));
-      const warning = 'Failed to load baselines from backend. Using local defaults.';
-      setSavedBaselines(fallback);
-      setDraftBaselines(fallback.map((row) => ({ ...row })));
-      if (import.meta.env.DEV) {
-        console.log('[baselines] draft reloaded from fallback', {
-          count: fallback.length,
-        });
-      }
+      const warning = 'Failed to load baselines from backend.';
       setRuntimeSource('fallback');
       setRuntimeWarning(warning);
-      onBaselinesSynced(draftRowsToBaselines(fallback), 'fallback', warning);
       setBaselineFetchFailed(true);
       setErrorMessage(error instanceof Error ? error.message : 'Failed to load baselines.');
     } finally {
@@ -4237,6 +4226,19 @@ function Baselines({
     loadBaselines();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
+    const syncRow = (row: BaselineDraftRow): BaselineDraftRow => {
+      const resolvedId = normalizeBaselineId(row.id || row.name);
+      return {
+        ...row,
+        inRoster: Boolean(rosterIdSet.has(baselineKey(resolvedId))),
+      };
+    };
+    setDraftBaselines((prev) => prev.map(syncRow));
+    setSavedBaselines((prev) => prev.map(syncRow));
+  }, [matchRosterIds]);
 
   useEffect(() => {
     const handlePointerDownOutside = (event: MouseEvent | TouchEvent) => {
@@ -4275,13 +4277,12 @@ function Baselines({
         const nextName = updates.name !== undefined ? String(updates.name) : row.name;
         const trimmedName = nextName.trim();
         const derivedDraftId = row._isDraft ? (trimmedName.length > 0 ? trimmedName : '') : row.id;
-        const nextInRoster = updates.active === false ? false : row.inRoster;
         return {
           ...row,
           ...updates,
           name: nextName,
           id: derivedDraftId,
-          inRoster: nextInRoster,
+          inRoster: updates.inRoster !== undefined ? Boolean(updates.inRoster) : row.inRoster,
         };
       });
         syncDraftToRoster(nextRows);
@@ -4335,7 +4336,7 @@ function Baselines({
         return;
       }
       const newlyAddedIds = draftBaselines
-        .filter((row) => row._isDraft && row.active === true)
+        .filter((row) => row._isDraft && row.inRoster === true)
         .map((row) => normalizeBaselineId(row.id || row.name))
         .filter((id) => id.length > 0);
       const payload = draftBaselines
@@ -4383,6 +4384,8 @@ function Baselines({
         syncDraftToRoster(nextRows);
         return nextRows;
       });
+      const nextRosterIds = matchRosterIds.filter((id) => baselineKey(id) !== baselineKey(row.id || row.name));
+      onMatchRosterIdsChange(nextRosterIds);
       return;
     }
 
@@ -4395,6 +4398,8 @@ function Baselines({
 
     try {
       await deleteBaseline(row.id);
+      const nextRosterIds = matchRosterIds.filter((id) => baselineKey(id) !== baselineKey(row.id || ''));
+      onMatchRosterIdsChange(nextRosterIds);
       onBaselinesSynced(draftRowsToBaselines(optimisticSaved), runtimeSource, runtimeWarning || undefined);
       setSuccessMessage(`Deleted baseline for ${playerName}.`);
     } catch (error) {
@@ -4408,19 +4413,10 @@ function Baselines({
     if (!window.confirm('This will delete ALL baseline players. Continue?')) return;
     setErrorMessage(null);
     setSuccessMessage(null);
-    const previousSaved = savedBaselines;
-    const previousDraft = draftBaselines;
     try {
       await resetBaselines();
-      setSavedBaselines([]);
-      setDraftBaselines([]);
-      onBaselinesSynced([], 'cosmos');
-      setRuntimeSource('cosmos');
-      setRuntimeWarning(null);
-      setSuccessMessage('All baseline players were deleted.');
+      await loadBaselines('Baseline database reset complete.');
     } catch (error) {
-      setSavedBaselines(previousSaved);
-      setDraftBaselines(previousDraft);
       setErrorMessage(error instanceof Error ? error.message : 'Failed to reset database.');
     }
   };
@@ -4527,7 +4523,7 @@ function Baselines({
             <GlowingBackButton onClick={onBack} />
           </div>
           <h2 className="text-3xl font-bold text-white">Player Baseline Models</h2>
-          <p className="text-slate-400 mt-1">Changes stay local until Save Changes is clicked. Cosmos DB is the baseline source-of-truth.</p>
+          <p className="text-slate-400 mt-1">Roster selection is session-based (local to this device). Baseline metrics are saved to Cosmos DB when you click Save Changes.</p>
         </div>
         <div className="flex gap-4">
           <button
@@ -4556,8 +4552,17 @@ function Baselines({
         </div>
       )}
       {errorMessage && (
-        <div className="mb-4 rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-rose-200 text-sm">
-          {errorMessage}
+        <div className="mb-4 rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-rose-200 text-sm flex items-center justify-between gap-3">
+          <span>{errorMessage}</span>
+          <button
+            type="button"
+            onClick={() => {
+              void loadBaselines();
+            }}
+            className="rounded-md border border-rose-300/40 px-3 py-1 text-xs font-semibold text-rose-100 hover:bg-rose-500/20"
+          >
+            Retry
+          </button>
         </div>
       )}
       {successMessage && (
@@ -4651,7 +4656,6 @@ function Baselines({
                  </tr>
 	               ) : (
                  draftBaselines.map((p) => {
-                  const isGloballyActive = p.active === true;
                   const isActive = p.inRoster === true;
                   const isPersisted = !p._isDraft;
                   const trimmedName = p.name.trim();
@@ -4699,8 +4703,7 @@ function Baselines({
                        type="checkbox"
                        checked={isActive}
                        onChange={(e) => handleRosterToggle(p, e.target.checked)}
-                       disabled={!isGloballyActive && !isActive}
-                       title={!isGloballyActive ? 'Globally inactive players cannot be added to roster.' : 'Toggle roster membership for this match.'}
+                       title="Toggle roster membership for this match."
                        className="w-4 h-4 accent-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed"
                      />
                    </td>

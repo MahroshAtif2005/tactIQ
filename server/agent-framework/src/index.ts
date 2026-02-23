@@ -59,7 +59,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') {
     res.status(204).end();
@@ -188,8 +188,11 @@ apiRouter.get('/baselines', async (_req, res) => {
     const container = await getCosmosContainerOrNull();
     if (!container) {
       fallbackBaselines = loadFallbackBaselines();
+      const players = fallbackBaselines
+        .map((row) => toPublicBaseline(row))
+        .filter((row) => row.active === true);
       res.status(200).json({
-        players: fallbackBaselines.map((row) => toPublicBaseline(row)),
+        players,
         source: 'fallback',
         warning: getFallbackWarning(),
       });
@@ -197,7 +200,8 @@ apiRouter.get('/baselines', async (_req, res) => {
     }
 
     const querySpec = {
-      query: 'SELECT * FROM c WHERE c.type = @type ORDER BY c.name',
+      query:
+        'SELECT * FROM c WHERE c.type = @type AND (c.active = true OR NOT IS_DEFINED(c.active)) ORDER BY c.name',
       parameters: [{ name: '@type', value: 'playerBaseline' }],
     };
     const { resources } = await container.items.query(querySpec).fetchAll();
@@ -206,6 +210,36 @@ apiRouter.get('/baselines', async (_req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     res.status(500).json({ error: 'Failed to load baselines', details: message });
+  }
+});
+
+apiRouter.get('/roster', async (_req, res) => {
+  try {
+    const container = await getCosmosContainerOrNull();
+    if (!container) {
+      fallbackBaselines = loadFallbackBaselines();
+      const players = fallbackBaselines
+        .map((row) => toPublicBaseline(row))
+        .filter((row) => row.active === true && row.inRoster === true);
+      res.status(200).json({
+        players,
+        source: 'fallback',
+        warning: getFallbackWarning(),
+      });
+      return;
+    }
+
+    const querySpec = {
+      query:
+        'SELECT * FROM c WHERE c.type = @type AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true) ORDER BY c.name',
+      parameters: [{ name: '@type', value: 'playerBaseline' }],
+    };
+    const { resources } = await container.items.query(querySpec).fetchAll();
+    const players = (Array.isArray(resources) ? resources : []).map((row) => toPublicBaseline(row));
+    res.status(200).json({ players, source: 'cosmos' });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({ error: 'Failed to load roster', details: message });
   }
 });
 
@@ -305,6 +339,97 @@ apiRouter.delete('/baselines/:id', async (req, res) => {
   }
 });
 
+apiRouter.patch('/baselines/:id', async (req, res) => {
+  try {
+    const idRaw = String(req.params.id || '');
+    const id = decodeURIComponent(idRaw).trim();
+    if (!id) {
+      res.status(400).json({ error: 'Baseline id is required' });
+      return;
+    }
+
+    const body = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+    const hasActive = Object.prototype.hasOwnProperty.call(body, 'active');
+    const hasInRoster =
+      Object.prototype.hasOwnProperty.call(body, 'inRoster') ||
+      Object.prototype.hasOwnProperty.call(body, 'roster');
+    if (!hasActive && !hasInRoster) {
+      res.status(400).json({ error: 'Body must include active and/or inRoster' });
+      return;
+    }
+    if (hasActive && typeof body.active !== 'boolean') {
+      res.status(400).json({ error: 'active must be boolean' });
+      return;
+    }
+    const inRosterValue = Object.prototype.hasOwnProperty.call(body, 'inRoster') ? body.inRoster : body.roster;
+    if (hasInRoster && typeof inRosterValue !== 'boolean') {
+      res.status(400).json({ error: 'inRoster must be boolean' });
+      return;
+    }
+
+    const container = await getCosmosContainerOrNull();
+    if (!container) {
+      const lowered = id.toLowerCase();
+      const target = fallbackBaselines.find((row) => row.id.toLowerCase() === lowered);
+      if (!target) {
+        res.status(404).json({ error: 'Baseline not found', source: 'fallback' });
+        return;
+      }
+      const patched = normalizeBaselineDoc({
+        ...target,
+        ...(hasActive ? { active: body.active } : {}),
+        ...(hasInRoster ? { inRoster: inRosterValue } : {}),
+        updatedAt: typeof body.updatedAt === 'string' ? body.updatedAt : new Date().toISOString(),
+      });
+      fallbackBaselines = dedupeBaselinesById(
+        fallbackBaselines.map((row) => (row.id.toLowerCase() === lowered ? patched : row))
+      );
+      persistFallbackBaselines(fallbackBaselines);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[agent-framework] PATCH /api/baselines/:id', { id, status: 200, source: 'fallback' });
+      }
+      res.status(200).json({ ok: true, player: toPublicBaseline(patched), source: 'fallback' });
+      return;
+    }
+
+    let existing: Record<string, unknown> | null = null;
+    try {
+      const { resource } = await container.item(id, id).read();
+      existing = resource ? (resource as Record<string, unknown>) : null;
+    } catch (error: unknown) {
+      const maybeCode =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? Number((error as { code?: number | string }).code)
+          : Number.NaN;
+      if (maybeCode === 404) {
+        res.status(404).json({ error: 'Baseline not found' });
+        return;
+      }
+      throw error;
+    }
+
+    if (!existing) {
+      res.status(404).json({ error: 'Baseline not found' });
+      return;
+    }
+
+    const patchedDoc = normalizeBaselineDoc({
+      ...existing,
+      ...(hasActive ? { active: body.active } : {}),
+      ...(hasInRoster ? { inRoster: inRosterValue } : {}),
+      updatedAt: typeof body.updatedAt === 'string' ? body.updatedAt : new Date().toISOString(),
+    });
+    await container.items.upsert(patchedDoc, { partitionKey: patchedDoc.id });
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[agent-framework] PATCH /api/baselines/:id', { id, status: 200, source: 'cosmos' });
+    }
+    res.status(200).json({ ok: true, player: toPublicBaseline(patchedDoc), source: 'cosmos' });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({ error: 'Failed to patch baseline', details: message });
+  }
+});
+
 apiRouter.post('/baselines/reset', async (_req, res) => {
   try {
     const container = await getCosmosContainerOrNull();
@@ -371,7 +496,7 @@ app.use('/api', (_req, res) => {
 
 app.listen(port, () => {
   console.log(`[agent-framework] listening on http://localhost:${port}`);
-  console.log('[agent-framework] mounted routes: GET /api/baselines, POST /api/baselines, PUT /api/baselines, DELETE /api/baselines/:id, POST /api/baselines/reset');
+  console.log('[agent-framework] mounted routes: GET /api/baselines, GET /api/roster, POST /api/baselines, PUT /api/baselines, PATCH /api/baselines/:id, DELETE /api/baselines/:id, POST /api/baselines/reset');
   console.log(`[agent-framework] forwarding agent calls to ${existingApiBaseUrl}`);
   if (!cosmosDiagnostics.configured || !cosmosDiagnostics.sdkAvailable) {
     console.warn(`[agent-framework] Cosmos baseline routes running in fallback mode (${getFallbackWarning()}).`);

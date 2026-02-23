@@ -12,6 +12,7 @@ export interface PlayerBaselineDoc {
   speed: number;
   power: number;
   active: boolean;
+  inRoster: boolean;
   updatedAt: string;
 }
 
@@ -170,6 +171,7 @@ export const normalizeBaselineDoc = (raw: unknown): PlayerBaselineDoc => {
     speed: clamp(toNumber(row.speed, 7), 0, 100),
     power: clamp(toNumber(row.power, 6), 0, 100),
     active: toBool(row.active, true),
+    inRoster: toBool(row.inRoster ?? row.roster, false),
     updatedAt: new Date().toISOString(),
   };
 };
@@ -186,5 +188,6 @@ export const toPublicBaseline = (row: Partial<PlayerBaselineDoc>): PlayerBaselin
   speed: clamp(toNumber(row.speed, 7), 0, 100),
   power: clamp(toNumber(row.power, 6), 0, 100),
   active: toBool(row.active, true),
+  inRoster: toBool((row as Record<string, unknown>).inRoster ?? (row as Record<string, unknown>).roster, false),
   updatedAt: typeof row.updatedAt === 'string' && row.updatedAt.trim().length > 0 ? row.updatedAt : new Date().toISOString(),
 });
