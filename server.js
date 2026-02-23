@@ -6,10 +6,10 @@ const { execSync } = require("child_process");
 const dotenv = require("dotenv");
 require("dotenv").config({ path: "server/agent-framework/.env" });
 const {
-  buildDefaultBaselines,
   deleteBaseline,
   getAllBaselines,
   getBaseline,
+  getBaselineCount,
   getContainer,
   getRosterBaselines,
   getCosmosDiagnostics,
@@ -70,6 +70,7 @@ console.log("Cosmos env loaded:", {
 const cosmosDiagnostics = getCosmosDiagnostics();
 console.log("[env] cosmos", {
   configured: cosmosDiagnostics.configured,
+  account: cosmosDiagnostics.account || null,
   database: cosmosDiagnostics.databaseId,
   container: cosmosDiagnostics.containerId,
   sdkAvailable: cosmosDiagnostics.sdkAvailable,
@@ -77,15 +78,15 @@ console.log("[env] cosmos", {
 getContainer()
   .then((container) => {
     if (container) {
-      const { databaseId, containerId } = getCosmosDiagnostics();
-      console.log(`Cosmos connected: db=${databaseId} container=${containerId}`);
+      const { account, databaseId, containerId } = getCosmosDiagnostics();
+      console.log(`Cosmos connected: account=${account || "unknown"} db=${databaseId} container=${containerId}`);
       console.log("[cosmos] container ready.");
     } else {
-      console.warn("[cosmos] not configured or unavailable. Using fallback baselines.");
+      console.warn("[cosmos] not configured or unavailable.");
     }
   })
   .catch((error) => {
-    console.warn("[cosmos] init failed. Using fallback baselines.", error instanceof Error ? error.message : String(error));
+    console.warn("[cosmos] init failed.", error instanceof Error ? error.message : String(error));
   });
 
 let adapter = null;
@@ -248,15 +249,28 @@ const sanitizeRiskRequest = (payload = {}) => {
   };
 };
 
-const resolveBaselineSource = async () => {
+const isCosmosUnavailableError = (error) =>
+  Boolean(error) &&
+  typeof error === "object" &&
+  ("code" in error && error.code === "COSMOS_NOT_CONFIGURED");
+
+const ensureCosmosBaselinesReady = async () => {
   if (!isCosmosConfigured()) {
-    return { source: "fallback", warning: "Cosmos not configured; using local defaults." };
+    return {
+      ok: false,
+      status: 503,
+      body: { error: "Cosmos not configured for baselines." },
+    };
   }
   const container = await getContainer();
   if (!container) {
-    return { source: "fallback", warning: "Cosmos unavailable; using local defaults." };
+    return {
+      ok: false,
+      status: 503,
+      body: { error: "Cosmos unavailable for baselines." },
+    };
   }
-  return { source: "cosmos", warning: null };
+  return { ok: true, container };
 };
 
 const normalizeBaselinesForSave = (body) => {
@@ -358,13 +372,28 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/health", (_req, res) => {
+app.get("/api/health", async (_req, res) => {
   const aoai = backend?.getAoaiConfig ? backend.getAoaiConfig() : { ok: false, missing: ["api-dist-not-loaded"] };
+  const diagnostics = getCosmosDiagnostics();
+  let cosmosConnected = false;
+  let count = 0;
+  try {
+    count = await getBaselineCount();
+    cosmosConnected = true;
+  } catch {
+    cosmosConnected = false;
+    count = 0;
+  }
   res.json({
     ok: true,
     status: "ok",
     service: "tactiq-express",
     timestamp: new Date().toISOString(),
+    cosmosConnected,
+    account: diagnostics.account || null,
+    database: diagnostics.databaseId,
+    container: diagnostics.containerId,
+    count,
     routes: [
       "/api/health",
       "/api/baselines",
@@ -392,36 +421,64 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/baselines", async (_req, res) => {
   try {
-    const baselineSource = await resolveBaselineSource();
+    const readiness = await ensureCosmosBaselinesReady();
+    if (!readiness.ok) {
+      return res.status(readiness.status).json(readiness.body);
+    }
     const players = await getAllBaselines();
+    const diagnostics = getCosmosDiagnostics();
+    console.log("[baselines] GET", {
+      account: diagnostics.account || null,
+      database: diagnostics.databaseId,
+      container: diagnostics.containerId,
+      count: players.length,
+    });
     return res.status(200).json({
       players,
-      source: baselineSource.source,
-      ...(baselineSource.warning ? { warning: baselineSource.warning } : {}),
+      source: "cosmos",
     });
   } catch (error) {
     console.error("Baselines GET error", error);
+    if (isCosmosUnavailableError(error)) {
+      return res.status(503).json({ error: "Cosmos unavailable for baselines." });
+    }
     return res.status(500).json({ error: "Failed to load baselines." });
   }
 });
 
 app.get("/api/roster", async (_req, res) => {
   try {
-    const baselineSource = await resolveBaselineSource();
+    const readiness = await ensureCosmosBaselinesReady();
+    if (!readiness.ok) {
+      return res.status(readiness.status).json(readiness.body);
+    }
     const players = await getRosterBaselines();
+    const diagnostics = getCosmosDiagnostics();
+    console.log("[roster] GET", {
+      account: diagnostics.account || null,
+      database: diagnostics.databaseId,
+      container: diagnostics.containerId,
+      count: players.length,
+    });
     return res.status(200).json({
       players,
-      source: baselineSource.source,
-      ...(baselineSource.warning ? { warning: baselineSource.warning } : {}),
+      source: "cosmos",
     });
   } catch (error) {
     console.error("Roster GET error", error);
+    if (isCosmosUnavailableError(error)) {
+      return res.status(503).json({ error: "Cosmos unavailable for roster." });
+    }
     return res.status(500).json({ error: "Failed to load roster." });
   }
 });
 
 app.get("/api/baselines/:id", async (req, res) => {
   try {
+    const readiness = await ensureCosmosBaselinesReady();
+    if (!readiness.ok) {
+      return res.status(readiness.status).json(readiness.body);
+    }
     const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
     if (!id) {
       return res.status(400).json({ error: "id is required." });
@@ -433,12 +490,19 @@ app.get("/api/baselines/:id", async (req, res) => {
     return res.status(200).json(baseline);
   } catch (error) {
     console.error("Baseline by id GET error", error);
+    if (isCosmosUnavailableError(error)) {
+      return res.status(503).json({ error: "Cosmos unavailable for baselines." });
+    }
     return res.status(500).json({ error: "Failed to load baseline." });
   }
 });
 
 const saveBaselinesHandler = async (req, res) => {
   try {
+    const readiness = await ensureCosmosBaselinesReady();
+    if (!readiness.ok) {
+      return res.status(readiness.status).json(readiness.body);
+    }
     const normalized = normalizeBaselinesForSave(req.body);
     if (!normalized.ok) {
       return res.status(400).json({
@@ -452,6 +516,9 @@ const saveBaselinesHandler = async (req, res) => {
     return res.status(200).json({ ok: true, players });
   } catch (error) {
     console.error("Baselines PUT error", error);
+    if (isCosmosUnavailableError(error)) {
+      return res.status(503).json({ error: "Cosmos unavailable for baselines." });
+    }
     if (error && typeof error === "object" && "code" in error && error.code === "VALIDATION_ERROR") {
       return res.status(400).json({
         error: "Invalid baselines payload.",
@@ -467,6 +534,10 @@ app.put("/api/baselines", saveBaselinesHandler);
 
 app.patch("/api/baselines/:id", async (req, res) => {
   try {
+    const readiness = await ensureCosmosBaselinesReady();
+    if (!readiness.ok) {
+      return res.status(readiness.status).json(readiness.body);
+    }
     const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
     if (!id) {
       return res.status(400).json({ error: "id is required." });
@@ -502,6 +573,9 @@ app.patch("/api/baselines/:id", async (req, res) => {
     return res.status(200).json({ ok: true, player: updated });
   } catch (error) {
     console.error("Baselines PATCH error", error);
+    if (isCosmosUnavailableError(error)) {
+      return res.status(503).json({ error: "Cosmos unavailable for baselines." });
+    }
     if (error && typeof error === "object" && "code" in error && Number(error.code) === 404) {
       return res.status(404).json({ error: `Baseline ${req.params.id} not found.` });
     }
@@ -517,6 +591,10 @@ app.patch("/api/baselines/:id", async (req, res) => {
 
 app.delete("/api/baselines/:id", async (req, res) => {
   try {
+    const readiness = await ensureCosmosBaselinesReady();
+    if (!readiness.ok) {
+      return res.status(readiness.status).json(readiness.body);
+    }
     const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
     if (!id) {
       return res.status(400).json({ error: "id is required." });
@@ -526,6 +604,9 @@ app.delete("/api/baselines/:id", async (req, res) => {
     return res.status(200).json({ ok: true });
   } catch (error) {
     console.error("Baselines DELETE error", error);
+    if (isCosmosUnavailableError(error)) {
+      return res.status(503).json({ error: "Cosmos unavailable for baselines." });
+    }
     const code = error && typeof error === "object" && "code" in error ? Number(error.code) : undefined;
     if (code === 404) {
       return res.status(404).json({ error: `Baseline ${req.params.id} not found.` });
@@ -536,6 +617,10 @@ app.delete("/api/baselines/:id", async (req, res) => {
 
 app.post("/api/baselines/reset", async (_req, res) => {
   try {
+    const readiness = await ensureCosmosBaselinesReady();
+    if (!readiness.ok) {
+      return res.status(readiness.status).json(readiness.body);
+    }
     const result = await resetBaselines({ seed: true });
     return res.status(200).json({
       ok: true,
@@ -545,6 +630,9 @@ app.post("/api/baselines/reset", async (_req, res) => {
     });
   } catch (error) {
     console.error("Baselines reset error", error);
+    if (isCosmosUnavailableError(error)) {
+      return res.status(503).json({ error: "Cosmos unavailable for baselines." });
+    }
     return res.status(500).json({ error: "Failed to reset baselines." });
   }
 });
