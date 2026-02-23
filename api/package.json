@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p .",
     "start": "npm run build && func start",
-    "dev": "func start --typescript"
+    "dev": "func start --typescript",
+    "test:risk": "npm run build && node --test dist/shared/riskModel.test.js"
   },
   "dependencies": {
     "@azure/functions": "^4.5.0",

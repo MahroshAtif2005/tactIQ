@@ -7,16 +7,46 @@ const sanitizeRequest = (payload: Partial<RiskAgentRequest>): RiskAgentRequest =
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : fallback;
   };
+  const toRisk = (value: unknown): RiskAgentRequest['injuryRisk'] => {
+    const upper = String(value || '').toUpperCase();
+    if (upper === 'LOW' || upper === 'MED' || upper === 'MEDIUM' || upper === 'HIGH') return upper as RiskAgentRequest['injuryRisk'];
+    return 'UNKNOWN';
+  };
+
+  const oversBowled = toNum(payload.oversBowled, Number.NaN);
+  const format = String((payload as RiskAgentRequest).format || (payload as any).match?.format || 'T20');
+  const formatMaxOvers =
+    format.toUpperCase().includes('T20') ? 4 : format.toUpperCase().includes('ODI') ? 10 : 999;
+  const maxOversRaw = toNum((payload as RiskAgentRequest).maxOvers, formatMaxOvers);
+  const maxOvers = Number.isFinite(maxOversRaw) ? Math.max(1, Math.floor(maxOversRaw)) : formatMaxOvers;
+  const spellOversRaw = toNum(payload.consecutiveOvers, Number.NaN);
+  const normalizedOvers = Number.isFinite(oversBowled) ? Math.min(maxOvers, Math.max(0, oversBowled)) : Number.NaN;
+  const normalizedSpellOvers = Number.isFinite(spellOversRaw)
+    ? Math.max(0, spellOversRaw)
+    : Number.NaN;
+  const clampedSpellOvers = Number.isFinite(normalizedOvers) && Number.isFinite(normalizedSpellOvers)
+    ? Math.min(normalizedSpellOvers, normalizedOvers)
+    : normalizedSpellOvers;
+  const oversRemainingRaw = toNum((payload as RiskAgentRequest).oversRemaining, Number.NaN);
+  const oversRemaining = Number.isFinite(oversRemainingRaw)
+    ? Math.min(maxOvers, Math.max(0, oversRemainingRaw))
+    : Number.isFinite(normalizedOvers)
+      ? Math.max(0, maxOvers - normalizedOvers)
+      : Number.NaN;
 
   return {
     playerId: String(payload.playerId || 'UNKNOWN'),
-    fatigueIndex: Math.max(0, Math.min(10, toNum(payload.fatigueIndex, 0))),
-    injuryRisk: String(payload.injuryRisk || 'LOW').toUpperCase() as RiskAgentRequest['injuryRisk'],
-    noBallRisk: String(payload.noBallRisk || 'LOW').toUpperCase() as RiskAgentRequest['noBallRisk'],
-    oversBowled: Math.max(0, toNum(payload.oversBowled, 0)),
-    consecutiveOvers: Math.max(0, toNum(payload.consecutiveOvers, 0)),
+    fatigueIndex: Math.max(0, Math.min(10, toNum(payload.fatigueIndex, Number.NaN))),
+    injuryRisk: toRisk(payload.injuryRisk),
+    noBallRisk: toRisk(payload.noBallRisk),
+    oversBowled: normalizedOvers,
+    consecutiveOvers: clampedSpellOvers,
+    oversRemaining,
+    maxOvers,
+    quotaComplete: payload.quotaComplete === true,
     heartRateRecovery: payload.heartRateRecovery ? String(payload.heartRateRecovery) : undefined,
-    format: String((payload as RiskAgentRequest).format || (payload as any).match?.format || 'T20'),
+    isUnfit: payload.isUnfit === true,
+    format,
     phase: String((payload as RiskAgentRequest).phase || (payload as any).match?.phase || 'Middle'),
     intensity: String((payload as RiskAgentRequest).intensity || (payload as any).match?.intensity || 'Medium'),
     conditions: (payload as RiskAgentRequest).conditions

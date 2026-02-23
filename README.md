@@ -94,6 +94,36 @@ If port `7071` is busy, run with a different port:
 
 Frontend runs on `http://localhost:5173` and Azure Functions runs on `http://localhost:7071`.
 
+### Player Baselines (Cosmos DB, Express API)
+
+If you are using the Express backend (`node server.js`) for Player Baseline Models:
+
+1. Configure environment in repo root `.env`:
+   - `COSMOS_CONNECTION_STRING` (preferred) or `COSMOS_ENDPOINT` + `COSMOS_KEY`
+   - `COSMOS_DATABASE=tactiq-db`
+   - `COSMOS_CONTAINER_PLAYERS=players`
+2. Start backend API:
+   - `node server.js` (defaults to `http://localhost:8080`)
+3. Start frontend:
+   - `npm run dev`
+   - Set `VITE_API_BASE_URL=/api` in `.env` (recommended for Vite proxy in dev).
+4. Manual verification:
+   - Load baselines: `curl http://localhost:8080/api/baselines`
+   - Save baselines (bulk upsert):
+     - `curl -X POST http://localhost:8080/api/baselines -H \"Content-Type: application/json\" -d '{\"players\":[{\"id\":\"J. Archer\",\"role\":\"FAST\",\"sleep\":7.5,\"recovery\":45,\"fatigueLimit\":6,\"control\":80,\"speed\":9,\"power\":0,\"active\":true}]}'`
+   - Delete one baseline:
+     - `curl -X DELETE \"http://localhost:8080/api/baselines/J.%20Archer\"`
+   - Reset baselines to seed defaults:
+     - `curl -X POST http://localhost:8080/api/baselines/reset`
+
+### Baselines API quick checks
+
+Use these commands to confirm local DELETE/RESET routes are live:
+
+- `curl -X POST http://localhost:8080/api/baselines/reset`
+- `curl -X DELETE "http://localhost:8080/api/baselines/Ben%20Ten"`
+- `curl http://localhost:8080/api/baselines`
+
 ### Optional Agent Framework orchestration layer
 
 This repo now supports an opt-in Microsoft Bot Framework orchestration service that forwards to the existing tactIQ agent endpoints.

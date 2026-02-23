@@ -27,6 +27,13 @@ import { getAoaiConfig } from '../llm/modelRegistry';
 
 const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
 
+const maxOversByFormat = (format?: string): number => {
+  const normalized = String(format || '').trim().toUpperCase();
+  if (normalized === 'T20') return 4;
+  if (normalized === 'ODI') return 10;
+  return 999;
+};
+
 const severityToConfidence = (severity?: string): number => {
   const upper = String(severity || '').toUpperCase();
   if (upper === 'CRITICAL') return 0.52;
@@ -55,8 +62,13 @@ const toSummarySignals = (value: unknown): string[] | undefined => {
 
 function computeTriggers(input: OrchestrateRequest): TriggerScores {
   const fatigueIndex = clamp(Number(input.telemetry.fatigueIndex) || 0, 0, 10);
-  const consecutiveOvers = Math.max(0, Number(input.telemetry.consecutiveOvers) || 0);
-  const oversBowled = Math.max(0, Number(input.telemetry.oversBowled) || 0);
+  const maxOvers = Math.max(1, Number(input.telemetry.maxOvers) || maxOversByFormat(input.matchContext.format));
+  const oversBowled = clamp(Number(input.telemetry.oversBowled) || 0, 0, maxOvers);
+  const oversRemaining = Number.isFinite(Number(input.telemetry.oversRemaining))
+    ? clamp(Number(input.telemetry.oversRemaining), 0, maxOvers)
+    : Math.max(0, maxOvers - oversBowled);
+  const workloadRatio = maxOvers > 0 ? oversBowled / maxOvers : 0;
+  const quotaComplete = input.telemetry.quotaComplete === true || (maxOvers < 999 && oversBowled >= maxOvers);
   const recovery = String(input.telemetry.heartRateRecovery || 'Moderate').toLowerCase();
   const injuryRisk = String(input.telemetry.injuryRisk || 'MEDIUM').toUpperCase();
   const noBallRisk = String(input.telemetry.noBallRisk || 'MEDIUM').toUpperCase();
@@ -67,8 +79,8 @@ function computeTriggers(input: OrchestrateRequest): TriggerScores {
 
   const fatigueTrigger = clamp(
     fatigueIndex * 8 +
-      consecutiveOvers * 4 +
-      oversBowled * 1.2 +
+      workloadRatio * 18 +
+      (oversRemaining <= 1 ? 8 : 0) +
       (recovery === 'poor' ? 12 : recovery === 'moderate' ? 6 : 0),
     0,
     100
@@ -78,7 +90,7 @@ function computeTriggers(input: OrchestrateRequest): TriggerScores {
     (injuryRisk === 'HIGH' ? 40 : injuryRisk === 'MED' || injuryRisk === 'MEDIUM' ? 20 : 8) +
       (noBallRisk === 'HIGH' ? 25 : noBallRisk === 'MED' || noBallRisk === 'MEDIUM' ? 12 : 4) +
       fatigueIndex * 3 +
-      consecutiveOvers * 4,
+      workloadRatio * 12,
     0,
     100
   );
@@ -87,7 +99,8 @@ function computeTriggers(input: OrchestrateRequest): TriggerScores {
     rrGap * 12 +
       (phase === 'death' ? 25 : phase === 'powerplay' ? 10 : 8) +
       (wicketsInHand <= 3 ? 20 : wicketsInHand <= 5 ? 10 : 4) +
-      (intent === 'strategy' || intent === 'substitution' || intent === 'full' ? 18 : 0),
+      (intent === 'strategy' || intent === 'substitution' || intent === 'full' ? 18 : 0) +
+      (quotaComplete ? 30 : 0),
     0,
     100
   );
@@ -100,54 +113,77 @@ function computeTriggers(input: OrchestrateRequest): TriggerScores {
 }
 
 export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateRequest): RouterDecision {
+  const maxOvers = Math.max(1, Number(input.telemetry.maxOvers) || maxOversByFormat(input.matchContext.format));
+  const oversBowled = clamp(Number(input.telemetry.oversBowled) || 0, 0, maxOvers);
+  const oversRemaining = Number.isFinite(Number(input.telemetry.oversRemaining))
+    ? clamp(Number(input.telemetry.oversRemaining), 0, maxOvers)
+    : Math.max(0, maxOvers - oversBowled);
+  const workloadRatio = maxOvers > 0 ? oversBowled / maxOvers : 0;
+  const legacyConsecutiveOvers = Math.max(0, Number(input.telemetry.consecutiveOvers) || 0);
+  const quotaComplete = input.telemetry.quotaComplete === true || (maxOvers < 999 && oversBowled >= maxOvers);
+
   if (mode === 'full') {
     return {
       intent: 'full',
-      selectedAgents: ['fatigue', 'risk', 'tactical'],
-      reason: 'Full combined analysis requested; running all agents.',
-      signals: {
-        fatigueIndex: clamp(Number(input.telemetry.fatigueIndex) || 0, 0, 10),
-        injuryRisk: String(input.telemetry.injuryRisk || 'MEDIUM').toUpperCase(),
-        noBallRisk: String(input.telemetry.noBallRisk || 'MEDIUM').toUpperCase(),
-        heartRateRecovery: String(input.telemetry.heartRateRecovery || 'Moderate'),
-        oversBowled: Math.max(0, Number(input.telemetry.oversBowled) || 0),
-        consecutiveOvers: Math.max(0, Number(input.telemetry.consecutiveOvers) || 0),
+        selectedAgents: ['fatigue', 'risk', 'tactical'],
+        reason: 'Full combined analysis requested; running all agents.',
+        signals: {
+          fatigueIndex: clamp(Number(input.telemetry.fatigueIndex) || 0, 0, 10),
+          injuryRisk: String(input.telemetry.injuryRisk || 'UNKNOWN').toUpperCase(),
+          noBallRisk: String(input.telemetry.noBallRisk || 'UNKNOWN').toUpperCase(),
+          heartRateRecovery: String(input.telemetry.heartRateRecovery || 'Unknown'),
+        oversBowled,
+        consecutiveOvers: legacyConsecutiveOvers,
+        maxOvers,
+        quotaComplete,
         phase: String(input.matchContext.phase || 'middle'),
         wicketsInHand: Math.max(0, Number(input.matchContext.wicketsInHand) || 0),
-        oversRemaining: Math.max(0, Number(input.matchContext.oversRemaining) || 0),
+        oversRemaining,
         isUnfit: Boolean(input.telemetry.isUnfit),
       },
     };
   }
 
   const fatigueIndex = clamp(Number(input.telemetry.fatigueIndex) || 0, 0, 10);
-  const recovery = String(input.telemetry.heartRateRecovery || 'Moderate');
-  const injuryRisk = String(input.telemetry.injuryRisk || 'MEDIUM').toUpperCase();
-  const noBallRisk = String(input.telemetry.noBallRisk || 'MEDIUM').toUpperCase();
-  const oversBowled = Math.max(0, Number(input.telemetry.oversBowled) || 0);
-  const consecutiveOvers = Math.max(0, Number(input.telemetry.consecutiveOvers) || 0);
+  const injuryRisk = String(input.telemetry.injuryRisk || 'UNKNOWN').toUpperCase();
+  const noBallRisk = String(input.telemetry.noBallRisk || 'UNKNOWN').toUpperCase();
+  const consecutiveOvers = legacyConsecutiveOvers;
   const isUnfit = Boolean(input.telemetry.isUnfit);
+  const riskUnknown = injuryRisk === 'UNKNOWN' || noBallRisk === 'UNKNOWN';
+  const substitutionTrigger = injuryRisk === 'HIGH' || (noBallRisk === 'HIGH' && fatigueIndex >= 6);
 
   let intent: RouterDecision['intent'];
   let selectedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
   let reason: string;
 
-  if (isUnfit || injuryRisk === 'HIGH' || injuryRisk === 'CRITICAL' || fatigueIndex >= 7 || recovery.toLowerCase() === 'poor') {
+  if (quotaComplete && substitutionTrigger) {
     intent = 'substitution';
     selectedAgents = ['risk', 'tactical'];
-    reason = 'Safety-critical signals detected; prioritizing risk + tactical substitution guidance.';
-  } else if (fatigueIndex >= 4 || consecutiveOvers >= 2 || oversBowled >= 4) {
+    reason = 'Bowling quota completed and medical substitution trigger met; tactical + risk review required.';
+  } else if (quotaComplete) {
+    intent = 'substitution';
+    selectedAgents = ['tactical'];
+    reason = 'Bowling quota completed for current format; substitution is required by rule limit.';
+  } else if (substitutionTrigger) {
+    intent = 'substitution';
+    selectedAgents = ['risk', 'tactical'];
+    reason = 'Substitution trigger met: injury is HIGH or no-ball risk is HIGH with fatigue >= 6.';
+  } else if (riskUnknown) {
+    intent = 'risk_check';
+    selectedAgents = ['risk'];
+    reason = 'Risk telemetry is incomplete (UNKNOWN); substitution routing is skipped until risk is known.';
+  } else if (fatigueIndex >= 4 || workloadRatio >= 0.5 || oversRemaining <= 1) {
     intent = 'fatigue_check';
     selectedAgents = ['fatigue'];
-    reason = 'Workload trend indicates fatigue check is required.';
+    reason = 'Workload quota trend indicates fatigue check is required.';
   } else if (noBallRisk === 'HIGH') {
     intent = 'risk_check';
     selectedAgents = ['risk'];
-    reason = 'No-ball risk is elevated; routing to risk agent.';
+    reason = 'No-ball risk is high but fatigue is below substitution threshold; routing to risk agent.';
   } else {
-    intent = 'substitution';
+    intent = 'risk_check';
     selectedAgents = ['tactical'];
-    reason = 'No immediate red flags; tactical next-step recommendation only.';
+    reason = 'No substitution trigger met; tactical recommendation only.';
   }
 
   return {
@@ -158,12 +194,14 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
       fatigueIndex,
       injuryRisk,
       noBallRisk,
-      heartRateRecovery: recovery,
+      heartRateRecovery: String(input.telemetry.heartRateRecovery || 'Unknown'),
       oversBowled,
       consecutiveOvers,
+      maxOvers,
+      quotaComplete,
       phase: String(input.matchContext.phase || 'middle'),
       wicketsInHand: Math.max(0, Number(input.matchContext.wicketsInHand) || 0),
-      oversRemaining: Math.max(0, Number(input.matchContext.oversRemaining) || 0),
+      oversRemaining,
       isUnfit,
     },
   };
@@ -390,7 +428,29 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     }
   }
 
-  const combinedDecision = buildCombinedDecision({ fatigue, risk, tactical });
+  const maxOvers = Math.max(1, Number(input.telemetry.maxOvers) || maxOversByFormat(input.matchContext.format));
+  const oversBowled = clamp(Number(input.telemetry.oversBowled) || 0, 0, maxOvers);
+  const quotaComplete = input.telemetry.quotaComplete === true || (maxOvers < 999 && oversBowled >= maxOvers);
+  const riskSeverityUpper = String(risk?.severity || '').toUpperCase();
+  const medicalRiskCritical = riskSeverityUpper === 'HIGH' || riskSeverityUpper === 'CRITICAL';
+
+  const combinedDecision = quotaComplete && !medicalRiskCritical
+    ? {
+        immediateAction: `Substitute ${input.telemetry.playerName || 'current bowler'} now (overs quota complete).`,
+        substitutionAdvice: {
+          out: input.players.bowler || input.telemetry.playerName || 'Current bowler',
+          in: input.players.bench?.[0] || 'Available replacement',
+          reason: 'Rule limit reached: bowler has completed maximum overs for this format.',
+        },
+        suggestedAdjustments: [
+          `Quota reached: ${oversBowled}/${maxOvers} overs.`,
+          'Rotate to the next eligible bowler immediately.',
+          'Keep injury monitoring separate from quota-based substitution.',
+        ],
+        confidence: 0.9,
+        rationale: 'Rule-lock substitution: bowling quota completed for current match format.',
+      }
+    : buildCombinedDecision({ fatigue, risk, tactical });
   const finalDecision = combinedDecision;
   const usedFallbackAgents: Array<'fatigue' | 'risk' | 'tactical'> = [];
   if (fatigue?.status === 'fallback') usedFallbackAgents.push('fatigue');
@@ -463,6 +523,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     finalDecision,
     combinedDecision,
     finalRecommendation,
+    ...(risk?.riskDebug ? { riskDebug: risk.riskDebug } : {}),
     errors,
     routerIntent: routerDecisionWithExecution.intent,
     router: {

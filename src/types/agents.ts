@@ -16,6 +16,8 @@ export interface FatigueAgentResponse {
     noBallRisk: InjuryRisk;
     oversBowled: number;
     consecutiveOvers: number;
+    oversRemaining?: number;
+    maxOvers?: number;
     heartRateRecovery?: string;
   };
   suggestedTweaks?: {
@@ -41,6 +43,8 @@ export interface RiskAgentResponse {
     noBallRisk: InjuryRisk;
     oversBowled: number;
     consecutiveOvers: number;
+    oversRemaining?: number;
+    maxOvers?: number;
     heartRateRecovery?: string;
     format?: string;
     phase?: string;

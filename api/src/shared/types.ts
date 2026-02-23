@@ -1,4 +1,4 @@
-export type InjuryRisk = 'LOW' | 'MEDIUM' | 'HIGH' | 'MED';
+export type InjuryRisk = 'LOW' | 'MEDIUM' | 'HIGH' | 'MED' | 'UNKNOWN';
 export type Severity = 'LOW' | 'MED' | 'HIGH';
 
 export interface FatigueAgentRequest {
@@ -7,6 +7,9 @@ export interface FatigueAgentRequest {
   role: string;
   oversBowled: number;
   consecutiveOvers: number;
+  oversRemaining?: number;
+  maxOvers?: number;
+  quotaComplete?: boolean;
   fatigueIndex: number;
   injuryRisk: InjuryRisk;
   noBallRisk: InjuryRisk;
@@ -70,8 +73,8 @@ export interface FatigueAgentResponse {
   debug?: unknown;
 }
 
-export type RiskLevelInput = 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
-export type RiskSeverity = 'LOW' | 'MED' | 'HIGH' | 'CRITICAL';
+export type RiskLevelInput = 'LOW' | 'MED' | 'HIGH' | 'MEDIUM' | 'UNKNOWN';
+export type RiskSeverity = 'LOW' | 'MED' | 'HIGH' | 'CRITICAL' | 'UNKNOWN';
 
 export interface RiskAgentRequest {
   playerId: string;
@@ -80,7 +83,11 @@ export interface RiskAgentRequest {
   noBallRisk: RiskLevelInput;
   oversBowled: number;
   consecutiveOvers: number;
+  oversRemaining?: number;
+  maxOvers?: number;
+  quotaComplete?: boolean;
   heartRateRecovery?: string;
+  isUnfit?: boolean;
   format?: string;
   phase?: string;
   intensity?: string;
@@ -101,4 +108,13 @@ export interface RiskAgentResponse {
   recommendation: string;
   signals: string[];
   echo: RiskAgentRequest;
+  riskDebug?: {
+    fatigueIndex: number;
+    consecutiveOvers: number;
+    oversBowled: number;
+    workloadRatio: number;
+    heartRateRecovery: 'GOOD' | 'MODERATE' | 'POOR' | 'UNKNOWN';
+    computedInjuryScore: number;
+    computedNoBallScore: number;
+  };
 }

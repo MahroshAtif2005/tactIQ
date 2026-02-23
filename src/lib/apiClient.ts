@@ -1,4 +1,5 @@
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse } from '../types/agents';
+import { Baseline, PlayerBaseline } from '../types/baseline';
 
 export type ApiClientErrorKind = 'network' | 'timeout' | 'cors' | 'http' | 'parse';
 export type AgentFrameworkMode = 'route' | 'all';
@@ -6,43 +7,44 @@ export type AgentFrameworkMode = 'route' | 'all';
 const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '');
 const ensureLeadingSlash = (value: string): string => (value.startsWith('/') ? value : `/${value}`);
 
-const rawApiBaseUrl = String(import.meta.env.VITE_API_BASE_URL || '').trim();
-export const apiBaseUrl = rawApiBaseUrl ? trimTrailingSlashes(rawApiBaseUrl) : '';
-const rawAgentFrameworkBase = String(import.meta.env.VITE_AGENT_FRAMEWORK_BASE_URL || '').trim();
-const agentFrameworkBaseUrl = rawAgentFrameworkBase ? trimTrailingSlashes(rawAgentFrameworkBase) : '';
+const rawBaseUrl = String(import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? '/api' : '')).trim();
+export const BASE_URL = trimTrailingSlashes(rawBaseUrl);
+export const apiBaseUrl = BASE_URL;
 
 const resolveApiUrl = (path: string): string => {
   const normalizedPath = ensureLeadingSlash(path);
-  if (!apiBaseUrl) return normalizedPath;
+  if (!BASE_URL) return normalizedPath;
+
+  if (!/^https?:\/\//i.test(BASE_URL)) {
+    const relativeBase = ensureLeadingSlash(BASE_URL);
+    if (normalizedPath === relativeBase || normalizedPath.startsWith(`${relativeBase}/`)) {
+      return normalizedPath;
+    }
+    if (relativeBase === '/api' && normalizedPath.startsWith('/api/')) {
+      return normalizedPath;
+    }
+    return `${relativeBase}${normalizedPath}`;
+  }
 
   try {
-    return new URL(normalizedPath, apiBaseUrl).toString();
+    return new URL(normalizedPath, BASE_URL).toString();
   } catch {
-    return `${trimTrailingSlashes(apiBaseUrl)}${normalizedPath}`;
+    return `${BASE_URL}${normalizedPath}`;
   }
 };
-
-const resolveAgentFrameworkUrl = (path: string): string => {
-  const normalizedPath = ensureLeadingSlash(path);
-  if (!agentFrameworkBaseUrl) return normalizedPath;
-
-  try {
-    return new URL(normalizedPath, agentFrameworkBaseUrl).toString();
-  } catch {
-    return `${trimTrailingSlashes(agentFrameworkBaseUrl)}${normalizedPath}`;
-  }
-};
-
-export const apiHealthPath = '/api/health';
+export const apiHealthPath = '/health';
+export const apiLegacyHealthPath = '/api/health';
 export const apiOrchestratePath = '/api/orchestrate';
 export const apiMessagesPath = '/api/messages';
 export const apiHealthUrl = resolveApiUrl(apiHealthPath);
+export const apiLegacyHealthUrl = resolveApiUrl(apiLegacyHealthPath);
 export const apiOrchestrateUrl = resolveApiUrl(apiOrchestratePath);
-export const apiAgentFrameworkMessagesUrl = resolveAgentFrameworkUrl(apiMessagesPath);
+export const apiAgentFrameworkMessagesUrl = resolveApiUrl(apiMessagesPath);
 
 const fatigueEndpoint = resolveApiUrl('/api/agents/fatigue');
 const riskEndpoint = resolveApiUrl('/api/agents/risk');
 const orchestrateEndpoint = apiOrchestrateUrl;
+const baselinesEndpoint = resolveApiUrl('/api/baselines');
 
 interface ApiClientErrorOptions {
   message: string;
@@ -85,7 +87,7 @@ const looksLikeHtml = (text: string): boolean => {
 
 const isLikelyCorsBlocked = (message: string, url: string): boolean => {
   if (!/failed to fetch|networkerror|load failed|fetch failed/i.test(message)) return false;
-  if (!apiBaseUrl || typeof window === 'undefined') return false;
+  if (!BASE_URL || typeof window === 'undefined') return false;
 
   try {
     const requestOrigin = new URL(url, window.location.origin).origin;
@@ -225,6 +227,56 @@ async function postJson<TResponse>(
   return parseJsonResponse<TResponse>(text, url, status);
 }
 
+async function putJson<TResponse>(
+  url: string,
+  payload: unknown,
+  signal?: AbortSignal
+): Promise<TResponse> {
+  const { status, text } = await requestText(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  return parseJsonResponse<TResponse>(text, url, status);
+}
+
+async function deleteJson<TResponse>(
+  url: string,
+  signal?: AbortSignal
+): Promise<TResponse> {
+  const { status, text } = await requestText(url, {
+    method: 'DELETE',
+    signal,
+  });
+  return parseJsonResponse<TResponse>(text, url, status);
+}
+
+async function patchJson<TResponse>(
+  url: string,
+  payload: unknown,
+  signal?: AbortSignal
+): Promise<TResponse> {
+  const { status, text } = await requestText(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  return parseJsonResponse<TResponse>(text, url, status);
+}
+
+async function getJson<TResponse>(
+  url: string,
+  signal?: AbortSignal
+): Promise<TResponse> {
+  const { status, text } = await requestText(url, {
+    method: 'GET',
+    signal,
+  });
+  return parseJsonResponse<TResponse>(text, url, status);
+}
+
 function normalizeOrchestrateResponse(raw: unknown): OrchestrateResponse {
   if (
     raw &&
@@ -355,13 +407,165 @@ export async function postAgentFrameworkOrchestrate(
   return normalizeOrchestrateResponse(payloadFromBot);
 }
 
+export interface BaselinesResponse {
+  baselines: Baseline[];
+  source: 'cosmos' | 'fallback';
+  warning?: string;
+}
+
+const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
+const toNumberOr = (value: unknown, fallback: number): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+const normalizeOrderIndex = (value: unknown): number => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.floor(parsed));
+};
+
+const normalizeBaseline = (raw: unknown): Baseline | null => {
+  if (!raw || typeof raw !== 'object') return null;
+  const item = raw as Record<string, unknown>;
+  const id = String(item.id || item.playerId || '').trim();
+  const roleRaw = String(item.role || '').trim().toUpperCase();
+  if (!id) return null;
+  const role = roleRaw === 'FAST' || roleRaw === 'SPIN' || roleRaw === 'BAT' || roleRaw === 'AR' ? roleRaw : 'FAST';
+
+  const sleepHoursToday = Number(item.sleep ?? item.sleepHoursToday);
+  const recoveryMinutes = Number(item.recovery ?? item.recoveryMinutes);
+  const fatigueLimit = Number(item.fatigueLimit);
+  const controlBaseline = Number(item.control ?? item.controlBaseline);
+  const speed = Number(item.speed);
+  const power = Number(item.power);
+  const isActive = typeof item.active === 'boolean' ? item.active : Boolean(item.isActive);
+  const name = String(item.name || id).trim() || id;
+
+  return {
+    id,
+    playerId: id,
+    name,
+    role,
+    isActive,
+    sleepHoursToday: Number.isFinite(sleepHoursToday) ? clamp(sleepHoursToday, 0, 12) : 7,
+    recoveryMinutes: Number.isFinite(recoveryMinutes) ? clamp(recoveryMinutes, 0, 240) : 45,
+    fatigueLimit: Number.isFinite(fatigueLimit) ? clamp(fatigueLimit, 0, 10) : 6,
+    controlBaseline: Number.isFinite(controlBaseline) ? clamp(controlBaseline, 0, 100) : 78,
+    speed: Number.isFinite(speed) ? clamp(speed, 0, 100) : 7,
+    power: Number.isFinite(power) ? clamp(power, 0, 100) : 6,
+    sleep: Number.isFinite(sleepHoursToday) ? clamp(sleepHoursToday, 0, 12) : 7,
+    recovery: Number.isFinite(recoveryMinutes) ? clamp(recoveryMinutes, 0, 240) : 45,
+    control: Number.isFinite(controlBaseline) ? clamp(controlBaseline, 0, 100) : 78,
+    active: isActive,
+    orderIndex: normalizeOrderIndex(item.orderIndex),
+    createdAt: typeof item.createdAt === 'string' ? item.createdAt : undefined,
+    updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : undefined,
+  };
+};
+
+export async function getBaselinesWithMeta(signal?: AbortSignal): Promise<BaselinesResponse> {
+  const raw = await getJson<unknown>(baselinesEndpoint, signal);
+  if (Array.isArray(raw)) {
+    const baselines = raw.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
+    return { baselines, source: 'cosmos' };
+  }
+
+  if (raw && typeof raw === 'object') {
+    const record = raw as Record<string, unknown>;
+    const rows = Array.isArray(record.players)
+      ? record.players
+      : Array.isArray(record.baselines)
+        ? record.baselines
+        : [];
+    const baselines = rows.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
+    const source = record.source === 'cosmos' ? 'cosmos' : 'fallback';
+    const warning = typeof record.warning === 'string' && record.warning.trim().length > 0 ? record.warning : undefined;
+    return { baselines, source, warning };
+  }
+  return { baselines: [], source: 'fallback', warning: 'Unexpected baselines response shape.' };
+}
+
+export async function getBaselines(signal?: AbortSignal): Promise<Baseline[]> {
+  const response = await getBaselinesWithMeta(signal);
+  return response.baselines;
+}
+
+export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal): Promise<Baseline[]> {
+  const players: PlayerBaseline[] = baselines.map((row) => ({
+    id: String(row.id || row.playerId || '').trim(),
+    role: row.role,
+    sleep: clamp(toNumberOr(row.sleep ?? row.sleepHoursToday, 7), 0, 12),
+    recovery: clamp(toNumberOr(row.recovery ?? row.recoveryMinutes, 45), 0, 240),
+    fatigueLimit: clamp(toNumberOr(row.fatigueLimit, 6), 0, 10),
+    control: clamp(toNumberOr(row.control ?? row.controlBaseline, 78), 0, 100),
+    speed: clamp(toNumberOr(row.speed, 7), 0, 100),
+    power: clamp(toNumberOr(row.power, 0), 0, 100),
+    active: typeof row.active === 'boolean' ? row.active : Boolean(row.isActive),
+    name: String(row.name || row.id || row.playerId || '').trim() || undefined,
+    ...(normalizeOrderIndex(row.orderIndex) > 0 ? { orderIndex: normalizeOrderIndex(row.orderIndex) } : {}),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }));
+
+  const raw = await postJson<unknown>(baselinesEndpoint, { players }, signal);
+  if (raw && typeof raw === 'object') {
+    const record = raw as Record<string, unknown>;
+    const rows = Array.isArray(record.players)
+      ? record.players
+      : Array.isArray(record.baselines)
+        ? record.baselines
+        : [];
+    return rows.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
+  }
+  return [];
+}
+
+export async function deleteBaseline(playerId: string, signal?: AbortSignal): Promise<void> {
+  const id = encodeURIComponent(String(playerId || '').trim());
+  await deleteJson<{ ok: boolean }>(`${baselinesEndpoint}/${id}`, signal);
+}
+
+export async function updateBaselineActive(
+  baselineId: string,
+  active: boolean,
+  signal?: AbortSignal
+): Promise<Baseline | null> {
+  const id = encodeURIComponent(String(baselineId || '').trim());
+  const raw = await patchJson<unknown>(`${baselinesEndpoint}/${id}`, { active }, signal);
+  if (raw && typeof raw === 'object') {
+    const record = raw as Record<string, unknown>;
+    const candidate = normalizeBaseline(record.player ?? record.baseline ?? record);
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
+export async function resetBaselines(signal?: AbortSignal): Promise<void> {
+  await postJson<{ ok: boolean; deleted: number }>(`${baselinesEndpoint}/reset`, {}, signal);
+}
+
 export async function checkHealth(
   signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
-  const { text } = await requestText(apiHealthUrl, {
-    method: 'GET',
-    signal,
-  }, { timeoutMs: 6000 });
+  const request = async (url: string) => requestText(
+    url,
+    {
+      method: 'GET',
+      signal,
+    },
+    { timeoutMs: 6000 }
+  );
+
+  let text: string;
+  try {
+    ({ text } = await request(apiHealthUrl));
+  } catch (error) {
+    if (error instanceof ApiClientError && error.status === 404 && apiHealthUrl !== apiLegacyHealthUrl) {
+      ({ text } = await request(apiLegacyHealthUrl));
+    } else {
+      throw error;
+    }
+  }
 
   if (!text.trim()) {
     return { status: 'ok' };

@@ -21,8 +21,6 @@ import {
   User,
   Hexagon,
   Trash2,
-  X,
-  UserPlus,
   UserMinus,
   Cpu,
   HelpCircle,
@@ -46,17 +44,19 @@ import {
   apiHealthUrl,
   apiOrchestrateUrl,
   checkHealth,
+  deleteBaseline,
+  getBaselinesWithMeta,
   postAgentFrameworkOrchestrate,
   postOrchestrate,
+  resetBaselines,
+  saveBaselines,
 } from './lib/apiClient';
+import { Baseline, BaselineRole } from './types/baseline';
 import {
   clamp,
-  computeBaselineRecoveryScore,
-  computeFatigue,
   computeInjuryRisk,
   computeLoadRatio,
   computeNoBallRisk,
-  computeRecoveryLevelAuto,
   computeStatus,
   type Phase,
   type RecoveryLevel,
@@ -86,6 +86,7 @@ interface MatchState {
 
 interface Player {
   id: string;
+  baselineId?: string;
   name: string;
   role: 'Bowler' | 'Fast Bowler' | 'Spinner' | 'Batsman' | 'All-rounder';
   isSub?: boolean;
@@ -93,13 +94,14 @@ interface Player {
   isActive?: boolean;
   // Live Metrics
   overs: number;
-  consecutiveOvers: number;
+  consecutiveOvers: number; // Legacy compatibility field; no longer user-controlled.
+  lastRestOvers?: number;
   fatigue: number; // 0-10
   hrRecovery: 'Good' | 'Moderate' | 'Poor';
-  injuryRisk: 'Low' | 'Medium' | 'High';
+  injuryRisk: 'Low' | 'Medium' | 'High' | 'Critical';
   noBallRisk: 'Low' | 'Medium' | 'High';
   agentFatigueOverride?: number;
-  agentRiskOverride?: 'Low' | 'Medium' | 'High';
+  agentRiskOverride?: 'Low' | 'Medium' | 'High' | 'Critical';
   runs: number;
   balls: number;
   boundaryEvents: Array<'4' | '6'>;
@@ -109,6 +111,9 @@ interface Player {
   baselineFatigue: number;
   sleepHours: number;
   recoveryTime: number; // in minutes
+  controlBaseline?: number;
+  speed?: number;
+  power?: number;
   isResting?: boolean;
   restStartMs?: number;
   restStartFatigue?: number;
@@ -121,10 +126,11 @@ interface Player {
   _previousState?: {
     fatigue: number;
     hrRecovery: 'Good' | 'Moderate' | 'Poor';
-    injuryRisk: 'Low' | 'Medium' | 'High';
+    injuryRisk: 'Low' | 'Medium' | 'High' | 'Critical';
     noBallRisk: 'Low' | 'Medium' | 'High';
     overs: number;
     consecutiveOvers: number;
+    lastRestOvers?: number;
     recoveryOffset: number;
     isResting: boolean;
     restElapsedSec: number;
@@ -140,6 +146,8 @@ interface FatigueAgentPayload {
   role: string;
   oversBowled: number;
   consecutiveOvers: number;
+  oversRemaining?: number;
+  maxOvers?: number;
   fatigueIndex: number;
   injuryRisk: 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
   noBallRisk: 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
@@ -195,6 +203,8 @@ interface RiskAgentPayload {
   noBallRisk: 'LOW' | 'MED' | 'HIGH' | 'MEDIUM';
   oversBowled: number;
   consecutiveOvers: number;
+  oversRemaining?: number;
+  maxOvers?: number;
   heartRateRecovery?: string;
   format: string;
   phase: string;
@@ -209,7 +219,8 @@ interface RiskAgentPayload {
 interface TelemetrySnapshot {
   playerId: string;
   overs: number;
-  consecutiveOvers: number;
+  oversRemaining: number;
+  maxOvers: number;
   isResting: boolean;
   restElapsedSec: number;
 }
@@ -220,30 +231,34 @@ const INITIAL_PLAYERS: Player[] = [
   { 
     id: 'p1', name: 'J. Archer', role: 'Fast Bowler', 
     isActive: true,
+    lastRestOvers: 0,
     overs: 2, consecutiveOvers: 2, fatigue: 3, hrRecovery: 'Good', injuryRisk: 'Low', noBallRisk: 'Low',
     runs: 0, balls: 0, boundaryEvents: [], isDismissed: false, dismissalType: 'Not Out',
-    baselineFatigue: 6, sleepHours: 7.5, recoveryTime: 45
+    baselineFatigue: 6, sleepHours: 7.5, recoveryTime: 45, controlBaseline: 80, speed: 9, power: 7
   },
   { 
     id: 'p2', name: 'R. Khan', role: 'Spinner', 
     isActive: true,
+    lastRestOvers: 7,
     overs: 8, consecutiveOvers: 1, fatigue: 4, hrRecovery: 'Good', injuryRisk: 'Low', noBallRisk: 'Low',
     runs: 0, balls: 0, boundaryEvents: [], isDismissed: false, dismissalType: 'Not Out',
-    baselineFatigue: 8, sleepHours: 6, recoveryTime: 30
+    baselineFatigue: 8, sleepHours: 6, recoveryTime: 30, controlBaseline: 88, speed: 7, power: 5
   },
   { 
     id: 'p3', name: 'B. Stokes', role: 'All-rounder', 
     isActive: true,
+    lastRestOvers: 0,
     overs: 3, consecutiveOvers: 3, fatigue: 5, hrRecovery: 'Moderate', injuryRisk: 'Medium', noBallRisk: 'Low',
     runs: 24, balls: 18, boundaryEvents: ['4', '4', '6'], isDismissed: false, dismissalType: 'Not Out',
-    baselineFatigue: 5, sleepHours: 8, recoveryTime: 50
+    baselineFatigue: 5, sleepHours: 8, recoveryTime: 50, controlBaseline: 76, speed: 8, power: 8
   },
   { 
     id: 'p4', name: 'P. Cummins', role: 'Fast Bowler', 
     isActive: true,
+    lastRestOvers: 10,
     overs: 10, consecutiveOvers: 0, fatigue: 7, hrRecovery: 'Poor', injuryRisk: 'High', noBallRisk: 'Medium',
     runs: 0, balls: 0, boundaryEvents: [], isDismissed: false, dismissalType: 'Not Out',
-    baselineFatigue: 7, sleepHours: 5.5, recoveryTime: 60
+    baselineFatigue: 7, sleepHours: 5.5, recoveryTime: 60, controlBaseline: 82, speed: 8, power: 8
   },
 ];
 
@@ -504,6 +519,377 @@ const safeNum = (v: unknown, fallback: number): number => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+const getMaxOvers = (format: string): number => {
+  const normalized = String(format || '').trim().toUpperCase();
+  if (normalized === 'T20') return 4;
+  if (normalized === 'ODI') return 10;
+  return 999; // Test / no strict cap.
+};
+
+const clampOversBowled = (value: number, maxOvers: number): number => {
+  const safeMax = Math.max(1, Math.floor(safeNum(maxOvers, 1)));
+  return Math.max(0, Math.min(safeMax, Math.floor(safeNum(value, 0))));
+};
+
+const computeOversRemaining = (oversBowled: number, maxOvers: number): number =>
+  Math.max(0, Math.floor(safeNum(maxOvers, 0)) - Math.floor(safeNum(oversBowled, 0)));
+
+type SanitizedBowlerWorkload = Pick<Player, 'overs' | 'consecutiveOvers' | 'lastRestOvers' | 'fatigue'> & {
+  maxOvers: number;
+  oversRemaining: number;
+};
+
+/**
+ * Bowling workload invariants:
+ * - 0 <= oversBowled <= format cap (T20=4, ODI=10, Test=999)
+ * - 0 <= oversRemaining <= maxOvers
+ * - oversRemaining === maxOvers - oversBowled
+ * - legacy consecutiveOvers is retained as 0 for backward compatibility only
+ * - fatigue is always clamped to [0, 10]
+ */
+const sanitizeBowlerWorkload = (player: Player, format: string): SanitizedBowlerWorkload => {
+  const maxOvers = getMaxOvers(format);
+  const oversBowled = clampOversBowled(safeNum(player.overs, 0), maxOvers);
+  const legacySpellOvers = Math.max(0, Math.floor(safeNum(player.consecutiveOvers, 0)));
+  const inferredLastRest = Math.max(0, oversBowled - legacySpellOvers);
+  const lastRestOvers = Math.max(
+    0,
+    Math.min(
+      oversBowled,
+      Math.floor(safeNum(player.lastRestOvers, inferredLastRest))
+    )
+  );
+  const oversRemaining = computeOversRemaining(oversBowled, maxOvers);
+  const fatigue = clamp(safeNum(player.fatigue, 2.5), 0, 10);
+  const consecutiveOvers = 0;
+
+  if (import.meta.env.DEV) {
+    const inRange =
+      oversBowled >= 0 &&
+      oversBowled <= maxOvers &&
+      oversRemaining >= 0 &&
+      oversRemaining <= maxOvers &&
+      oversRemaining === maxOvers - oversBowled;
+    console.assert(inRange, 'Bowler workload invariant violation (auto-corrected).', {
+      playerId: player.id,
+      format,
+      oversBowled,
+      maxOvers,
+      oversRemaining,
+    });
+  }
+
+  return {
+    overs: oversBowled,
+    lastRestOvers,
+    consecutiveOvers,
+    fatigue,
+    maxOvers,
+    oversRemaining,
+  };
+};
+
+const normalizeBaselineId = (value: string): string => String(value || '').trim();
+const baselineKey = (value: string): string => normalizeBaselineId(value).toLowerCase();
+
+const playerRoleToBaselineRole = (role: Player['role']): BaselineRole => {
+  if (role === 'Fast Bowler' || role === 'Bowler') return 'FAST';
+  if (role === 'Spinner') return 'SPIN';
+  if (role === 'Batsman') return 'BAT';
+  return 'AR';
+};
+
+const baselineRoleToPlayerRole = (role: BaselineRole): Player['role'] => {
+  if (role === 'FAST') return 'Fast Bowler';
+  if (role === 'SPIN') return 'Spinner';
+  if (role === 'BAT') return 'Batsman';
+  return 'All-rounder';
+};
+
+const normalizeBaselineRecord = (baseline: Partial<Baseline>): Baseline => ({
+  id: normalizeBaselineId(baseline.id || baseline.playerId || baseline.name),
+  playerId: normalizeBaselineId(baseline.playerId || baseline.id || baseline.name),
+  name: String(baseline.name || baseline.id || baseline.playerId || 'Unknown Player').trim() || 'Unknown Player',
+  role: baseline.role,
+  isActive: baseline.isActive ?? baseline.active ?? true,
+  sleepHoursToday: clamp(safeNum(baseline.sleepHoursToday ?? baseline.sleep, 7), 0, 12),
+  recoveryMinutes: clamp(safeNum(baseline.recoveryMinutes ?? baseline.recovery, 45), 0, 240),
+  fatigueLimit: clamp(safeNum(baseline.fatigueLimit, 6), 0, 10),
+  controlBaseline: clamp(safeNum(baseline.controlBaseline ?? baseline.control, 78), 0, 100),
+  speed: clamp(safeNum(baseline.speed, 7), 0, 100),
+  power: clamp(safeNum(baseline.power, 6), 0, 100),
+  sleep: clamp(safeNum(baseline.sleep ?? baseline.sleepHoursToday, 7), 0, 12),
+  recovery: clamp(safeNum(baseline.recovery ?? baseline.recoveryMinutes, 45), 0, 240),
+  control: clamp(safeNum(baseline.control ?? baseline.controlBaseline, 78), 0, 100),
+  active: baseline.active ?? baseline.isActive ?? true,
+  orderIndex: Math.max(0, Math.floor(safeNum(baseline.orderIndex, 0))),
+  createdAt: baseline.createdAt,
+  updatedAt: baseline.updatedAt,
+});
+
+const parseBaselineOrderIndex = (value: number | undefined): number => {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.floor(value as number));
+};
+
+const sortByOrderIndex = <T extends { orderIndex?: number }>(rows: T[]): T[] =>
+  rows
+    .map((row, index) => ({ row, index, orderIndex: parseBaselineOrderIndex(row.orderIndex) }))
+    .sort((a, b) => {
+      if (a.orderIndex !== b.orderIndex) return a.orderIndex - b.orderIndex;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.row);
+
+const orderBaselinesForDisplay = (rows: Baseline[]): Baseline[] => {
+  const normalized = rows.map((row) => normalizeBaselineRecord(row));
+  return sortByOrderIndex(normalized);
+};
+
+const LOCAL_BASELINE_DEFAULTS: Array<Partial<Baseline>> = [
+  {
+    id: 'J. Archer',
+    playerId: 'J. Archer',
+    name: 'J. Archer',
+    role: 'FAST',
+    isActive: true,
+    sleepHoursToday: 7.5,
+    recoveryMinutes: 45,
+    fatigueLimit: 6,
+    controlBaseline: 80,
+    speed: 9,
+    power: 0,
+  },
+  {
+    id: 'R. Khan',
+    playerId: 'R. Khan',
+    name: 'R. Khan',
+    role: 'SPIN',
+    isActive: true,
+    sleepHoursToday: 7.1,
+    recoveryMinutes: 40,
+    fatigueLimit: 6,
+    controlBaseline: 86,
+    speed: 8,
+    power: 0,
+  },
+  {
+    id: 'B. Stokes',
+    playerId: 'B. Stokes',
+    name: 'B. Stokes',
+    role: 'AR',
+    isActive: true,
+    sleepHoursToday: 7.3,
+    recoveryMinutes: 55,
+    fatigueLimit: 6,
+    controlBaseline: 75,
+    speed: 8,
+    power: 7,
+  },
+  {
+    id: 'M. Starc',
+    playerId: 'M. Starc',
+    name: 'M. Starc',
+    role: 'FAST',
+    isActive: true,
+    sleepHoursToday: 6.8,
+    recoveryMinutes: 50,
+    fatigueLimit: 6,
+    controlBaseline: 79,
+    speed: 9,
+    power: 0,
+  },
+];
+
+const getLocalDefaultBaselines = (): Baseline[] =>
+  LOCAL_BASELINE_DEFAULTS.map((row) => normalizeBaselineRecord(row));
+
+const MAX_ROSTER = 11;
+const BASELINES_STORAGE_KEY = 'tactiq.baselines';
+const BASELINES_CHANGED_EVENT = 'tactiq-baselines-changed';
+const MATCH_ROSTER_IDS_STORAGE_KEY = 'tactiq_matchRosterIds';
+
+const serializeBaselinesForStorage = (rows: Baseline[]): string =>
+  JSON.stringify(rows.map((row) => normalizeBaselineRecord(row)));
+
+const readBaselinesFromStorage = (): Baseline[] | null => {
+  if (typeof window === 'undefined') return null;
+  const raw = window.localStorage.getItem(BASELINES_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.map((entry) => normalizeBaselineRecord(entry));
+  } catch {
+    return null;
+  }
+};
+
+const writeBaselinesToStorage = (rows: Baseline[]): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(BASELINES_STORAGE_KEY, serializeBaselinesForStorage(rows));
+    window.dispatchEvent(new Event(BASELINES_CHANGED_EVENT));
+  } catch {
+    // Ignore storage write failures in restricted browser modes.
+  }
+};
+
+const readMatchRosterIdsFromStorage = (): string[] | null => {
+  if (typeof window === 'undefined') return null;
+  const raw = window.localStorage.getItem(MATCH_ROSTER_IDS_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed
+      .map((entry) => normalizeBaselineId(String(entry || '')))
+      .filter((entry, index, list) => entry.length > 0 && list.indexOf(entry) === index);
+  } catch {
+    return null;
+  }
+};
+
+const writeMatchRosterIdsToStorage = (ids: string[]): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(MATCH_ROSTER_IDS_STORAGE_KEY, JSON.stringify(ids));
+  } catch {
+    // Ignore storage write failures in restricted browser modes.
+  }
+};
+
+const getEligibleRosterBaselineIds = (rows: Baseline[]): string[] =>
+  orderBaselinesForDisplay(rows)
+    .map((row) => normalizeBaselineRecord(row))
+    .filter((row) => row.active === true || row.isActive === true)
+    .map((row) => normalizeBaselineId(row.id || row.playerId || row.name))
+    .filter((id, index, list) => id.length > 0 && list.indexOf(id) === index);
+
+const resolveMatchRosterIds = (
+  baselines: Baseline[],
+  storedIds: string[] | null
+): string[] => {
+  const orderedIds = getEligibleRosterBaselineIds(baselines);
+  if (storedIds === null || storedIds.length === 0) {
+    return orderedIds.slice(0, MAX_ROSTER);
+  }
+
+  const availableKeys = new Set(orderedIds.map((id) => baselineKey(id)));
+  const next: string[] = [];
+  const seen = new Set<string>();
+
+  storedIds.forEach((id) => {
+    const normalized = normalizeBaselineId(id);
+    const key = baselineKey(normalized);
+    if (!key || seen.has(key) || !availableKeys.has(key)) return;
+    next.push(normalized);
+    seen.add(key);
+  });
+
+  return next.slice(0, MAX_ROSTER);
+};
+
+const baselineFromPlayer = (player: Player): Baseline =>
+  normalizeBaselineRecord({
+    id: normalizeBaselineId(player.id),
+    playerId: normalizeBaselineId(player.id),
+    name: player.name,
+    role: playerRoleToBaselineRole(player.role),
+    isActive: player.isActive !== false,
+    active: player.isActive !== false,
+    sleepHoursToday: safeNum(player.sleepHours, 7),
+    sleep: safeNum(player.sleepHours, 7),
+    recoveryMinutes: safeNum(player.recoveryTime, 45),
+    recovery: safeNum(player.recoveryTime, 45),
+    fatigueLimit: safeNum(player.baselineFatigue, 6),
+    controlBaseline: safeNum(player.controlBaseline, 78),
+    control: safeNum(player.controlBaseline, 78),
+    speed: safeNum(player.speed, 7),
+    power: safeNum(player.power, 6),
+    updatedAt: new Date().toISOString(),
+  });
+
+const buildRosterPlayersFromBaselines = (
+  currentPlayers: Player[],
+  baselines: Baseline[],
+  matchRosterIds: string[]
+): Player[] => {
+  const byName = new Map<string, Player>();
+  const byId = new Map<string, Player>();
+  currentPlayers.forEach((player) => {
+    byName.set(baselineKey(player.name), player);
+    byId.set(player.id, player);
+  });
+
+  const baselineById = new Map<string, Baseline>();
+  orderBaselinesForDisplay(baselines)
+    .map((baseline) => normalizeBaselineRecord(baseline))
+    .forEach((baseline) => {
+      if (baseline.active !== true && baseline.isActive !== true) return;
+      const id = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+      if (!id) return;
+      baselineById.set(baselineKey(id), baseline);
+    });
+
+  // Roster is derived strictly from local match roster IDs.
+  return matchRosterIds
+    .map((id) => baselineById.get(baselineKey(id)))
+    .filter((baseline): baseline is Baseline => Boolean(baseline))
+    .map((baseline) => {
+      const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+      const existing = byId.get(baselineId) || byName.get(baselineKey(baseline.name));
+
+      if (existing) {
+        return {
+          ...existing,
+          id: baselineId,
+          baselineId,
+          name: baseline.name,
+          role: baselineRoleToPlayerRole(baseline.role),
+          isSub: false,
+          inRoster: true,
+          isActive: true,
+          baselineFatigue: baseline.fatigueLimit,
+          sleepHours: baseline.sleepHoursToday,
+          recoveryTime: baseline.recoveryMinutes,
+          controlBaseline: baseline.controlBaseline,
+          speed: baseline.speed,
+          power: baseline.power,
+        };
+      }
+
+      return {
+        id: baselineId,
+        baselineId,
+        name: baseline.name,
+        role: baselineRoleToPlayerRole(baseline.role),
+        isSub: false,
+        inRoster: true,
+        isActive: true,
+        overs: 0,
+        consecutiveOvers: 0,
+        lastRestOvers: 0,
+        fatigue: 2.5,
+        hrRecovery: 'Good',
+        injuryRisk: 'Low',
+        noBallRisk: 'Low',
+        runs: 0,
+        balls: 0,
+        boundaryEvents: [],
+        isDismissed: false,
+        dismissalType: 'Not Out',
+        baselineFatigue: baseline.fatigueLimit,
+        sleepHours: baseline.sleepHoursToday,
+        recoveryTime: baseline.recoveryMinutes,
+        controlBaseline: baseline.controlBaseline,
+        speed: baseline.speed,
+        power: baseline.power,
+        recoveryOffset: 0,
+      } satisfies Player;
+    });
+};
+
 const formatMMSS = (s: number): string => {
   const safe = Math.max(0, Math.floor(s));
   return `${String(Math.floor(safe / 60)).padStart(2, '0')}:${String(safe % 60).padStart(2, '0')}`;
@@ -539,7 +925,7 @@ const normalizeApiFailureBody = (body?: string): string | null => {
 
 const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailureDetail => {
   if (error instanceof ApiClientError) {
-    const isHealthEndpoint = error.url.includes('/api/health');
+    const isHealthEndpoint = error.url.includes('/health') || error.url.includes('/api/health');
     const status = error.status ?? (error.kind === 'timeout' ? 'timeout' : error.kind === 'cors' ? 'cors' : 'network');
     let message = normalizeApiFailureBody(error.body) ?? error.message;
     let hint: string | null = null;
@@ -551,8 +937,8 @@ const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailure
       message = 'Request blocked (CORS). Check API CORS settings or VITE_API_BASE_URL.';
       hint = 'If API is cross-origin, allow this frontend origin in CORS settings.';
     } else if (error.status === 404 && isHealthEndpoint) {
-      message = 'Health endpoint not found (/api/health). Check proxy/routes.';
-      hint = 'Ensure /api/health exists and Vite proxy forwards /api to the backend.';
+      message = 'Health endpoint not found (/health). Check proxy/routes.';
+      hint = 'Ensure /health (or /api/health) exists and Vite proxy forwards requests to the backend.';
     } else if (typeof error.status === 'number' && error.status >= 500) {
       message = `Backend error (${error.status}). Check API logs.`;
       hint = 'Server responded with an internal error.';
@@ -599,8 +985,8 @@ export default function App() {
     ballsBowled: 56,
     wickets: 3
   });
-  const [players, setPlayers] = useState<Player[]>(INITIAL_PLAYERS);
-  const [activePlayerId, setActivePlayerId] = useState<string>('p1');
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [activePlayerId, setActivePlayerId] = useState<string>('');
   const [agentState, setAgentState] = useState<'idle' | 'thinking' | 'done' | 'offline' | 'invalid'>('idle');
   const [agentWarning, setAgentWarning] = useState<string | null>(null);
   const [agentFailure, setAgentFailure] = useState<AgentFailureDetail | null>(null);
@@ -615,44 +1001,126 @@ export default function App() {
   const [analysisRequested, setAnalysisRequested] = useState(false);
   const [recoveryMode, setRecoveryMode] = useState<RecoveryMode>('auto');
   const [manualRecovery, setManualRecovery] = useState<RecoveryLevel>('Moderate');
+  const [baselineSource, setBaselineSource] = useState<'cosmos' | 'fallback'>('fallback');
+  const [baselineWarning, setBaselineWarning] = useState<string | null>(null);
+  const [workingBaselines, setWorkingBaselines] = useState<Baseline[]>(getLocalDefaultBaselines());
+  const [matchRosterIds, setMatchRosterIds] = useState<string[]>([]);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
-  const playersRef = useRef<Player[]>([]);
   const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const previousActivePlayerIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    playersRef.current = players;
-  }, [players]);
+    let rosterIdsRef = readMatchRosterIdsFromStorage();
+
+    const applyBaselinesToRoster = (rows: Baseline[]) => {
+      const orderedRows = orderBaselinesForDisplay(rows);
+      setWorkingBaselines(orderedRows);
+      const resolvedIds = resolveMatchRosterIds(orderedRows, rosterIdsRef);
+      rosterIdsRef = resolvedIds;
+      setMatchRosterIds(resolvedIds);
+      writeMatchRosterIdsToStorage(resolvedIds);
+      setPlayers((prev) => {
+        const derivedRoster = buildRosterPlayersFromBaselines(prev, orderedRows, resolvedIds);
+        setActivePlayerId((currentId) => {
+          if (derivedRoster.some((player) => player.id === currentId)) return currentId;
+          return derivedRoster[0]?.id ?? '';
+        });
+        return derivedRoster;
+      });
+    };
+
+    const loadFromStorage = (warning?: string) => {
+      const stored = readBaselinesFromStorage();
+      const rows = orderBaselinesForDisplay(stored !== null ? stored : getLocalDefaultBaselines());
+      if (!stored) writeBaselinesToStorage(rows);
+      setBaselineSource('fallback');
+      setBaselineWarning(warning || null);
+      applyBaselinesToRoster(rows);
+    };
+
+    const loadFromBackend = async () => {
+      try {
+        const response = await getBaselinesWithMeta();
+        const rows = orderBaselinesForDisplay(response.baselines);
+        setBaselineSource(response.source);
+        setBaselineWarning(
+          response.warning || (response.source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null)
+        );
+        writeBaselinesToStorage(rows);
+        applyBaselinesToRoster(rows);
+      } catch (error) {
+        if (import.meta.env.DEV) {
+          console.warn('[baselines] backend load failed; using local fallback', error);
+        }
+        loadFromStorage('Failed to load baselines from backend. Using local defaults.');
+      }
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key && event.key !== BASELINES_STORAGE_KEY && event.key !== MATCH_ROSTER_IDS_STORAGE_KEY) {
+        return;
+      }
+
+      if (event.key === MATCH_ROSTER_IDS_STORAGE_KEY) {
+        rosterIdsRef = readMatchRosterIdsFromStorage();
+        const storedBaselines = readBaselinesFromStorage();
+        if (storedBaselines) {
+          applyBaselinesToRoster(storedBaselines);
+        }
+        return;
+      }
+
+      loadFromStorage();
+    };
+
+    const handleLocalEvent = () => {
+      loadFromStorage();
+    };
+
+    loadFromBackend();
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
+    };
+  }, []);
 
   const selectedPlayer = players.find((p) => p.id === activePlayerId) ?? null;
   const normalizedPhase = normalizePhase(matchContext.phase);
   const activeDerived = React.useMemo(() => {
     if (!selectedPlayer) return null;
-    const role = normalizeRole(selectedPlayer.role);
-    const oversBowled = Math.max(0, safeNum(selectedPlayer.overs, 0));
-    const consecutiveOvers = Math.max(0, safeNum(selectedPlayer.consecutiveOvers, 0));
+    const workload = sanitizeBowlerWorkload(selectedPlayer, matchContext.format);
+    const oversBowled = workload.overs;
+    const maxOvers = workload.maxOvers;
+    const oversRemaining = workload.oversRemaining;
+    const quotaComplete = maxOvers < 999 && oversBowled >= maxOvers;
+    const lastRestOvers = workload.lastRestOvers;
     const fatigueLimit = Math.max(0, safeNum(selectedPlayer.baselineFatigue, 6));
     const sleepHrs = Math.max(0, safeNum(selectedPlayer.sleepHours, 7));
     const recoveryMin = Math.max(0, safeNum(selectedPlayer.recoveryTime, 45));
-    const recoveryOffset = Math.max(0, safeNum(selectedPlayer.recoveryOffset, 0));
-
-    // Baseline capacity derived from sleep/recovery baselines.
-    const baselineRecoveryScore = computeBaselineRecoveryScore(sleepHrs, recoveryMin);
-    const baseFatigue = computeFatigue(oversBowled, consecutiveOvers, normalizedPhase, role, baselineRecoveryScore);
-    const computedFatigue = clamp(baseFatigue - recoveryOffset, 0, 10);
-    const computedLoadRatio = computeLoadRatio(computedFatigue, fatigueLimit);
-    const recoveryAuto = computeRecoveryLevelAuto(baselineRecoveryScore, computedLoadRatio);
-    const computedRecoveryDisplayed = recoveryMode === 'manual' ? manualRecovery : recoveryAuto;
-    const computedInjuryRisk = computeInjuryRisk(computedLoadRatio, consecutiveOvers, role, computedRecoveryDisplayed);
-    const computedNoBallRisk = computeNoBallRisk(computedFatigue, consecutiveOvers, normalizedPhase);
-    const computedStatus = computeStatus(computedLoadRatio);
     const isUnfit = Boolean(selectedPlayer.isUnfit);
-    const fatigue = isUnfit ? 10 : computedFatigue;
-    const loadRatio = isUnfit ? Math.max(1.1, computedLoadRatio) : computedLoadRatio;
-    const recoveryDisplayed: RecoveryLevel = isUnfit ? 'Poor' : computedRecoveryDisplayed;
-    const injuryRisk: 'Low' | 'Medium' | 'High' = isUnfit ? 'High' : computedInjuryRisk;
-    const noBallRisk: 'Low' | 'Medium' | 'High' = isUnfit ? 'High' : computedNoBallRisk;
+    const fatigue = isUnfit ? 10 : workload.fatigue;
+    const recoveryDisplayed: RecoveryLevel = isUnfit
+      ? 'Poor'
+      : recoveryMode === 'manual'
+        ? manualRecovery
+        : (selectedPlayer.hrRecovery || 'Good');
+    const computedLoadRatio = computeLoadRatio(fatigue, fatigueLimit);
+    const computedStatus = computeStatus(computedLoadRatio);
+    const computedInjuryRisk = computeInjuryRisk(fatigue, oversBowled, maxOvers, isUnfit);
+    const computedNoBallRisk = computeNoBallRisk(
+      fatigue,
+      oversBowled,
+      maxOvers,
+      matchContext.pitch || matchContext.phase,
+      isUnfit
+    );
+    const injuryRisk: 'Low' | 'Medium' | 'High' | 'Critical' = computedInjuryRisk;
+    const noBallRisk: 'Low' | 'Medium' | 'High' = computedNoBallRisk;
+    const loadRatio = isUnfit ? Math.max(1.1, computeLoadRatio(fatigue, fatigueLimit)) : computedLoadRatio;
     const status: StatusLevel = isUnfit ? 'EXCEEDED LIMIT' : computedStatus;
 
     return {
@@ -663,29 +1131,48 @@ export default function App() {
       noBallRisk,
       loadRatio,
       status,
-      recoveryAuto,
       recoveryDisplayed,
       oversBowled,
-      consecutiveOvers,
+      consecutiveOvers: 0,
+      maxOvers,
+      oversRemaining,
+      quotaComplete,
+      lastRestOvers,
       fatigueLimit,
       sleepHrs,
       recoveryMin,
-      recoveryOffset,
     };
-  }, [selectedPlayer, normalizedPhase, recoveryMode, manualRecovery]);
+  }, [selectedPlayer, matchContext.format, matchContext.phase, matchContext.pitch, recoveryMode, manualRecovery]);
 
   const activePlayer = activeDerived;
   const currentTelemetry = React.useMemo(() => {
     if (!activeDerived) return null;
+    const injuryLabel = String(activeDerived.injuryRisk || 'Low').toUpperCase();
+    const injuryRisk: 'LOW' | 'MEDIUM' | 'HIGH' =
+      injuryLabel === 'CRITICAL' || injuryLabel === 'HIGH'
+        ? 'HIGH'
+        : injuryLabel === 'MED' || injuryLabel === 'MEDIUM'
+          ? 'MEDIUM'
+          : 'LOW';
+    const noBallLabel = String(activeDerived.noBallRisk || 'Low').toUpperCase();
+    const noBallRisk: 'LOW' | 'MEDIUM' | 'HIGH' =
+      noBallLabel === 'HIGH'
+        ? 'HIGH'
+        : noBallLabel === 'MED' || noBallLabel === 'MEDIUM'
+          ? 'MEDIUM'
+          : 'LOW';
     return {
       playerId: activeDerived.id.toUpperCase(),
       playerName: activeDerived.name,
       role: activeDerived.role,
       oversBowled: activeDerived.oversBowled,
-      consecutiveOvers: activeDerived.consecutiveOvers,
+      consecutiveOvers: 0,
+      oversRemaining: activeDerived.oversRemaining,
+      maxOvers: activeDerived.maxOvers,
+      quotaComplete: Boolean(activeDerived.quotaComplete),
       fatigueIndex: activeDerived.fatigue,
-      injuryRisk: String(activeDerived.injuryRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
-      noBallRisk: String(activeDerived.noBallRisk || 'Medium').toUpperCase() as 'LOW' | 'MEDIUM' | 'HIGH',
+      injuryRisk,
+      noBallRisk,
       heartRateRecovery: String(activeDerived.hrRecovery || 'Moderate'),
       fatigueLimit: activeDerived.fatigueLimit,
       sleepHours: activeDerived.sleepHrs,
@@ -728,14 +1215,38 @@ export default function App() {
         ballsBowled: Math.min(prev.ballsBowled, maxBalls),
       };
     });
+    setPlayers((prev) =>
+      prev.map((player) => ({
+        ...player,
+        ...sanitizeBowlerWorkload(player, matchContext.format),
+      }))
+    );
   }, [matchContext.format]);
 
   useEffect(() => {
+    const previousActivePlayerId = previousActivePlayerIdRef.current;
+    previousActivePlayerIdRef.current = activePlayerId;
     setPlayers((prev) =>
       prev.map((p) => {
-        if (!p.isResting) return p;
+        const workload = sanitizeBowlerWorkload(p, matchContext.format);
+        const isPreviousActive = Boolean(previousActivePlayerId && p.id === previousActivePlayerId && p.id !== activePlayerId);
+        const nextLastRest = isPreviousActive ? workload.overs : workload.lastRestOvers;
+        if (
+          !p.isResting &&
+          !isPreviousActive &&
+          workload.overs === p.overs &&
+          p.consecutiveOvers === 0 &&
+          nextLastRest === safeNum(p.lastRestOvers, 0) &&
+          workload.fatigue === safeNum(p.fatigue, 2.5)
+        ) {
+          return p;
+        }
         return {
           ...p,
+          overs: workload.overs,
+          lastRestOvers: nextLastRest,
+          consecutiveOvers: 0,
+          fatigue: workload.fatigue,
           isResting: false,
           restStartMs: undefined,
           restStartFatigue: undefined,
@@ -763,34 +1274,25 @@ export default function App() {
         prev.map((p) => {
           if (!p.isResting) return p;
 
-          const role = normalizeRole(p.role);
-          const baselineRecoveryScore = computeBaselineRecoveryScore(
-            Math.max(0, safeNum(p.sleepHours, 7)),
-            Math.max(0, safeNum(p.recoveryTime, 45))
-          );
-          const baseFatigue = computeFatigue(
-            Math.max(0, safeNum(p.overs, 0)),
-            Math.max(0, safeNum(p.consecutiveOvers, 0)),
-            normalizedPhase,
-            role,
-            baselineRecoveryScore
-          );
-          const currentOffset = Math.max(0, safeNum(p.recoveryOffset, 0));
-          const fatigueWithOffset = clamp(baseFatigue - currentOffset, 0, 10);
-          const loadRatio = computeLoadRatio(fatigueWithOffset, Math.max(0, safeNum(p.baselineFatigue, 6)));
-          const autoRecovery = computeRecoveryLevelAuto(baselineRecoveryScore, loadRatio);
+          const workload = sanitizeBowlerWorkload(p, matchContext.format);
           const recoveryLevel =
-            p.id === activePlayerId && recoveryMode === 'manual' ? manualRecovery : autoRecovery;
+            p.id === activePlayerId && recoveryMode === 'manual'
+              ? manualRecovery
+              : (p.hrRecovery || 'Good');
           const recoveryRate = RECOVERY_RATE_BY_HRR[recoveryLevel];
 
           const startMs = p.restStartMs ?? Date.now();
           const nextElapsedSeconds = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+          const nextFatigue = clamp(workload.fatigue - recoveryRate, 0, 10);
 
           return {
             ...p,
+            overs: workload.overs,
+            lastRestOvers: workload.lastRestOvers,
+            consecutiveOvers: workload.consecutiveOvers,
+            fatigue: nextFatigue,
             restElapsedSec: nextElapsedSeconds,
             recoveryElapsed: nextElapsedSeconds / 60,
-            recoveryOffset: clamp(currentOffset + recoveryRate, 0, 10),
           };
         })
       );
@@ -802,56 +1304,34 @@ export default function App() {
         recoveryIntervalRef.current = null;
       }
     };
-  }, [hasRestingPlayers, activePlayerId, recoveryMode, manualRecovery, normalizedPhase]);
+  }, [hasRestingPlayers, activePlayerId, recoveryMode, manualRecovery, matchContext.format]);
 
-  const updatePlayer = (id: string, updates: Partial<Player>) => {
+  const updatePlayer = (
+    id: string,
+    updates: Partial<Player> | ((player: Player) => Partial<Player>)
+  ) => {
     setPlayers(prev => prev.map(p => {
       if (p.id !== id) return p;
-      
-      let updated = { ...p, ...updates };
 
-      if (!('agentFatigueOverride' in updates) && !('agentRiskOverride' in updates)) {
+      const patch = typeof updates === 'function' ? updates(p) : updates;
+      let updated = { ...p, ...patch };
+
+      if (!('agentFatigueOverride' in patch) && !('agentRiskOverride' in patch)) {
         updated.agentFatigueOverride = undefined;
         updated.agentRiskOverride = undefined;
       }
 
-      if (updated.consecutiveOvers > updated.overs) {
-         updated.consecutiveOvers = updated.overs;
-      }
+      updated = {
+        ...updated,
+        ...sanitizeBowlerWorkload(updated, matchContext.format),
+      };
 
       return updated;
     }));
   };
 
-  const addPlayer = (name: string, role: Player['role'], isSub: boolean = false, inRoster: boolean = true) => {
-    const newPlayer: Player = {
-      id: `p${Date.now()}`,
-      name,
-      role,
-      isSub,
-      inRoster,
-      isActive: inRoster,
-      overs: 0,
-      consecutiveOvers: 0,
-      fatigue: 0,
-      hrRecovery: 'Good',
-      injuryRisk: 'Low',
-      noBallRisk: 'Low',
-      runs: 0,
-      balls: 0,
-      boundaryEvents: [],
-      isDismissed: false,
-      dismissalType: 'Not Out',
-      baselineFatigue: 7, 
-      sleepHours: 7,
-      recoveryTime: 45,
-      recoveryOffset: 0,
-    };
-    setPlayers((prev) => [...prev, newPlayer]);
-    setActivePlayerId(newPlayer.id);
-  };
-
   const movePlayerToSub = (playerId: string) => {
+    // Regression guard: roster operations never call baseline APIs.
     const idx = players.findIndex(p => p.id === playerId);
     if (idx !== -1) {
       const rosterBefore = players.filter(p => p.inRoster !== false);
@@ -874,61 +1354,84 @@ export default function App() {
     }
   };
 
-  const deletePlayer = (id: string) => {
-    const newPlayers = players.filter(p => p.id !== id);
-    setPlayers(newPlayers);
-    if (activePlayerId === id && newPlayers.length > 0) {
-      setActivePlayerId(newPlayers[0].id);
-    }
+  const applyMatchRosterIds = (nextIdsInput: string[]) => {
+    const orderedBaselines = orderBaselinesForDisplay(
+      workingBaselines.length > 0 ? workingBaselines : (readBaselinesFromStorage() ?? getLocalDefaultBaselines())
+    );
+    const resolvedIds = resolveMatchRosterIds(orderedBaselines, nextIdsInput);
+    setMatchRosterIds(resolvedIds);
+    writeMatchRosterIdsToStorage(resolvedIds);
+    setPlayers((prevPlayers) => {
+      const derivedRoster = buildRosterPlayersFromBaselines(prevPlayers, orderedBaselines, resolvedIds);
+      setActivePlayerId((currentId) => {
+        if (derivedRoster.some((player) => player.id === currentId)) return currentId;
+        return derivedRoster[0]?.id ?? '';
+      });
+      return derivedRoster;
+    });
+  };
+
+  const deleteRosterPlayer = (rosterPlayerId: string) => {
+    const normalizedId = normalizeBaselineId(rosterPlayerId);
+    if (!normalizedId) return;
+    const normalizedKey = baselineKey(normalizedId);
+
+    // Keep baseline + roster in sync locally: removing from roster marks baseline inactive for this session.
+    const nextBaselines = orderBaselinesForDisplay(
+      workingBaselines.length > 0 ? workingBaselines : (readBaselinesFromStorage() ?? getLocalDefaultBaselines())
+    ).map((baseline) => {
+      const baselineId = normalizeBaselineId(baseline.id || baseline.playerId || baseline.name);
+      if (baselineKey(baselineId) !== normalizedKey) return baseline;
+      return normalizeBaselineRecord({
+        ...baseline,
+        isActive: false,
+        active: false,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+    setWorkingBaselines(nextBaselines);
+    writeBaselinesToStorage(nextBaselines);
+
+    const currentIds = matchRosterIds.length > 0 ? matchRosterIds : (readMatchRosterIdsFromStorage() || []);
+    const nextIds = currentIds.filter((id) => baselineKey(id) !== normalizedKey);
+    applyMatchRosterIds(nextIds);
   };
 
   const handleAddOver = () => {
     if (!activePlayer) return;
-    setPlayers((prev) =>
-      prev.map((p) => {
-        if (p.id !== activePlayer.id) return p;
-        if (activePlayer.injuryRisk === 'High' || p.isSub) return p;
-        return { ...p, overs: p.overs + 1 };
-      })
-    );
+    if ((activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') || activePlayer.isSub || activePlayer.isUnfit) return;
+    const cap = getMaxOvers(matchContext.format);
+    const intensityMultiplier = fatigueIntensityMultiplier(matchContext.pitch || 'Medium');
+    updatePlayer(activePlayer.id, (p) => {
+      const workload = sanitizeBowlerWorkload(p, matchContext.format);
+      if (workload.overs >= cap) return {};
+      return {
+        overs: workload.overs + 1,
+        fatigue: clamp(workload.fatigue + 0.9 * intensityMultiplier, 0, 10),
+        isResting: false,
+      };
+    });
   };
 
   const handleDecreaseOver = () => {
     if (!activePlayer) return;
-    setPlayers((prev) =>
-      prev.map((p) => (p.id === activePlayer.id ? { ...p, overs: Math.max(0, p.overs - 1) } : p))
-    );
-  };
-
-  const handleConsecutiveChange = (delta: number) => {
-    if (!activePlayer) return;
-    if (delta > 0) {
-      setPlayers((prev) =>
-        prev.map((p) => {
-          if (p.id !== activePlayer.id) return p;
-          if (activePlayer.injuryRisk === 'High' || p.isSub) return p;
-          return {
-            ...p,
-            consecutiveOvers: p.consecutiveOvers + 1,
-            overs: p.overs + 1,
-          };
-        })
-      );
-    } else {
-      setPlayers((prev) =>
-        prev.map((p) =>
-          p.id === activePlayer.id ? { ...p, consecutiveOvers: Math.max(0, p.consecutiveOvers + delta) } : p
-        )
-      );
-    }
+    const intensityMultiplier = fatigueIntensityMultiplier(matchContext.pitch || 'Medium');
+    updatePlayer(activePlayer.id, (p) => ({
+      overs: Math.max(0, p.overs - 1),
+      fatigue: clamp(safeNum(p.fatigue, 2.5) - 0.9 * intensityMultiplier, 0, 10),
+    }));
   };
 
   const handleNewSpell = () => {
     if (!activePlayer) return;
     if (activePlayer.isUnfit) return;
-    // Reset consecutive overs (Fatigue drops automatically)
+    // Compatibility marker for legacy spell tracking fields.
     updatePlayer(activePlayer.id, {
-      consecutiveOvers: 0,
+      lastRestOvers: activePlayer.overs,
+      isResting: false,
+      restStartMs: undefined,
+      restElapsedSec: 0,
+      recoveryElapsed: 0,
       isManuallyUnfit: false,
       isInjured: false,
     });
@@ -937,15 +1440,16 @@ export default function App() {
   const handleRest = () => {
     if (!activePlayer) return;
     if (activePlayer.isUnfit) return;
-    // Rest toggles timer-driven recovery; fatigue changes only via recoveryOffset over time.
-    setPlayers((prev) =>
-      prev.map((p) => {
-        if (p.id !== activePlayer.id) return p;
+    // Rest toggles timer-driven recovery and snapshots current overs for workload bookkeeping.
+    updatePlayer(
+      activePlayer.id,
+      (p) => {
+        const workload = sanitizeBowlerWorkload(p, matchContext.format);
         const nextResting = !p.isResting;
         const elapsed = p.restElapsedSec || 0;
         const nextStartMs = nextResting ? Date.now() - elapsed * 1000 : undefined;
         return {
-          ...p,
+          lastRestOvers: nextResting ? workload.overs : p.lastRestOvers,
           isResting: nextResting,
           restStartMs: nextStartMs,
           restStartFatigue: p.restStartFatigue,
@@ -954,7 +1458,7 @@ export default function App() {
           isManuallyUnfit: nextResting ? false : p.isManuallyUnfit,
           isInjured: nextResting ? false : p.isInjured,
         };
-      })
+      }
     );
   };
 
@@ -963,6 +1467,7 @@ export default function App() {
     setPlayers((prev) =>
       prev.map((p) => {
         if (p.id !== activePlayerId) return p;
+        const workload = sanitizeBowlerWorkload(p, matchContext.format);
 
         if (!p.isUnfit) {
           const recoveryOffset = Math.max(0, safeNum(p.recoveryOffset, 0));
@@ -973,8 +1478,9 @@ export default function App() {
               hrRecovery: p.hrRecovery,
               injuryRisk: p.injuryRisk,
               noBallRisk: p.noBallRisk,
-              overs: p.overs,
-              consecutiveOvers: p.consecutiveOvers,
+              overs: workload.overs,
+              consecutiveOvers: workload.consecutiveOvers,
+              lastRestOvers: workload.lastRestOvers,
               recoveryOffset,
               isResting: Boolean(p.isResting),
               restElapsedSec: Math.max(0, safeNum(p.restElapsedSec, 0)),
@@ -985,9 +1491,12 @@ export default function App() {
             isUnfit: true,
             isManuallyUnfit: true,
             isInjured: true,
+            overs: workload.overs,
+            consecutiveOvers: workload.consecutiveOvers,
+            lastRestOvers: workload.lastRestOvers,
             fatigue: 10,
             hrRecovery: 'Poor',
-            injuryRisk: 'High',
+            injuryRisk: 'Critical',
             noBallRisk: 'High',
             isResting: false,
             restStartMs: undefined,
@@ -996,16 +1505,27 @@ export default function App() {
 
         const backup = p._previousState;
         if (backup) {
+          const normalizedBackup = sanitizeBowlerWorkload(
+            {
+              ...p,
+              overs: backup.overs,
+              consecutiveOvers: backup.consecutiveOvers,
+              lastRestOvers: backup.lastRestOvers,
+              fatigue: backup.fatigue,
+            },
+            matchContext.format
+          );
           return {
             ...p,
             isUnfit: false,
             _previousState: undefined,
             isManuallyUnfit: backup.isManuallyUnfit,
             isInjured: backup.isInjured,
-            overs: backup.overs,
-            consecutiveOvers: backup.consecutiveOvers,
+            overs: normalizedBackup.overs,
+            consecutiveOvers: normalizedBackup.consecutiveOvers,
+            lastRestOvers: normalizedBackup.lastRestOvers,
             recoveryOffset: backup.recoveryOffset,
-            fatigue: backup.fatigue,
+            fatigue: normalizedBackup.fatigue,
             hrRecovery: backup.hrRecovery,
             injuryRisk: backup.injuryRisk,
             noBallRisk: backup.noBallRisk,
@@ -1022,6 +1542,9 @@ export default function App() {
           _previousState: undefined,
           isManuallyUnfit: false,
           isInjured: false,
+          overs: workload.overs,
+          consecutiveOvers: workload.consecutiveOvers,
+          lastRestOvers: workload.lastRestOvers,
         };
       })
     );
@@ -1122,55 +1645,100 @@ export default function App() {
     setAgentFailure(null);
     setAgentState('thinking');
 
-    const roster = playersRef.current;
-    const batsmen = roster.filter((p) => p.role === 'Batsman' && p.inRoster !== false && !p.isDismissed);
-    const bench = roster.filter((p) => p.isSub || p.inRoster === false).map((p) => p.name).slice(0, 5);
+    const requestMode: 'auto' | 'route' = mode === 'auto' ? 'auto' : 'route';
+    const maxOvers = Math.max(1, safeNum(currentTelemetry.maxOvers, getMaxOvers(matchContext.format)));
+    const oversBowled = clampOversBowled(safeNum(currentTelemetry.oversBowled, 0), maxOvers);
+    const oversRemaining = computeOversRemaining(oversBowled, maxOvers);
+    const quotaComplete = Boolean(currentTelemetry.quotaComplete) || (maxOvers < 999 && oversBowled >= maxOvers);
+    const fatigue = Math.max(0, Math.min(10, safeNum(currentTelemetry.fatigueIndex, 0)));
+    const injuryLabelRaw = String(currentTelemetry.injuryRisk || 'LOW').toUpperCase();
+    const noBallRiskLabelRaw = String(currentTelemetry.noBallRisk || 'LOW').toUpperCase();
+    const injuryLabel =
+      injuryLabelRaw === 'CRITICAL' || injuryLabelRaw === 'HIGH'
+        ? 'HIGH'
+        : injuryLabelRaw === 'MED' || injuryLabelRaw === 'MEDIUM'
+          ? 'MEDIUM'
+          : 'LOW';
+    const noBallRiskLabel =
+      noBallRiskLabelRaw === 'HIGH' ? 'HIGH' : noBallRiskLabelRaw === 'MED' || noBallRiskLabelRaw === 'MEDIUM' ? 'MEDIUM' : 'LOW';
+    const isUnfit = Boolean(activePlayer?.isUnfit);
+    const injury = isUnfit || injuryLabel === 'HIGH' || injuryLabel === 'CRITICAL';
+    const noBallRisk: 'LOW' | 'MEDIUM' | 'HIGH' = noBallRiskLabel === 'HIGH' ? 'HIGH' : noBallRiskLabel === 'LOW' ? 'LOW' : 'MEDIUM';
     const totalBalls = totalBallsFromOvers(matchState.totalOvers);
-    const ballsRemaining = Math.max(0, totalBalls - matchState.ballsBowled);
-    const oversFaced = matchState.ballsBowled / 6;
-    const currentRunRate = matchState.ballsBowled > 0 ? matchState.runs / oversFaced : 0;
-    const runsNeeded = matchState.target != null ? Math.max(matchState.target - matchState.runs, 0) : 0;
-    const requiredRunRate = ballsRemaining > 0 ? (runsNeeded / ballsRemaining) * 6 : 0;
-    const tacticalPhase = String(currentTelemetry.matchContext.phase || 'middle').toLowerCase();
+    const ballsBowled = Math.min(totalBalls, Math.max(0, matchState.ballsBowled));
+    const ballsRemaining = Math.max(0, totalBalls - ballsBowled);
+    const oversFaced = ballsBowled > 0 ? ballsBowled / 6 : 0;
+    const currentRunRate = oversFaced > 0 ? matchState.runs / oversFaced : 0;
+    const wicketsInHand = Math.max(0, 10 - matchState.wickets);
+    const inningsOversRemaining = Number((ballsRemaining / 6).toFixed(1));
+    const requiredRunRate =
+      typeof matchState.target === 'number' && matchState.target > 0 && ballsRemaining > 0
+        ? Math.max(0, (matchState.target - matchState.runs) / (ballsRemaining / 6))
+        : currentRunRate;
+    const batsmen = players.filter((p) => p.role === 'Batsman' && p.inRoster !== false && !p.isDismissed);
+    const bench = players
+      .filter((p) => {
+        if (p.id === activePlayer?.id) return false;
+        if (p.inRoster === false) return false;
+        if (p.isDismissed) return false;
+        const workload = sanitizeBowlerWorkload(p, matchContext.format);
+        return workload.oversRemaining > 0;
+      })
+      .map((p) => p.name);
+    const selectedPlayerBaseline = activePlayer ? baselineFromPlayer(activePlayer) : null;
+    const text = `${currentTelemetry.playerName} overs ${oversBowled}/${maxOvers} (remaining ${oversRemaining}), fatigue ${fatigue.toFixed(1)}/10, injury risk ${injuryLabel}, no-ball risk ${noBallRiskLabel}, ${quotaComplete ? 'quota completed for format' : 'quota available'}, ${isUnfit ? 'marked unfit' : 'currently fit'}.`;
     const payload = {
-      mode,
-        player: {
+      text,
+      mode: requestMode,
+      signals: {
+        injury,
+        isUnfit,
+        fatigue,
+        noBallRisk,
+        oversBowled,
+        oversRemaining,
+        maxOvers,
+        quotaComplete,
+        intensity: matchContext.pitch || 'Medium',
+      },
+      telemetry: {
         playerId: currentTelemetry.playerId,
         playerName: currentTelemetry.playerName,
         role: currentTelemetry.role,
-        oversBowled: currentTelemetry.oversBowled,
-        consecutiveOvers: currentTelemetry.consecutiveOvers,
-        fatigueIndex: currentTelemetry.fatigueIndex,
-        injuryRisk: currentTelemetry.injuryRisk,
-        noBallRisk: currentTelemetry.noBallRisk,
+        fatigueIndex: fatigue,
         heartRateRecovery: currentTelemetry.heartRateRecovery,
+        oversBowled,
+        oversRemaining,
+        maxOvers,
+        quotaComplete,
+        consecutiveOvers: 0,
+        injuryRisk: injuryLabel,
+        noBallRisk,
         fatigueLimit: currentTelemetry.fatigueLimit,
         sleepHours: currentTelemetry.sleepHours,
-          recoveryMinutes: currentTelemetry.recoveryMinutes,
-          isUnfit: Boolean(activePlayer?.isUnfit),
-        },
-      match: {
+        recoveryMinutes: currentTelemetry.recoveryMinutes,
+        isUnfit,
+      },
+      matchContext: {
         format: currentTelemetry.matchContext.format,
-        phase: currentTelemetry.matchContext.phase,
+        phase: normalizedPhase,
+        requiredRunRate: Number(requiredRunRate.toFixed(2)),
+        currentRunRate: Number(currentRunRate.toFixed(2)),
+        wicketsInHand,
+        oversRemaining: inningsOversRemaining,
         over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
         intensity: currentTelemetry.matchContext.intensity,
         conditions: matchContext.weather,
-        target: matchState.target,
+        target: typeof matchState.target === 'number' ? matchState.target : undefined,
         score: matchState.runs,
         balls: ballsRemaining,
-        tactical: {
-          phase: tacticalPhase === 'death' || tacticalPhase === 'powerplay' || tacticalPhase === 'middle' ? tacticalPhase : 'middle',
-          requiredRunRate,
-          currentRunRate,
-          wicketsInHand: Math.max(0, 10 - matchState.wickets),
-          oversRemaining: Number((ballsRemaining / 6).toFixed(1)),
-        },
       },
       players: {
         striker: batsmen[0]?.name || 'Striker',
         nonStriker: batsmen[1]?.name || batsmen[0]?.name || 'Non-striker',
         bowler: currentTelemetry.playerName,
         bench,
+        ...(selectedPlayerBaseline ? { selectedBaseline: selectedPlayerBaseline } : {}),
       },
     };
     if (import.meta.env.DEV) {
@@ -1275,6 +1843,50 @@ export default function App() {
   const navigateTo = (p: Page) => {
     window.scrollTo(0, 0);
     setPage(p);
+  };
+
+  const handleBaselinesSynced = (
+    baselines: Baseline[],
+    source: 'cosmos' | 'fallback',
+    warning?: string,
+    options?: { persist?: boolean; addToRosterIds?: string[] }
+  ) => {
+    const shouldPersist = options?.persist !== false;
+    const orderedBaselines = orderBaselinesForDisplay(baselines);
+    const storedRosterIds = readMatchRosterIdsFromStorage();
+    const currentRosterIds = matchRosterIds.length > 0 || storedRosterIds === null
+      ? matchRosterIds
+      : storedRosterIds;
+    const normalizedRosterIds = resolveMatchRosterIds(orderedBaselines, currentRosterIds);
+    const baselineIdSet = new Set(getEligibleRosterBaselineIds(orderedBaselines).map((id) => baselineKey(id)));
+    const seen = new Set(normalizedRosterIds.map((id) => baselineKey(id)));
+    const additions = (options?.addToRosterIds || [])
+      .map((id) => normalizeBaselineId(id))
+      .filter((id) => {
+        const key = baselineKey(id);
+        if (!key) return false;
+        if (seen.has(key)) return false;
+        if (!baselineIdSet.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    const resolvedRosterIds = [...normalizedRosterIds, ...additions].slice(0, MAX_ROSTER);
+    setWorkingBaselines(orderedBaselines);
+    setBaselineSource(source);
+    setBaselineWarning(warning || (source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null));
+    setMatchRosterIds(resolvedRosterIds);
+    writeMatchRosterIdsToStorage(resolvedRosterIds);
+    if (shouldPersist) {
+      writeBaselinesToStorage(orderedBaselines);
+    }
+    // IMPORTANT: Roster is derived from local match roster IDs only.
+    setPlayers((prev) => {
+      const derivedRoster = buildRosterPlayersFromBaselines(prev, orderedBaselines, resolvedRosterIds);
+      if (!derivedRoster.some((player) => player.id === activePlayerId) && derivedRoster.length > 0) {
+        setTimeout(() => setActivePlayerId(derivedRoster[0].id), 0);
+      }
+      return derivedRoster;
+    });
   };
 
   return (
@@ -1414,7 +2026,7 @@ export default function App() {
                       Dismiss
                     </button>
                     <button 
-                       onClick={() => updatePlayer(activePlayer.id, { inRoster: false, isSub: true, isActive: false })}
+                       onClick={() => movePlayerToSub(activePlayer.id)}
                        className="flex-1 py-3 rounded-xl bg-rose-600 text-white font-bold hover:bg-rose-500 shadow-lg shadow-rose-900/20 transition-colors flex items-center justify-center gap-2 text-sm"
                     >
                        <UserMinus className="w-4 h-4" /> Remove from Squad
@@ -1450,8 +2062,7 @@ export default function App() {
               setActivePlayerId={setActivePlayerId}
               updatePlayer={updatePlayer}
               updateMatchState={updateMatchState}
-              addPlayer={addPlayer}
-              deletePlayer={deletePlayer}
+              deleteRosterPlayer={deleteRosterPlayer}
               movePlayerToSub={movePlayerToSub}
               agentState={agentState}
               agentWarning={agentWarning}
@@ -1468,7 +2079,6 @@ export default function App() {
               onDismissAnalysis={dismissAnalysis}
               handleAddOver={handleAddOver}
               handleDecreaseOver={handleDecreaseOver}
-              handleConsecutiveChange={handleConsecutiveChange}
               handleNewSpell={handleNewSpell}
               handleRest={handleRest}
               handleMarkUnfit={handleMarkUnfit}
@@ -1476,16 +2086,18 @@ export default function App() {
               setRecoveryMode={setRecoveryMode}
               manualRecovery={manualRecovery}
               setManualRecovery={setManualRecovery}
+              onGoToBaselines={() => navigateTo('baselines')}
               onBack={() => navigateTo('setup')}
             />
           )}
           {page === 'baselines' && (
             <Baselines 
               key="baselines"
-              players={players}
-              addPlayer={addPlayer}
-              updatePlayer={updatePlayer}
-              deletePlayer={deletePlayer}
+              baselineSource={baselineSource}
+              baselineWarning={baselineWarning}
+              onBaselinesSynced={handleBaselinesSynced}
+              matchRosterIds={matchRosterIds}
+              onMatchRosterIdsChange={applyMatchRosterIds}
               onBack={() => navigateTo('dashboard')}
             />
           )}
@@ -1880,12 +2492,11 @@ interface DashboardProps {
   matchContext: MatchContext;
   matchState: MatchState;
   players: Player[];
-  activePlayer: (Player & { status: StatusLevel; loadRatio: number }) | null;
+  activePlayer: (Player & { status: StatusLevel; loadRatio: number; maxOvers: number; oversRemaining: number }) | null;
   setActivePlayerId: React.Dispatch<React.SetStateAction<string>>;
-  updatePlayer: (id: string, updates: Partial<Player>) => void;
+  updatePlayer: (id: string, updates: Partial<Player> | ((player: Player) => Partial<Player>)) => void;
   updateMatchState: (updates: Partial<MatchState>) => void;
-  addPlayer: (name: string, role: Player['role'], isSub?: boolean, inRoster?: boolean) => void;
-  deletePlayer: (id: string) => void;
+  deleteRosterPlayer: (id: string) => void;
   movePlayerToSub: (id: string) => void;
   agentState: 'idle' | 'thinking' | 'done' | 'offline' | 'invalid';
   aiAnalysis: AiAnalysis | null;
@@ -1902,7 +2513,6 @@ interface DashboardProps {
   onDismissAnalysis: () => void;
   handleAddOver: () => void;
   handleDecreaseOver: () => void;
-  handleConsecutiveChange: (delta: number) => void;
   handleNewSpell: () => void;
   handleRest: () => void;
   handleMarkUnfit: () => void;
@@ -1910,17 +2520,19 @@ interface DashboardProps {
   setRecoveryMode: React.Dispatch<React.SetStateAction<RecoveryMode>>;
   manualRecovery: RecoveryLevel;
   setManualRecovery: React.Dispatch<React.SetStateAction<RecoveryLevel>>;
+  onGoToBaselines: () => void;
   onBack: () => void;
 }
 
 function Dashboard({
-  matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, addPlayer, deletePlayer, movePlayerToSub,
-  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleConsecutiveChange, handleNewSpell, handleRest, handleMarkUnfit,
-  recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, onBack
+  matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, deleteRosterPlayer, movePlayerToSub,
+  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleNewSpell, handleRest, handleMarkUnfit,
+  recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, onGoToBaselines, onBack
 }: DashboardProps) {
-  const [isAdding, setIsAdding] = useState(false);
-  const [newPlayerName, setNewPlayerName] = useState('');
-  const [newPlayerRole, setNewPlayerRole] = useState<Player['role']>('Fast Bowler');
+  const [arTelemetryView, setArTelemetryView] = useState<'batting' | 'bowling'>('batting');
+  const [strainIndex, setStrainIndex] = useState(0);
+  const [isResettingBaselines, setIsResettingBaselines] = useState(false);
+  const [rosterEmptyError, setRosterEmptyError] = useState<string | null>(null);
   const [substitutionRecommendation, setSubstitutionRecommendation] = useState<string | null>(null);
   const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
   const [showRouterSignals, setShowRouterSignals] = useState(false);
@@ -1932,18 +2544,43 @@ function Dashboard({
     setSubstitutionRecommendation(null);
   }, [activePlayer?.id]);
 
-  const handleSavePlayer = () => {
-    if (newPlayerName.trim()) {
-      const isSub = players.length >= 11;
-      addPlayer(newPlayerName, newPlayerRole, isSub, true);
-      setNewPlayerName('');
-      setIsAdding(false);
+  useEffect(() => {
+    if (!activePlayer) return;
+    if (activePlayer.role === 'All-rounder') {
+      setArTelemetryView('batting');
+    }
+  }, [activePlayer?.id, activePlayer?.role]);
+
+  useEffect(() => {
+    setStrainIndex(0);
+  }, [activePlayer?.id]);
+
+  const rosterPlayers = players.filter((p: Player) => p.inRoster !== false);
+  const totalCount = rosterPlayers.length;
+  const hasRosterPlayers = rosterPlayers.length > 0;
+  const isRosterFull = totalCount >= MAX_ROSTER;
+
+  const handleResetBaselines = async () => {
+    setRosterEmptyError(null);
+    setIsResettingBaselines(true);
+    try {
+      await resetBaselines();
+      const response = await getBaselinesWithMeta();
+      writeBaselinesToStorage(response.baselines);
+    } catch (error) {
+      setRosterEmptyError(error instanceof Error ? error.message : 'Failed to reset baselines.');
+    } finally {
+      setIsResettingBaselines(false);
     }
   };
 
   const handleRemoveActive = () => {
+    if (!activePlayer) return;
     setSubstitutionRecommendation(`⚠️ URGENT: ${activePlayer.name} marked unfit. Immediate substitution recommended.`);
     movePlayerToSub(activePlayer.id);
+  };
+  const removeFromRoster = (playerId: string) => {
+    void deleteRosterPlayer(playerId);
   };
 
   const handleDismissAnalysis = () => {
@@ -1953,13 +2590,54 @@ function Dashboard({
     onDismissAnalysis?.();
   };
 
-  const totalCount = players.filter((p: Player) => p.inRoster !== false).length;
-  const isMaxed = totalCount >= 13;
-  const isBatsmanActive = activePlayer?.role === 'Batsman';
+  const telemetryView: 'batting' | 'bowling' = activePlayer?.role === 'Batsman'
+    ? 'batting'
+    : activePlayer?.role === 'All-rounder'
+      ? arTelemetryView
+      : 'bowling';
+  const isBatsmanActive = telemetryView === 'batting';
 
   const totalBalls = totalBallsFromOvers(matchState.totalOvers);
   const ballsBowled = Math.min(totalBalls, Math.max(0, matchState.ballsBowled));
   const ballsRemaining = Math.max(totalBalls - ballsBowled, 0);
+  const formatMaxOvers = activePlayer?.maxOvers ?? getMaxOvers(matchContext.format);
+  const hasFormatCap = formatMaxOvers < 999;
+  const atOversCap = Boolean(activePlayer && activePlayer.overs >= formatMaxOvers);
+  const isQuotaComplete = Boolean(activePlayer && (activePlayer.quotaComplete === true || (hasFormatCap && activePlayer.overs >= formatMaxOvers)));
+  const isMedicalCritical = Boolean(activePlayer && (activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical'));
+  const showQuotaLockState = isQuotaComplete && !isMedicalCritical;
+  const clampedStrainIndex = Math.max(0, Math.min(5, strainIndex));
+  const isStrainMax = clampedStrainIndex >= 5;
+  const strainProgress = (clampedStrainIndex / 5) * 100;
+  const strainTone = clampedStrainIndex >= 4 ? 'high' : clampedStrainIndex >= 2 ? 'moderate' : 'low';
+  const strainStatusText = strainTone === 'high'
+    ? 'HIGH RISK'
+    : strainTone === 'moderate'
+      ? 'MODERATE STRAIN'
+      : 'LOW STRESS';
+  const strainStrokeClass = strainTone === 'high'
+    ? 'text-rose-400'
+    : strainTone === 'moderate'
+      ? 'text-amber-300'
+      : 'text-emerald-400';
+  const strainTextClass = strainTone === 'high'
+    ? 'text-rose-300'
+    : strainTone === 'moderate'
+      ? 'text-amber-200'
+      : 'text-emerald-300';
+  const strainBadgeClass = strainTone === 'high'
+    ? 'border-rose-400/35 bg-rose-500/12 text-rose-200'
+    : strainTone === 'moderate'
+      ? 'border-amber-300/35 bg-amber-500/12 text-amber-200'
+      : 'border-emerald-300/35 bg-emerald-500/12 text-emerald-200';
+  const strainCardClass = strainTone === 'high'
+    ? 'border-rose-500/45 shadow-[0_0_26px_rgba(244,63,94,0.20)]'
+    : strainTone === 'moderate'
+      ? 'border-amber-400/35 shadow-[0_0_22px_rgba(251,191,36,0.14)]'
+      : 'border-emerald-500/30 shadow-[0_0_20px_rgba(16,185,129,0.12)]';
+  const applyStrainDelta = (delta: number) => {
+    setStrainIndex((prev) => Math.max(0, Math.min(5, prev + delta)));
+  };
   const overStr = formatOverStr(ballsBowled);
   const oversFaced = ballsBowled / 6;
   const currentRunRate = ballsBowled > 0 ? matchState.runs / oversFaced : 0;
@@ -2073,11 +2751,11 @@ function Dashboard({
                 : 'LOW',
           action:
             aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
-              ? 'Immediate substitution advised. Remove from active spell now.'
+              ? 'Immediate substitution advised. Remove from active workload quota now.'
               : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
                 ? 'Rotate bowler for next over.'
                 : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
-                  ? 'No immediate change; manage spell length and monitor trend.'
+                  ? 'No immediate change; manage remaining quota and monitor trend.'
                   : 'No change, continue and monitor trend.',
           reasons: [
             aiAnalysis.headline,
@@ -2089,6 +2767,80 @@ function Dashboard({
   const handleAddBoundary = (boundary: '4' | '6') => {
     if (!activePlayer) return;
     updatePlayer(activePlayer.id, { boundaryEvents: [...boundaryEvents, boundary] });
+  };
+
+  const StrainIndexCard = () => {
+    console.log('StrainIndexCard rendered');
+    const radius = 46;
+    const circumference = 2 * Math.PI * radius;
+    const strokeOffset = circumference - (strainProgress / 100) * circumference;
+    const strainButtonBase =
+      'inline-flex w-full cursor-pointer select-none items-center justify-center rounded-full px-6 py-2 text-[11px] font-semibold shadow-sm transition-all duration-200 active:scale-95 focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45';
+
+    return (
+        <div className={`bg-[#162032] rounded-xl p-5 border text-center relative transition-all h-full min-h-[12rem] flex flex-col ${strainCardClass}`}>
+          <div className="mt-3 text-sm font-bold uppercase tracking-wide text-slate-300">Strain Index</div>
+        <div className="h-[14px]" aria-hidden="true" />
+        <div className="flex flex-1 flex-col items-center justify-center py-2">
+          <div className="relative h-32 w-32">
+            <svg className="h-full w-full -rotate-90" viewBox="0 0 120 120">
+              <circle cx="60" cy="60" r={radius} className="stroke-slate-700/70" strokeWidth="10" fill="transparent" />
+              <motion.circle
+                cx="60"
+                cy="60"
+                r={radius}
+                className={strainStrokeClass}
+                stroke="currentColor"
+                strokeWidth="10"
+                strokeLinecap="round"
+                fill="transparent"
+                strokeDasharray={circumference}
+                animate={{ strokeDashoffset: strokeOffset }}
+                transition={{ duration: 0.26, ease: 'easeOut' }}
+              />
+            </svg>
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className={`text-5xl font-mono font-semibold leading-none ${strainTextClass}`}>{clampedStrainIndex}/5</div>
+            </div>
+          </div>
+          <span className={`mt-3 inline-flex items-center rounded-full border px-2.5 py-0.5 text-[10px] font-semibold tracking-wide ${strainBadgeClass}`}>
+            {strainStatusText}
+          </span>
+          <div className="min-h-[18px] mt-2 flex items-center justify-center">
+            {isStrainMax && (
+              <span className="inline-flex items-center rounded-full border border-amber-300/35 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold text-amber-200">
+                Max
+              </span>
+            )}
+          </div>
+          <div className="mt-3 grid w-full grid-cols-3 gap-4">
+            <button
+              type="button"
+              onClick={() => applyStrainDelta(1)}
+              disabled={isStrainMax}
+              className={`${strainButtonBase} bg-emerald-500/10 border border-emerald-400/30 text-emerald-200 hover:bg-emerald-500/20 hover:border-emerald-400/60 hover:shadow-[0_0_18px_rgba(16,185,129,0.25)] focus-visible:ring-emerald-400/45`}
+            >
+              Minor
+            </button>
+            <button
+              type="button"
+              onClick={() => applyStrainDelta(2)}
+              disabled={isStrainMax}
+              className={`${strainButtonBase} bg-emerald-500/15 border border-emerald-400/40 text-white hover:bg-emerald-500/25 hover:shadow-[0_0_22px_rgba(16,185,129,0.35)] focus-visible:ring-emerald-400/45`}
+            >
+              Heavy
+            </button>
+            <button
+              type="button"
+              onClick={() => setStrainIndex(0)}
+              className={`${strainButtonBase} bg-rose-500/10 border border-rose-400/30 text-rose-200 hover:bg-rose-500/20 hover:border-rose-400/60 hover:shadow-[0_0_18px_rgba(244,63,94,0.25)] focus-visible:ring-rose-400/35`}
+            >
+              Reset
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   const handleTacticalScroll = () => {
@@ -2207,107 +2959,89 @@ function Dashboard({
           <div className="bg-[#0F172A] border border-white/5 rounded-2xl h-full min-h-0 flex-1 flex flex-col overflow-hidden">
             <div className="px-5 py-6 border-b border-white/5 bg-slate-900/50 flex items-center justify-between">
                <h3 className="text-sm dashboard-panel-title-tall font-bold text-slate-400 flex items-center gap-2">
-                 <Users className="w-5 h-5 dashboard-icon-tall" /> Roster ({totalCount}/13)
+                 <Users className="w-5 h-5 dashboard-icon-tall" /> Roster ({totalCount}/{MAX_ROSTER})
                </h3>
-               {totalCount > 11 && (
-                 <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded border border-amber-500/20">Subs Active</span>
+               {isRosterFull && (
+                 <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded border border-amber-500/20">
+                   Full
+                 </span>
                )}
             </div>
             
             <div className="px-4 py-5 space-y-3 flex-1 min-h-0 overflow-y-auto">
-              {players.filter((p: Player) => p.inRoster !== false).map((player: Player, index: number) => {
-                const isSub = index >= 11;
+              {hasRosterPlayers ? rosterPlayers.map((player: Player) => {
+                const isSelected = activePlayer?.id === player.id;
                 return (
                   <div key={player.id} className="relative group">
                     <button
                       onClick={() => setActivePlayerId(player.id)}
                       className={`w-full flex items-center gap-3 p-3 rounded-xl transition-all border text-left ${
-                        activePlayer.id === player.id 
+                        isSelected
                           ? 'bg-emerald-500/10 border-emerald-500/50' 
                           : 'bg-transparent border-transparent hover:bg-white/5'
                       }`}
                     >
                       <div className={`w-8 h-8 dashboard-avatar-tall rounded-full flex items-center justify-center text-xs font-bold shadow-lg shrink-0 ${
-                        activePlayer.id === player.id ? 'bg-emerald-500 text-black' : 'bg-slate-800 text-slate-400 group-hover:bg-slate-700'
+                        isSelected ? 'bg-emerald-500 text-black' : 'bg-slate-800 text-slate-400 group-hover:bg-slate-700'
                       }`}>
                         {player.name.charAt(0)}
                       </div>
                       <div className="min-w-0 flex-1">
-                        <div className={`font-semibold text-sm dashboard-roster-name-tall ${activePlayer.id === player.id ? 'text-white' : 'text-slate-300'}`}>
+                        <div className={`font-semibold text-sm dashboard-roster-name-tall ${isSelected ? 'text-white' : 'text-slate-300'}`}>
                           <div className="flex items-center min-w-0">
                             <span className="truncate">{player.name}</span>
                             {player.isUnfit && <span className="ml-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500 animate-pulse shadow-[0_0_10px_rgba(239,68,68,0.75)]" />}
                           </div>
-                          {isSub && <span className="text-[10px] text-amber-500 ml-1 shrink-0">(Sub)</span>}
                         </div>
                         <div className="text-[10px] dashboard-roster-role-tall uppercase font-bold text-slate-500 truncate">{player.role}</div>
                       </div>
                       {/* Only show Chevron if not hovering (to avoid clash with delete) or just keep it simple */}
-                      {activePlayer.id === player.id && <ChevronRight className="w-5 h-5 text-emerald-500 ml-auto shrink-0 group-hover:hidden" />}
+                      {isSelected && <ChevronRight className="w-5 h-5 text-emerald-500 ml-auto shrink-0 group-hover:hidden" />}
                     </button>
                     
                     {/* Delete Button (Hover) */}
                     <button 
-                      onClick={(e) => { e.stopPropagation(); deletePlayer(player.id); }}
+                      onClick={(e) => { e.stopPropagation(); removeFromRoster(player.baselineId || player.id); }}
                       className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg bg-rose-500/20 text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-rose-500 hover:text-white"
                     >
                       <Trash2 className="w-5 h-5" />
                     </button>
                   </div>
                 );
-              })}
-
-              {/* Add Player Form/Button */}
-              {!isMaxed && (
-                <div className="mt-2 pt-2 border-t border-white/5">
-                  {!isAdding ? (
-                    <button 
-                      onClick={() => setIsAdding(true)}
-                      className="w-full py-3 rounded-xl border border-dashed border-slate-700 text-slate-500 hover:text-white hover:border-emerald-500/50 hover:bg-emerald-500/5 transition-all flex items-center justify-center gap-2 text-sm font-medium"
+              }) : (
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-center">
+                  <p className="text-sm font-semibold text-slate-200">No players yet</p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Add your first player profile from the Add Player button below.
+                  </p>
+                  <div className="mt-4 flex flex-col gap-2">
+                    <button
+                      onClick={handleResetBaselines}
+                      disabled={isResettingBaselines}
+                      className="w-full rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs font-bold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                      <UserPlus className="w-5 h-5" /> Add Player
+                      {isResettingBaselines ? 'Resetting...' : 'Reset Baselines'}
                     </button>
-                  ) : (
-                    <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-700 animate-in fade-in slide-in-from-top-2">
-                      <div className="space-y-3">
-                        <input 
-                          autoFocus
-                          placeholder="Player Name"
-                          value={newPlayerName}
-                          onChange={(e) => setNewPlayerName(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
-                        />
-                        <select 
-                          value={newPlayerRole}
-                          onChange={(e) => setNewPlayerRole(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
-                        >
-                          <option value="Bowler">Bowler</option>
-                          <option value="Fast Bowler">Fast Bowler</option>
-                          <option value="Spinner">Spinner</option>
-                          <option value="Batsman">Batsman</option>
-                          <option value="All-rounder">All-rounder</option>
-                        </select>
-                        <div className="flex gap-2">
-                          <button 
-                            onClick={handleSavePlayer}
-                            disabled={!newPlayerName.trim()}
-                            className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white py-1.5 rounded-lg text-xs font-bold transition-colors disabled:opacity-50"
-                          >
-                            Save
-                          </button>
-                          <button 
-                            onClick={() => setIsAdding(false)}
-                            className="px-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors"
-                          >
-                            <X className="w-5 h-5" />
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
+                  </div>
+                  {rosterEmptyError && <p className="mt-3 text-[11px] text-rose-300">{rosterEmptyError}</p>}
                 </div>
               )}
+
+              <div className="mt-2 pt-2 border-t border-white/5">
+                <button
+                  onClick={onGoToBaselines}
+                  disabled={isRosterFull}
+                  title={isRosterFull ? `Roster is full (${MAX_ROSTER}/${MAX_ROSTER}).` : 'Open baselines to add a player.'}
+                  className="w-full py-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-all text-sm font-medium disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {isRosterFull ? `Roster Full (${MAX_ROSTER}/${MAX_ROSTER})` : 'Add Player'}
+                </button>
+                {isRosterFull && (
+                  <p className="mb-2 text-[11px] text-amber-300 text-center">
+                    Roster full. Deactivate a player in Baselines before adding another.
+                  </p>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -2315,7 +3049,7 @@ function Dashboard({
         {/* CENTER: METRICS */}
         <div className="lg:col-span-6 flex flex-col gap-4 min-h-0 h-full">
           <div className={`bg-[#0F172A] border rounded-2xl h-full min-h-0 flex-1 px-6 py-6 dashboard-center-panel-y relative flex flex-col overflow-hidden transition-all duration-500 ${
-            (activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High')
+            (activePlayer && (activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical'))
               ? 'border-rose-500/50 shadow-[0_0_30px_rgba(225,29,72,0.15)]' 
               : 'border-white/5'
           }`}>
@@ -2325,9 +3059,9 @@ function Dashboard({
             <div className="flex justify-between items-start mb-8 relative z-10 shrink-0">
               <div>
                  <div className="flex items-center gap-2 mb-1">
-                   <Activity className={`w-6 h-6 dashboard-icon-tall-lg ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500 animate-pulse' : 'text-emerald-400'}`} />
-                   <span className={`text-base font-bold uppercase tracking-widest ${activePlayer && activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-emerald-400'}`}>
-                     {activePlayer?.role === 'Batsman' ? 'Batsman Live Telemetry' : 'Bowler Live Telemetry'}
+                   <Activity className={`w-6 h-6 dashboard-icon-tall-lg ${activePlayer && (activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500 animate-pulse' : 'text-emerald-400'}`} />
+                   <span className={`text-base font-bold uppercase tracking-widest ${activePlayer && (activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500' : 'text-emerald-400'}`}>
+                     {telemetryView === 'batting' ? 'Batsman Live Telemetry' : 'Bowler Live Telemetry'}
                    </span>
                  </div>
                  <h2 className="text-3xl dashboard-main-heading-tall font-bold text-white">{activePlayer ? activePlayer.name : 'Select Player'}</h2>
@@ -2339,11 +3073,36 @@ function Dashboard({
               )}
             </div>
 
+            {activePlayer?.role === 'All-rounder' && (
+              <div className="relative z-10 mb-4">
+                <div className="inline-flex rounded-lg border border-white/10 bg-slate-900/40 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setArTelemetryView('batting')}
+                    className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${
+                      arTelemetryView === 'batting' ? 'bg-emerald-500/20 text-emerald-300' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Batting View
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setArTelemetryView('bowling')}
+                    className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${
+                      arTelemetryView === 'bowling' ? 'bg-emerald-500/20 text-emerald-300' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Bowling View
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Main Stats Panels */}
             <div className="relative z-10 flex-1 min-h-0 overflow-y-auto overscroll-contain pr-2">
               {activePlayer ? (
               <AnimatePresence mode="wait" initial={false}>
-                {activePlayer.role === 'Batsman' ? (
+                {telemetryView === 'batting' ? (
                   <motion.div
                     key="batsman-telemetry"
                     initial={{ opacity: 0, y: 8 }}
@@ -2555,7 +3314,18 @@ function Dashboard({
                     transition={{ duration: 0.2 }}
                     className="min-h-0 flex flex-col"
                   >
-                  {(activePlayer.status === 'EXCEEDED LIMIT' || activePlayer.injuryRisk === 'High') && (
+                  {showQuotaLockState && (
+                    <div className="mb-6 bg-purple-500/10 border border-purple-500/30 rounded-xl p-4 flex items-center gap-4 animate-in fade-in slide-in-from-top-4 backdrop-blur-md shadow-2xl shadow-purple-900/10">
+                      <div className="w-10 h-10 rounded-full bg-purple-500/20 flex items-center justify-center border border-purple-500/30 shrink-0">
+                        <Shield className="w-5 h-5 text-purple-300" />
+                      </div>
+                      <div>
+                        <h4 className="text-sm font-bold text-purple-300 uppercase tracking-wide">Overs quota completed</h4>
+                        <p className="text-xs text-purple-200/75 mt-0.5">Overs quota completed - player cannot bowl further in this format.</p>
+                      </div>
+                    </div>
+                  )}
+                  {!showQuotaLockState && isMedicalCritical && (
                     <div className="mb-6 bg-rose-950/40 border border-rose-500/30 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4 animate-in fade-in slide-in-from-top-4 backdrop-blur-md shadow-2xl shadow-rose-900/10">
                       <div className="flex items-center gap-4 w-full sm:w-auto">
                         <div className="w-10 h-10 rounded-full bg-rose-500/20 flex items-center justify-center border border-rose-500/30 shrink-0 animate-pulse">
@@ -2579,47 +3349,33 @@ function Dashboard({
                   )}
 
                   <div className="grid grid-cols-2 gap-4 mb-8">
-                    <div className={`bg-[#162032] rounded-xl p-5 border text-center relative group transition-all ${activePlayer.injuryRisk === 'High' ? 'border-rose-500/50 shadow-[0_0_15px_rgba(244,63,94,0.1)]' : 'border-white/5'}`}>
-                      <div className={`text-xs font-bold uppercase mb-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-400' : 'text-slate-500'}`}>Overs Bowled</div>
-                      <div className={`text-5xl font-mono font-medium mb-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-white'}`}>{activePlayer.overs}</div>
-                      <div className="flex justify-center gap-4 mt-2 opacity-100 transition-opacity">
-                        <button
-                          onClick={handleDecreaseOver}
-                          disabled={activePlayer.isSub || activePlayer.isUnfit}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
-                        >
-                          <Minus className="w-5 h-5" />
-                        </button>
-                        <button
-                          onClick={handleAddOver}
-                          disabled={activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center shadow-lg transition-all ${activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none' : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
-                        >
-                          <Plus className="w-5 h-5" />
-                        </button>
+                    <div data-testid="overs-bowled" className={`bg-[#162032] rounded-xl p-6 md:p-7 border text-center relative group transition-all h-full min-h-[13.5rem] flex flex-col ${showQuotaLockState ? 'border-purple-500/40 shadow-[0_0_15px_rgba(168,85,247,0.14)]' : isMedicalCritical ? 'border-rose-500/50 shadow-[0_0_15px_rgba(244,63,94,0.1)]' : 'border-white/5'}`}>
+                      <div className="flex flex-1 w-full flex-col items-center justify-center gap-3">
+                        <div className={`text-sm font-bold uppercase tracking-wide ${showQuotaLockState ? 'text-purple-300' : isMedicalCritical ? 'text-rose-400' : 'text-slate-500'}`}>Overs Bowled</div>
+                        <div data-testid="overs-bowled-value" className={`${showQuotaLockState ? 'text-purple-300' : isMedicalCritical ? 'text-rose-500' : 'text-white'} text-5xl font-semibold leading-none`}>{activePlayer.overs}</div>
+                        {hasFormatCap && (
+                          <p className="text-sm text-slate-500">Max {formatMaxOvers} overs</p>
+                        )}
+                        <div className="flex items-center justify-center gap-6 mt-4">
+                          <button
+                            onClick={handleDecreaseOver}
+                            disabled={activePlayer.isSub || activePlayer.isUnfit}
+                            className={`w-12 h-12 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'cursor-pointer bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
+                          >
+                            <Minus className="w-6 h-6" />
+                          </button>
+                          <button
+                            onClick={handleAddOver}
+                            disabled={isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap}
+                            className={`w-12 h-12 rounded-full flex items-center justify-center shadow-lg transition-all ${isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none opacity-40' : 'cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
+                          >
+                            <Plus className="w-6 h-6" />
+                          </button>
+                        </div>
                       </div>
                     </div>
 
-                    <div className={`bg-[#162032] rounded-xl p-5 border text-center relative group transition-all ${activePlayer.injuryRisk === 'High' ? 'border-rose-500/50 shadow-[0_0_15px_rgba(244,63,94,0.1)]' : 'border-white/5'}`}>
-                      <div className={`text-xs font-bold uppercase mb-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-400' : 'text-slate-500'}`}>Consecutive Overs</div>
-                      <div className={`text-5xl font-mono font-medium mb-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : activePlayer.consecutiveOvers > 3 ? 'text-amber-400' : 'text-white'}`}>{activePlayer.consecutiveOvers}</div>
-                      <div className="flex justify-center gap-4 mt-2 opacity-100 transition-opacity">
-                        <button
-                          onClick={() => handleConsecutiveChange(-1)}
-                          disabled={activePlayer.isSub || activePlayer.isUnfit}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
-                        >
-                          <Minus className="w-5 h-5" />
-                        </button>
-                        <button
-                          onClick={() => handleConsecutiveChange(1)}
-                          disabled={activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${activePlayer.injuryRisk === 'High' || activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-700 hover:bg-slate-600 text-white border-slate-600'}`}
-                        >
-                          <Plus className="w-5 h-5" />
-                        </button>
-                      </div>
-                    </div>
+                    <StrainIndexCard />
                   </div>
 
                   <div className="h-px bg-gradient-to-r from-transparent via-slate-700 to-transparent my-2" />
@@ -2627,10 +3383,10 @@ function Dashboard({
                   <div className="grid grid-cols-2 gap-x-8 gap-y-6 mt-6">
                     <div>
                       <div className="flex justify-between mb-2">
-                        <label className={`text-[13px] font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
-                          <Activity className={`w-3 h-3 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Fatigue Index (0-10)
+                        <label className={`text-[13px] font-bold flex items-center gap-2 ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500' : 'text-slate-400'}`}>
+                          <Activity className={`w-3 h-3 ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'animate-pulse' : ''}`} /> Fatigue Index (0-10)
                         </label>
-                        <span className={`text-base font-mono ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-white'}`}>{activePlayer.fatigue.toFixed(1)}</span>
+                        <span className={`text-base font-mono ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500' : 'text-white'}`}>{activePlayer.fatigue.toFixed(1)}</span>
                       </div>
                       <div className="h-3 bg-slate-800 rounded-full overflow-hidden">
                         <motion.div
@@ -2681,8 +3437,8 @@ function Dashboard({
 
                     <div>
                       <div className="mb-2 flex items-center justify-between">
-                        <label className={`text-[13px] font-bold flex items-center gap-2 ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : 'text-slate-400'}`}>
-                          <AlertTriangle className={`w-3 h-3 ${activePlayer.injuryRisk === 'High' ? 'animate-pulse' : ''}`} /> Heart Rate Recovery
+                        <label className={`text-[13px] font-bold flex items-center gap-2 ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500' : 'text-slate-400'}`}>
+                          <AlertTriangle className={`w-3 h-3 ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'animate-pulse' : ''}`} /> Heart Rate Recovery
                         </label>
                         <div className="inline-flex items-center rounded-md border border-slate-700 bg-[#162032] p-0.5">
                           <button
@@ -2705,7 +3461,7 @@ function Dashboard({
                         value={recoveryMode === 'manual' ? manualRecovery : activePlayer.hrRecovery}
                         onChange={(e) => setManualRecovery(e.target.value as RecoveryLevel)}
                         disabled={recoveryMode === 'auto'}
-                        className={`w-full bg-[#162032] text-sm rounded-lg px-3 py-2.5 border focus:outline-none ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 border-rose-500/50 bg-rose-500/5' : 'text-white border-slate-700'} ${recoveryMode === 'auto' ? 'opacity-80 cursor-not-allowed' : ''}`}
+                        className={`w-full bg-[#162032] text-sm rounded-lg px-3 py-2.5 border focus:outline-none ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500 border-rose-500/50 bg-rose-500/5' : 'text-white border-slate-700'} ${recoveryMode === 'auto' ? 'opacity-80 cursor-not-allowed' : ''}`}
                       >
                         <option value="Good">Good</option>
                         <option value="Moderate">Moderate</option>
@@ -2713,9 +3469,9 @@ function Dashboard({
                       </select>
                     </div>
 
-                    <div className={`bg-[#162032] p-3 rounded-lg flex items-center justify-between border transition-all duration-300 ${activePlayer.injuryRisk === 'High' ? 'border-rose-500/50 bg-rose-500/10 shadow-[0_0_15px_rgba(244,63,94,0.15)]' : 'border-white/5'}`}>
-                      <span className={`text-sm font-medium ${activePlayer.injuryRisk === 'High' ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>Injury Risk</span>
-                      <span className={`text-sm font-bold text-right ${activePlayer.injuryRisk === 'High' ? 'text-rose-500' : activePlayer.injuryRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
+                    <div className={`bg-[#162032] p-3 rounded-lg flex items-center justify-between border transition-all duration-300 ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'border-rose-500/50 bg-rose-500/10 shadow-[0_0_15px_rgba(244,63,94,0.15)]' : 'border-white/5'}`}>
+                      <span className={`text-sm font-medium ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500 font-bold' : 'text-slate-300'}`}>Injury Risk</span>
+                      <span className={`text-sm font-bold text-right ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500' : activePlayer.injuryRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>
                         {activePlayer.injuryRisk.toUpperCase()}
                       </span>
                     </div>
@@ -2758,7 +3514,7 @@ function Dashboard({
                       <FatigueForecastChart
                         currentFatigue={activePlayer.fatigue}
                         intensity={matchContext.pitch || matchContext.phase || 'Medium'}
-                        consecutiveOvers={activePlayer.consecutiveOvers ?? 0}
+                        consecutiveOvers={0}
                         heartRateRecovery={activePlayer.hrRecovery ?? 'Good'}
                       />
                     </div>
@@ -2767,9 +3523,14 @@ function Dashboard({
                 )}
               </AnimatePresence>
               ) : (
-                 <div className="flex flex-1 min-h-0 flex-col items-center justify-center text-slate-500">
+                 <div className="flex flex-1 min-h-0 flex-col items-center justify-center text-center text-slate-500">
                    <Users className="w-14 h-14 mb-4 opacity-50" />
-                   <p>Select a player from the roster to view metrics.</p>
+                   <p className="text-slate-300 font-medium">
+                     {hasRosterPlayers ? 'Select a player from the roster to view telemetry.' : 'No players yet'}
+                   </p>
+                   <p className="mt-2 text-xs text-slate-500">
+                     {hasRosterPlayers ? 'Telemetry controls are disabled until a player is selected.' : 'Add a player or reset baselines to enable telemetry controls.'}
+                   </p>
                  </div>
               )}
             </div>
@@ -2861,7 +3622,7 @@ function Dashboard({
                                 rel="noreferrer"
                                 className="mt-1 inline-block text-[11px] text-cyan-200 underline decoration-cyan-300/40 hover:text-cyan-100"
                               >
-                                Check /api/health
+                                Check /health
                               </a>
                             </div>
                           </div>
@@ -2876,7 +3637,7 @@ function Dashboard({
                                 rel="noreferrer"
                                 className="mt-1 inline-block text-[11px] text-cyan-200 underline decoration-cyan-300/40 hover:text-cyan-100"
                               >
-                                Check /api/health
+                                Check /health
                               </a>
                             </div>
                           </div>
@@ -3097,7 +3858,21 @@ function Dashboard({
                   )}
                 </>
               ) : (
-                <div className="mt-8 text-slate-500 text-sm">Select a player to analyze</div>
+                <div className="flex-1 min-h-0 flex flex-col items-center justify-center text-center">
+                  <p className="text-sm text-slate-300 font-medium">
+                    {hasRosterPlayers ? 'Select a player to analyze' : 'No players available'}
+                  </p>
+                  <p className="mt-2 text-xs text-slate-500">
+                    {hasRosterPlayers ? 'Run Coach Agent will be enabled after player selection.' : 'Add players or reset baselines to run coach analysis.'}
+                  </p>
+                  <button
+                    type="button"
+                    disabled
+                    className="mt-5 w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white bg-slate-700/70 opacity-70 cursor-not-allowed"
+                  >
+                    <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                  </button>
+                </div>
               )}
             </div>
 
@@ -3137,23 +3912,607 @@ function Dashboard({
 }
 
 interface BaselinesProps {
-  players: Player[];
-  updatePlayer: (id: string, updates: Partial<Player>) => void;
-  addPlayer: (name: string, role: Player['role'], isSub?: boolean, inRoster?: boolean) => void;
-  deletePlayer: (id: string) => void;
+  baselineSource: 'cosmos' | 'fallback';
+  baselineWarning: string | null;
+  onBaselinesSynced: (
+    baselines: Baseline[],
+    source: 'cosmos' | 'fallback',
+    warning?: string,
+    options?: { persist?: boolean; addToRosterIds?: string[] }
+  ) => void;
+  matchRosterIds: string[];
+  onMatchRosterIdsChange: (nextIds: string[]) => void;
   onBack: () => void;
 }
 
-function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: BaselinesProps) {
+interface BaselineDraftRow {
+  _localId: string;
+  _isDraft: boolean;
+  id?: string;
+  name: string;
+  role: BaselineRole;
+  active: boolean;
+  inRoster: boolean;
+  sleep: number;
+  recovery: number;
+  fatigueLimit: number;
+  control: number;
+  speed: number;
+  power: number;
+  orderIndex?: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+const createDraftRowKey = (): string => {
+  const generator = globalThis.crypto?.randomUUID;
+  if (typeof generator === 'function') {
+    return generator.call(globalThis.crypto);
+  }
+  return `row-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+const baselineToDraftRow = (baseline: Baseline, rosterIdSet?: Set<string>): BaselineDraftRow => {
+  const normalized = normalizeBaselineRecord(baseline);
+  const name = String(normalized.name || normalized.playerId || normalized.id || '').trim();
+  const persistedId = String(normalized.id || normalized.playerId || name).trim();
+  const resolvedRosterKey = baselineKey(persistedId || name);
+  return {
+    _localId: persistedId || `draft-${createDraftRowKey()}`,
+    _isDraft: false,
+    id: persistedId || undefined,
+    name,
+    role: normalized.role,
+    active: Boolean(normalized.isActive),
+    inRoster: Boolean(rosterIdSet?.has(resolvedRosterKey)),
+    sleep: clamp(safeNum(normalized.sleepHoursToday, 7), 0, 12),
+    recovery: clamp(safeNum(normalized.recoveryMinutes, 45), 0, 240),
+    fatigueLimit: clamp(safeNum(normalized.fatigueLimit, 6), 0, 10),
+    control: clamp(safeNum(normalized.controlBaseline, 78), 0, 100),
+    speed: clamp(safeNum(normalized.speed, 7), 0, 100),
+    power: clamp(safeNum(normalized.power, 6), 0, 100),
+    orderIndex: parseBaselineOrderIndex(normalized.orderIndex),
+    createdAt: normalized.createdAt,
+    updatedAt: normalized.updatedAt,
+  };
+};
+
+const draftRowToBaseline = (row: BaselineDraftRow): Baseline | null => {
+  const name = String(row.name || '').trim();
+  if (!name) return null;
+  const resolvedId = String(row.id || name).trim();
+
+  return normalizeBaselineRecord({
+    id: resolvedId,
+    playerId: resolvedId,
+    name,
+    role: row.role,
+    isActive: row.active,
+    sleepHoursToday: clamp(safeNum(row.sleep, 7), 0, 12),
+    recoveryMinutes: clamp(safeNum(row.recovery, 45), 0, 240),
+    fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), 0, 10),
+    controlBaseline: clamp(safeNum(row.control, 78), 0, 100),
+    speed: clamp(safeNum(row.speed, 7), 0, 100),
+    power: clamp(safeNum(row.power, 6), 0, 100),
+    orderIndex: parseBaselineOrderIndex(row.orderIndex),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  });
+};
+
+function Baselines({
+  baselineSource,
+  baselineWarning,
+  onBaselinesSynced,
+  matchRosterIds,
+  onMatchRosterIdsChange,
+  onBack,
+}: BaselinesProps) {
   const [activeTooltip, setActiveTooltip] = useState<string | null>(null);
+  const tooltipOpenTimerRef = useRef<number | null>(null);
+  const rosterToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const nameInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const [savedBaselines, setSavedBaselines] = useState<BaselineDraftRow[]>([]);
+  const [draftBaselines, setDraftBaselines] = useState<BaselineDraftRow[]>([]);
+  const [pendingFocusLocalId, setPendingFocusLocalId] = useState<string | null>(null);
+  const [isLoadingBaselines, setIsLoadingBaselines] = useState(true);
+  const [baselineFetchFailed, setBaselineFetchFailed] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [rosterToastMessage, setRosterToastMessage] = useState<string | null>(null);
+  const [runtimeSource, setRuntimeSource] = useState<'cosmos' | 'fallback'>(baselineSource);
+  const [runtimeWarning, setRuntimeWarning] = useState<string | null>(baselineWarning);
+
+  const sortedSignature = (rows: BaselineDraftRow[]): string =>
+    JSON.stringify(
+      rows
+        .map((row) => ({
+          name: String(row.name || ''),
+          role: row.role,
+          active: Boolean(row.active),
+          sleep: clamp(safeNum(row.sleep, 7), 0, 12),
+          recovery: clamp(safeNum(row.recovery, 45), 0, 240),
+          fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), 0, 10),
+          control: clamp(safeNum(row.control, 78), 0, 100),
+          speed: clamp(safeNum(row.speed, 7), 0, 100),
+          power: clamp(safeNum(row.power, 6), 0, 100),
+          orderIndex: parseBaselineOrderIndex(row.orderIndex),
+        }))
+        .map((row) => ({
+          name: row.name,
+          role: row.role,
+          active: row.active,
+          sleep: row.sleep,
+          recovery: row.recovery,
+          fatigueLimit: row.fatigueLimit,
+          control: row.control,
+          speed: row.speed,
+          power: row.power,
+          orderIndex: row.orderIndex,
+        }))
+    );
+
+  const isDirty = sortedSignature(savedBaselines) !== sortedSignature(draftBaselines);
+  const validateDraftBaselines = (rows: BaselineDraftRow[]): string | null => {
+    const seen = new Set<string>();
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const playerName = String(row.name || '').trim();
+      if (!playerName) {
+        return `Row ${index + 1}: Player Name is required.`;
+      }
+      const key = playerName.toLowerCase();
+      if (seen.has(key)) {
+        return `Duplicate player name found: ${playerName}.`;
+      }
+      seen.add(key);
+
+      const sleep = safeNum(row.sleep, Number.NaN);
+      const recovery = safeNum(row.recovery, Number.NaN);
+      const fatigueLimit = safeNum(row.fatigueLimit, Number.NaN);
+      const control = safeNum(row.control, Number.NaN);
+      const speed = safeNum(row.speed, Number.NaN);
+      const power = safeNum(row.power, Number.NaN);
+      if (!Number.isFinite(sleep) || sleep < 0 || sleep > 12) {
+        return `Row ${index + 1}: Sleep must be between 0 and 12.`;
+      }
+      if (!Number.isFinite(recovery) || recovery < 0 || recovery > 240) {
+        return `Row ${index + 1}: Recovery must be between 0 and 240.`;
+      }
+      if (!Number.isFinite(fatigueLimit) || fatigueLimit < 0 || fatigueLimit > 10) {
+        return `Row ${index + 1}: Fatigue Limit must be between 0 and 10.`;
+      }
+      if (!Number.isFinite(control) || control < 0 || control > 100) {
+        return `Row ${index + 1}: Control must be between 0 and 100.`;
+      }
+      if (!Number.isFinite(speed) || speed < 0 || speed > 100) {
+        return `Row ${index + 1}: Speed must be between 0 and 100.`;
+      }
+      if (!Number.isFinite(power) || power < 0 || power > 100) {
+        return `Row ${index + 1}: Power must be between 0 and 100.`;
+      }
+    }
+    return null;
+  };
+
+  const draftRowsToBaselines = (rows: BaselineDraftRow[]): Baseline[] =>
+    rows
+      .map((row) => draftRowToBaseline(row))
+      .filter((row): row is Baseline => Boolean(row));
+
+  const syncDraftToRoster = (rows: BaselineDraftRow[]) => {
+    onBaselinesSynced(
+      draftRowsToBaselines(rows),
+      runtimeSource,
+      runtimeWarning || undefined,
+      { persist: false }
+    );
+  };
+
+  const draftRosterIds = React.useMemo(() => {
+    const seen = new Set<string>();
+    return draftBaselines
+      .filter((row) => row.inRoster === true && row.active === true)
+      .map((row) => normalizeBaselineId(row.id || row.name))
+      .filter((id) => {
+        const key = baselineKey(id);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, MAX_ROSTER);
+  }, [draftBaselines]);
+
+  useEffect(() => {
+    const currentKeys = matchRosterIds.map((id) => baselineKey(id));
+    const nextKeys = draftRosterIds.map((id) => baselineKey(id));
+    if (currentKeys.length === nextKeys.length && currentKeys.every((key, index) => key === nextKeys[index])) {
+      return;
+    }
+    if (import.meta.env.DEV) {
+      console.log('[baselines] roster re-derived', { current: matchRosterIds, next: draftRosterIds });
+    }
+    onMatchRosterIdsChange(draftRosterIds);
+  }, [draftRosterIds, matchRosterIds, onMatchRosterIdsChange]);
+
+  const showRosterToast = (message: string) => {
+    if (rosterToastTimerRef.current) {
+      clearTimeout(rosterToastTimerRef.current);
+      rosterToastTimerRef.current = null;
+    }
+    setRosterToastMessage(message);
+    rosterToastTimerRef.current = setTimeout(() => {
+      setRosterToastMessage(null);
+      rosterToastTimerRef.current = null;
+    }, 2600);
+  };
+
+  const handleRosterToggle = (row: BaselineDraftRow, checked: boolean) => {
+    if (row._isDraft) {
+      showRosterToast('Save changes first to add this player to roster.');
+      return;
+    }
+
+    const resolvedId = normalizeBaselineId(row.id || row.name);
+    if (!resolvedId) {
+      setErrorMessage('Enter player name before adding to roster.');
+      return;
+    }
+    if (checked && row.active !== true) {
+      setErrorMessage('Only globally active players can be added to the current roster.');
+      return;
+    }
+
+    setDraftBaselines((prev) => {
+      const currentRow = prev.find((entry) => entry._localId === row._localId);
+      const wasInRoster = Boolean(currentRow?.inRoster);
+      const currentCount = prev.filter((entry) => entry.inRoster === true && entry.active === true).length;
+      if (checked && !wasInRoster && currentCount >= MAX_ROSTER) {
+        setErrorMessage(`Roster is full (${MAX_ROSTER}/${MAX_ROSTER}).`);
+        return prev;
+      }
+      const nextRows = prev.map((entry) =>
+        entry._localId === row._localId ? { ...entry, inRoster: checked } : entry
+      );
+      if (import.meta.env.DEV) {
+        console.log('[baselines] roster checkbox toggled', {
+          id: resolvedId,
+          checked,
+        });
+      }
+      return nextRows;
+    });
+    setSuccessMessage(null);
+  };
+
+  const loadBaselines = async (showSuccess?: string) => {
+    setIsLoadingBaselines(true);
+    setBaselineFetchFailed(false);
+    setErrorMessage(null);
+    try {
+      const response = await getBaselinesWithMeta();
+      const sourceRows = orderBaselinesForDisplay(response.baselines);
+      const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
+      const normalized = sourceRows.map((row) => baselineToDraftRow(row, rosterIdSet));
+      setSavedBaselines(normalized);
+      setDraftBaselines(normalized.map((row) => ({ ...row })));
+      if (import.meta.env.DEV) {
+        console.log('[baselines] draft reloaded from backend', {
+          source: response.source,
+          count: normalized.length,
+        });
+      }
+      setRuntimeSource(response.source);
+      setRuntimeWarning(
+        response.warning || (response.source === 'fallback' ? 'Cosmos not configured. Using fallback baseline profiles.' : null)
+      );
+      onBaselinesSynced(draftRowsToBaselines(normalized), response.source, response.warning);
+      setBaselineFetchFailed(false);
+      if (showSuccess) setSuccessMessage(showSuccess);
+    } catch (error) {
+      const storedBaselines = readBaselinesFromStorage();
+      const fallbackRows = orderBaselinesForDisplay(storedBaselines !== null ? storedBaselines : getLocalDefaultBaselines());
+      const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
+      const fallback = fallbackRows.map((row) => baselineToDraftRow(row, rosterIdSet));
+      const warning = 'Failed to load baselines from backend. Using local defaults.';
+      setSavedBaselines(fallback);
+      setDraftBaselines(fallback.map((row) => ({ ...row })));
+      if (import.meta.env.DEV) {
+        console.log('[baselines] draft reloaded from fallback', {
+          count: fallback.length,
+        });
+      }
+      setRuntimeSource('fallback');
+      setRuntimeWarning(warning);
+      onBaselinesSynced(draftRowsToBaselines(fallback), 'fallback', warning);
+      setBaselineFetchFailed(true);
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to load baselines.');
+    } finally {
+      setIsLoadingBaselines(false);
+    }
+  };
+
+  useEffect(() => {
+    loadBaselines();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const handlePointerDownOutside = (event: MouseEvent | TouchEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('[data-baseline-tooltip-container="true"]')) return;
+      setActiveTooltip(null);
+    };
+
+    document.addEventListener('mousedown', handlePointerDownOutside);
+    document.addEventListener('touchstart', handlePointerDownOutside);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDownOutside);
+      document.removeEventListener('touchstart', handlePointerDownOutside);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!pendingFocusLocalId) return;
+    const focusTarget = pendingFocusLocalId;
+    requestAnimationFrame(() => {
+      const input = nameInputRefs.current[focusTarget];
+      if (input) {
+        input.focus();
+      }
+    });
+    setPendingFocusLocalId(null);
+  }, [pendingFocusLocalId, draftBaselines]);
+
+  const updateDraft = (localId: string, updates: Partial<BaselineDraftRow>) => {
+    // Keep name as raw editable text during typing; normalize only on save.
+    setDraftBaselines((prev) =>
+      {
+        const nextRows = prev.map((row) => {
+        if (row._localId !== localId) return row;
+        const nextName = updates.name !== undefined ? String(updates.name) : row.name;
+        const trimmedName = nextName.trim();
+        const derivedDraftId = row._isDraft ? (trimmedName.length > 0 ? trimmedName : '') : row.id;
+        const nextInRoster = updates.active === false ? false : row.inRoster;
+        return {
+          ...row,
+          ...updates,
+          name: nextName,
+          id: derivedDraftId,
+          inRoster: nextInRoster,
+        };
+      });
+        syncDraftToRoster(nextRows);
+        return nextRows;
+      }
+    );
+    setSuccessMessage(null);
+  };
+
+  const addDraftPlayer = () => {
+    const localId = createDraftRowKey();
+    const nowIso = new Date().toISOString();
+    setDraftBaselines((prev) => {
+      const nextOrderIndex =
+        prev.reduce((max, row) => Math.max(max, parseBaselineOrderIndex(row.orderIndex)), 0) + 1;
+      const nextRow: BaselineDraftRow = {
+        _localId: localId,
+        _isDraft: true,
+        id: '',
+        name: '',
+        role: 'BAT',
+        active: true,
+        inRoster: false,
+        sleep: 7,
+        recovery: 45,
+        fatigueLimit: 6,
+        control: 78,
+        speed: 7,
+        power: 6,
+        orderIndex: nextOrderIndex,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      const nextRows = [...prev, nextRow];
+      syncDraftToRoster(nextRows);
+      return nextRows;
+    });
+    setPendingFocusLocalId(localId);
+    setSuccessMessage(null);
+  };
+
+  const handleSave = async () => {
+    if (!isDirty || isSaving) return;
+    setIsSaving(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      const validationError = draftValidationError;
+      if (validationError) {
+        setErrorMessage(validationError);
+        return;
+      }
+      const newlyAddedIds = draftBaselines
+        .filter((row) => row._isDraft && row.active === true)
+        .map((row) => normalizeBaselineId(row.id || row.name))
+        .filter((id) => id.length > 0);
+      const payload = draftBaselines
+        .map((row) => ({
+          ...row,
+          orderIndex: parseBaselineOrderIndex(row.orderIndex),
+          updatedAt: new Date().toISOString(),
+        }))
+        .map((row) => draftRowToBaseline(row))
+        .filter((row): row is Baseline => Boolean(row));
+      const saved = await saveBaselines(payload);
+      const orderedSaved = orderBaselinesForDisplay(saved);
+      const rosterIdSet = new Set(draftBaselines.filter((row) => row.inRoster).map((row) => baselineKey(row.id || row.name)));
+      const nextRows = orderedSaved.map((row) => baselineToDraftRow(row, rosterIdSet));
+      setSavedBaselines(nextRows);
+      setDraftBaselines(nextRows.map((row) => ({ ...row })));
+      if (import.meta.env.DEV) {
+        console.log('[baselines] draft replaced after save', { count: nextRows.length });
+      }
+      onBaselinesSynced(orderedSaved, runtimeSource, runtimeWarning || undefined, { addToRosterIds: newlyAddedIds });
+      setSuccessMessage(
+        runtimeSource === 'cosmos' ? 'Saved to Cosmos DB.' : 'Saved baseline changes to local fallback store.'
+      );
+    } catch (error) {
+      const message = error instanceof ApiClientError
+        ? error.message
+        : error instanceof Error
+          ? error.message
+          : 'Failed to save baselines.';
+      setErrorMessage(message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async (row: BaselineDraftRow) => {
+    const playerName = row.name.trim() || row.id || 'this player';
+    if (!window.confirm(`Delete baseline for ${playerName}?`)) return;
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    if (row._isDraft || !row.id) {
+      setDraftBaselines((prev) => {
+        const nextRows = prev.filter((entry) => entry._localId !== row._localId);
+        syncDraftToRoster(nextRows);
+        return nextRows;
+      });
+      return;
+    }
+
+    const previousSaved = savedBaselines;
+    const previousDraft = draftBaselines;
+    const optimisticSaved = previousSaved.filter((entry) => entry._localId !== row._localId);
+    const optimisticDraft = previousDraft.filter((entry) => entry._localId !== row._localId);
+    setSavedBaselines(optimisticSaved);
+    setDraftBaselines(optimisticDraft);
+
+    try {
+      await deleteBaseline(row.id);
+      onBaselinesSynced(draftRowsToBaselines(optimisticSaved), runtimeSource, runtimeWarning || undefined);
+      setSuccessMessage(`Deleted baseline for ${playerName}.`);
+    } catch (error) {
+      setSavedBaselines(previousSaved);
+      setDraftBaselines(previousDraft);
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to delete baseline.');
+    }
+  };
+
+  const handleReset = async () => {
+    if (!window.confirm('This will delete ALL baseline players. Continue?')) return;
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    const previousSaved = savedBaselines;
+    const previousDraft = draftBaselines;
+    try {
+      await resetBaselines();
+      setSavedBaselines([]);
+      setDraftBaselines([]);
+      onBaselinesSynced([], 'cosmos');
+      setRuntimeSource('cosmos');
+      setRuntimeWarning(null);
+      setSuccessMessage('All baseline players were deleted.');
+    } catch (error) {
+      setSavedBaselines(previousSaved);
+      setDraftBaselines(previousDraft);
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to reset database.');
+    }
+  };
+
+  const clearTooltipTimer = () => {
+    if (tooltipOpenTimerRef.current !== null) {
+      window.clearTimeout(tooltipOpenTimerRef.current);
+      tooltipOpenTimerRef.current = null;
+    }
+  };
+
+  useEffect(
+    () => () => {
+      if (tooltipOpenTimerRef.current !== null) {
+        window.clearTimeout(tooltipOpenTimerRef.current);
+      }
+      if (rosterToastTimerRef.current !== null) {
+        window.clearTimeout(rosterToastTimerRef.current);
+      }
+    },
+    []
+  );
+
+  const openTooltipWithDelay = (field: string) => {
+    clearTooltipTimer();
+    tooltipOpenTimerRef.current = window.setTimeout(() => {
+      setActiveTooltip(field);
+      tooltipOpenTimerRef.current = null;
+    }, 140);
+  };
+
+  const closeTooltip = () => {
+    clearTooltipTimer();
+    setActiveTooltip(null);
+  };
 
   const toggleTooltip = (field: string) => {
+    clearTooltipTimer();
     if (activeTooltip === field) {
       setActiveTooltip(null);
     } else {
       setActiveTooltip(field);
     }
   };
+
+  const renderHeaderTooltip = (
+    field: string,
+    label: string,
+    title: string,
+    description: string,
+    align: 'center' | 'right' = 'center',
+    titleIcon?: React.ReactNode
+  ) => {
+    const tooltipPositionClass =
+      align === 'right'
+        ? 'right-0'
+        : 'left-1/2 -translate-x-1/2';
+    const arrowPositionClass =
+      align === 'right'
+        ? 'right-8'
+        : 'left-1/2 -translate-x-1/2';
+
+    return (
+      <div
+        data-baseline-tooltip-container="true"
+        className="relative flex items-center justify-center gap-2"
+        onMouseEnter={() => openTooltipWithDelay(field)}
+        onMouseLeave={closeTooltip}
+      >
+        {label}
+        <button
+          onClick={() => toggleTooltip(field)}
+          className="text-slate-500 hover:text-emerald-400 focus:outline-none transition-colors"
+        >
+          <Info size={14} />
+        </button>
+        {activeTooltip === field && (
+          <div className={`absolute top-full mt-2 ${tooltipPositionClass} w-64 bg-[#020408] border border-emerald-500/30 text-xs text-slate-300 p-3 rounded-lg shadow-2xl z-[100] text-left pointer-events-none font-normal normal-case`}>
+            <div className="font-bold text-emerald-400 mb-1 flex items-center gap-2">
+              {titleIcon}
+              <span>{title}</span>
+            </div>
+            <p className="leading-relaxed">{description}</p>
+            <div className={`absolute -top-1 ${arrowPositionClass} w-2 h-2 bg-[#020408] border-l border-t border-emerald-500/30 rotate-45`} />
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const draftValidationError = validateDraftBaselines(draftBaselines);
+  const disableSave = !isDirty || isSaving || isLoadingBaselines || Boolean(draftValidationError);
 
   return (
     <motion.div 
@@ -3168,126 +4527,193 @@ function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: B
             <GlowingBackButton onClick={onBack} />
           </div>
           <h2 className="text-3xl font-bold text-white">Player Baseline Models</h2>
-          <p className="text-slate-400 mt-1">Fatigue Limit (0-10) represents a player’s baseline capacity from historical data. When live match values exceed this tolerance, fatigue and risk increase.</p>
+          <p className="text-slate-400 mt-1">Changes stay local until Save Changes is clicked. Cosmos DB is the baseline source-of-truth.</p>
         </div>
         <div className="flex gap-4">
-           <button className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-2.5 rounded-lg font-bold shadow-lg shadow-emerald-900/40 transition-all">
-            <Save className="w-4 h-4" /> Save Changes
+          <button
+            onClick={handleReset}
+            className="flex items-center gap-2 bg-rose-700/70 hover:bg-rose-600 text-white px-4 py-2.5 rounded-lg font-bold transition-colors"
+          >
+            Reset Database
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={disableSave}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-bold transition-all ${
+              disableSave
+                ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/40'
+            }`}
+          >
+            <Save className="w-4 h-4" /> {isSaving ? 'Saving...' : 'Save Changes'}
           </button>
         </div>
       </div>
 
+      {!isLoadingBaselines && baselineFetchFailed && (runtimeSource === 'fallback' || runtimeWarning) && (
+        <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-amber-200 text-sm">
+          {runtimeWarning || 'Cosmos DB is unavailable; using fallback baseline profiles.'}
+        </div>
+      )}
+      {errorMessage && (
+        <div className="mb-4 rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-rose-200 text-sm">
+          {errorMessage}
+        </div>
+      )}
+      {successMessage && (
+        <div className="mb-4 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-emerald-200 text-sm">
+          {successMessage}
+        </div>
+      )}
+      {rosterToastMessage && (
+        <div className="fixed bottom-6 right-6 z-[120] rounded-lg border border-slate-500/40 bg-[#0B1324]/95 px-4 py-2.5 text-sm text-slate-100 shadow-2xl backdrop-blur-sm">
+          {rosterToastMessage}
+        </div>
+      )}
+
       <div className="flex-1 bg-[#0F172A] border border-white/5 rounded-2xl overflow-hidden shadow-2xl flex flex-col">
+        {isLoadingBaselines ? (
+          <div className="flex-1 min-h-[460px] flex items-center justify-center px-6">
+            <div className="flex flex-col items-center justify-center text-center">
+              <div className="h-12 w-12 rounded-full border-2 border-slate-500/35 border-t-emerald-400 animate-spin" />
+              <p className="mt-4 text-sm text-slate-400">Loading players...</p>
+            </div>
+          </div>
+        ) : (
          <div className="overflow-auto flex-1">
-           <table className="w-full text-left border-collapse min-w-[1000px]">
+           <table className="w-full text-left border-collapse min-w-[1300px]">
              <thead>
                <tr className="bg-slate-900/80 border-b border-white/5 text-xs font-bold text-slate-400 uppercase tracking-wider sticky top-0 z-10 backdrop-blur-md">
-                 <th className="px-6 py-5 w-[15%]">Player Name</th>
-                 <th className="px-6 py-5 w-[12%]">Role</th>
-                 <th className="px-4 py-5 text-center w-[12%] relative group/th">
-                   <div className="flex items-center justify-center gap-2">
-                     Fatigue Limit (0-10)
-                     <button 
-                       onClick={() => toggleTooltip('fatigue')}
-                       className="text-slate-500 hover:text-emerald-400 focus:outline-none transition-colors"
-                     >
-                       <Info size={14} />
-                     </button>
-                   </div>
-                   {activeTooltip === 'fatigue' && (
-                      <div className="absolute top-full mt-2 left-1/2 -translate-x-1/2 w-64 bg-[#020408] border border-emerald-500/30 text-xs text-slate-300 p-3 rounded-lg shadow-2xl z-[100] text-left pointer-events-none font-normal normal-case">
-                          <div className="font-bold text-emerald-400 mb-1 flex items-center gap-2"><Activity size={12}/> Fatigue Threshold</div>
-                          <p className="leading-relaxed">Baseline fatigue tolerance value. Higher values indicate greater capacity to handle match load before risk increases.</p>
-                          <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-[#020408] border-l border-t border-emerald-500/30 rotate-45"></div>
-                      </div>
+                 <th className="px-4 py-5 w-[8%]">ID</th>
+                 <th className="px-6 py-5 w-[16%]">Player Name</th>
+                 <th className="px-4 py-5 text-center w-[9%]">Role</th>
+                 <th className="px-4 py-5 text-center w-[8%]">Roster</th>
+                 <th className="px-4 py-5 text-center w-[10%]">Sleep (Hrs)</th>
+                 <th className="px-4 py-5 text-center w-[10%] relative group/th">
+                   {renderHeaderTooltip(
+                     'recovery',
+                     'Recovery (Min)',
+                     'Recovery Time',
+                     'Minutes required for player to recover between spells.',
+                     'right',
+                     <Wind size={12} />
                    )}
                  </th>
-                 <th className="px-4 py-5 text-center w-[12%] text-indigo-400">Sleep (Hrs)</th>
-                 <th className="px-4 py-5 text-center w-[12%] relative group/th">
-                   <div className="flex items-center justify-center gap-2">
-                     Recovery (Min)
-                     <button 
-                       onClick={() => toggleTooltip('recovery')}
-                       className="text-slate-500 hover:text-emerald-400 focus:outline-none transition-colors"
-                     >
-                       <Info size={14} />
-                     </button>
-                   </div>
-                   {activeTooltip === 'recovery' && (
-                      <div className="absolute top-full mt-2 right-0 w-64 bg-[#020408] border border-emerald-500/30 text-xs text-slate-300 p-3 rounded-lg shadow-2xl z-[100] text-left pointer-events-none font-normal normal-case">
-                          <div className="font-bold text-emerald-400 mb-1 flex items-center gap-2"><Wind size={12}/> Recovery Time</div>
-                          <p className="leading-relaxed">Number of minutes needed for this player to recover fully from fatigue.</p>
-                          <div className="absolute -top-1 right-8 w-2 h-2 bg-[#020408] border-l border-t border-emerald-500/30 rotate-45"></div>
-                      </div>
+                 <th className="px-4 py-5 text-center w-[10%] relative group/th">
+                   {renderHeaderTooltip(
+                     'fatigue',
+                     'Fatigue Limit (0-10)',
+                     'Fatigue Threshold',
+                     'Baseline fatigue tolerance value. Higher values indicate greater capacity to handle match load before risk increases.',
+                     'center',
+                     <Activity size={12} />
                    )}
                  </th>
-                 <th className="px-6 py-5 text-right w-[20%]">Status</th>
-                 <th className="px-4 py-5 text-center w-[10%]">Roster</th>
+                 <th className="px-4 py-5 text-center w-[8%] relative group/th">
+                   {renderHeaderTooltip(
+                     'control',
+                     'Control',
+                     'Control Baseline',
+                     'Higher control indicates better accuracy and consistency. Strong signal for spin bowlers and line-and-length discipline.'
+                   )}
+                 </th>
+                 <th className="px-4 py-5 text-center w-[7%] relative group/th">
+                   {renderHeaderTooltip(
+                     'speed',
+                     'Speed',
+                     'Speed Baseline',
+                     'Higher speed indicates fast-bowling pace and raw velocity. Key metric for fast bowlers.'
+                   )}
+                 </th>
+                 <th className="px-4 py-5 text-center w-[7%] relative group/th">
+                   {renderHeaderTooltip(
+                     'power',
+                     'Power',
+                     'Power Baseline',
+                     'Higher power indicates batting strength and boundary-hitting ability. Most relevant for batsmen and all-rounders.'
+                   )}
+                 </th>
+                 <th className="px-6 py-5 text-right w-[15%]">Status</th>
                  <th className="px-4 py-5 w-[5%]"></th>
                </tr>
              </thead>
-             <tbody className="divide-y divide-white/5 text-sm">
-               {players.map((p: Player) => {
-                  const isActive = p.isActive !== false;
-                  // Determine status based on configuration safety
-                  let status = { label: "Within Safe Range", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20" };
-                  
-                  if (!isActive) {
-                    status = { label: "Inactive", color: "text-slate-300 bg-slate-700/40 border-slate-500/40" };
-                  } else if ((p.sleepHours || 0) < 5 || p.baselineFatigue > 9) {
-                    status = { label: "Risk Threshold Exceeded", color: "text-rose-400 bg-rose-500/10 border-rose-500/20" };
-                  } else if ((p.sleepHours || 0) < 6 || p.baselineFatigue > 8) {
-                    status = { label: "Approaching Limit", color: "text-amber-400 bg-amber-500/10 border-amber-500/20" };
-                  }
-
-                  return (
-                 <tr key={p.id} className="group hover:bg-white/[0.02] transition-colors">
-                   <td className="px-6 py-4">
-                     <div className="flex flex-col">
-                       <input 
-                         type="text" 
-                         value={p.name}
-                         onChange={(e) => updatePlayer(p.id, { name: e.target.value })}
-                         className="bg-transparent text-white font-bold focus:outline-none border-b border-transparent focus:border-emerald-500 py-1 transition-colors w-full"
-                       />
-                       {players.indexOf(p) >= 11 && <span className="text-[10px] text-amber-500 uppercase font-bold mt-1">Substitute</span>}
+	             <tbody className="divide-y divide-white/5 text-sm">
+	               {(!baselineFetchFailed && draftBaselines.length === 0) ? (
+                 <tr>
+                   <td colSpan={12} className="px-6 py-16">
+                     <div className="flex flex-col items-center justify-center text-center">
+                       <p className="text-lg font-semibold text-slate-200">No baseline players yet</p>
+                       <p className="mt-2 text-sm text-slate-400">
+                         Add a baseline player or Reset Database to restore defaults.
+                       </p>
                      </div>
                    </td>
+                 </tr>
+	               ) : (
+                 draftBaselines.map((p) => {
+                  const isGloballyActive = p.active === true;
+                  const isActive = p.inRoster === true;
+                  const isPersisted = !p._isDraft;
+                  const trimmedName = p.name.trim();
+                  const idDisplay = p._isDraft
+                    ? (trimmedName ? trimmedName : '—')
+                    : (p.id || trimmedName || '—');
+                  const rosterStatus = isActive
+                    ? { label: 'In roster', color: 'text-indigo-200 bg-indigo-500/15 border-indigo-400/35' }
+                    : { label: 'Not in roster', color: 'text-slate-300 bg-slate-700/30 border-slate-600/40' };
+
+                  return (
+                 <tr key={p._localId} className="group hover:bg-white/[0.02] transition-colors">
+                   <td className="px-4 py-4 text-slate-400 font-mono text-xs">{idDisplay}</td>
                    <td className="px-6 py-4">
+                       <input 
+                         ref={(input) => {
+                           nameInputRefs.current[p._localId] = input;
+                         }}
+                         type="text" 
+                         placeholder="Enter player name..."
+                         value={p.name}
+                         readOnly={isPersisted}
+                         onChange={(e) => updateDraft(p._localId, { name: e.target.value })}
+                         className={`bg-transparent font-bold focus:outline-none border-b py-1 transition-colors w-full ${
+                           isPersisted
+                             ? 'text-slate-300 border-transparent cursor-not-allowed'
+                             : 'text-white border-transparent focus:border-emerald-500'
+                         }`}
+                       />
+                   </td>
+                   <td className="px-4 py-4">
                       <select 
                         value={p.role}
-                        onChange={(e) => updatePlayer(p.id, { role: e.target.value as Player['role'] })}
-                        className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1.5 focus:border-emerald-500 outline-none w-full"
+                        onChange={(e) => updateDraft(p._localId, { role: e.target.value as BaselineRole })}
+                        className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1.5 focus:border-emerald-500 outline-none w-full text-center"
                       >
-                        <option value="Bowler">Bowler</option>
-                        <option value="Fast Bowler">Fast Bowler</option>
-                        <option value="Spinner">Spinner</option>
-                        <option value="Batsman">Batsman</option>
-                        <option value="All-rounder">All-rounder</option>
+                        <option value="FAST">FAST</option>
+                        <option value="SPIN">SPIN</option>
+                        <option value="BAT">BAT</option>
+                        <option value="AR">AR</option>
                       </select>
                    </td>
                    <td className="px-4 py-4 text-center">
-                     <div className="flex items-center justify-center gap-2 group-hover:bg-slate-800/50 rounded-lg py-1">
-                       <input 
-                         type="number" 
-                         min="1" max="10"
-                         value={p.baselineFatigue}
-                         onChange={(e) => updatePlayer(p.id, { baselineFatigue: Number(e.target.value) })}
-                         className="w-12 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
-                       />
-                     </div>
+                     <input
+                       type="checkbox"
+                       checked={isActive}
+                       onChange={(e) => handleRosterToggle(p, e.target.checked)}
+                       disabled={!isGloballyActive && !isActive}
+                       title={!isGloballyActive ? 'Globally inactive players cannot be added to roster.' : 'Toggle roster membership for this match.'}
+                       className="w-4 h-4 accent-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                     />
                    </td>
-                   {/* New Sleep Section */}
                    <td className="px-4 py-4 text-center bg-indigo-500/5">
                      <div className="flex items-center justify-center gap-2">
                        <input 
                          type="number" 
                          step="0.5"
-                         min="0" max="24"
-                         value={p.sleepHours || 0}
-                         onChange={(e) => updatePlayer(p.id, { sleepHours: Number(e.target.value) })}
+                         min="0" max="12"
+                         value={p.sleep}
+                         onChange={(e) => updateDraft(p._localId, { sleep: Number(e.target.value) })}
                          className={`w-12 bg-transparent text-center font-mono focus:outline-none font-bold ${
-                           (p.sleepHours || 0) < 6 ? 'text-rose-400' : 'text-indigo-400'
+                           p.sleep < 6 ? 'text-rose-400' : 'text-indigo-400'
                          }`}
                        />
                        <span className="text-xs text-slate-500">h</span>
@@ -3298,53 +4724,60 @@ function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: B
                        <input 
                          type="number" 
                          min="0"
-                         value={p.recoveryTime || 45}
-                         onChange={(e) => updatePlayer(p.id, { recoveryTime: Number(e.target.value) })}
+                         value={p.recovery}
+                         onChange={(e) => updateDraft(p._localId, { recovery: Number(e.target.value) })}
                          className="w-12 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
                        />
                        <span className="text-xs text-slate-500">min</span>
                      </div>
                    </td>
+                   <td className="px-4 py-4 text-center">
+                     <input 
+                       type="number" 
+                       min="0" max="10"
+                       value={p.fatigueLimit}
+                       onChange={(e) => updateDraft(p._localId, { fatigueLimit: Number(e.target.value) })}
+                       className="w-14 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
+                     />
+                   </td>
+                   <td className="px-4 py-4 text-center">
+                     <input 
+                       type="number" 
+                       min="0" max="100"
+                       value={p.control}
+                       onChange={(e) => updateDraft(p._localId, { control: Number(e.target.value) })}
+                       className="w-14 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
+                     />
+                   </td>
+                   <td className="px-4 py-4 text-center">
+                     <input 
+                       type="number" 
+                       min="0" max="100"
+                       value={p.speed}
+                       onChange={(e) => updateDraft(p._localId, { speed: Number(e.target.value) })}
+                       className="w-12 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
+                     />
+                   </td>
+                   <td className="px-4 py-4 text-center">
+                     <input 
+                       type="number" 
+                       min="0" max="100"
+                       value={p.power}
+                       onChange={(e) => updateDraft(p._localId, { power: Number(e.target.value) })}
+                       className="w-12 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
+                     />
+                   </td>
                    <td className="px-6 py-4 text-right">
-                      {/* Status Indicator based on configuration safety */}
-                      <div className="flex justify-end">
-                        <span className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide border ${status.color}`}>
-                          {status.label}
+                      <div className="flex items-center justify-end">
+                        <span className={`inline-flex min-w-[120px] justify-center px-2.5 py-1 rounded-full text-[11px] font-medium border ${rosterStatus.color}`}>
+                          {rosterStatus.label}
                         </span>
                       </div>
                    </td>
                    <td className="px-4 py-4 text-center">
-                     <div className="flex items-center justify-center">
-                        <button
-                          onClick={() => {
-                            const nextIsActive = !isActive;
-                            updatePlayer(p.id, { isActive: nextIsActive, inRoster: nextIsActive });
-                          }}
-                          className={`
-                            relative flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all duration-300 w-24
-                            ${isActive
-                              ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50 hover:bg-emerald-500/30 shadow-[0_0_10px_rgba(16,185,129,0.2)]' 
-                              : 'bg-slate-800/50 text-slate-500 border border-slate-700 hover:border-slate-500 hover:text-slate-300 hover:bg-slate-800'}
-                          `}
-                        >
-                          {isActive ? (
-                            <>
-                              <CheckCircle2 className="w-3 h-3" />
-                              <span>Active</span>
-                            </>
-                          ) : (
-                            <>
-                              <Plus className="w-3 h-3" />
-                              <span>Inactive</span>
-                            </>
-                          )}
-                        </button>
-                     </div>
-                   </td>
-                   <td className="px-4 py-4 text-center">
                      <button 
-                       onClick={() => deletePlayer(p.id)}
-                       className="p-2 text-slate-600 hover:text-rose-500 hover:bg-rose-500/10 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
+                       onClick={() => handleDelete(p)}
+                       className="p-2 text-slate-600 hover:text-rose-500 hover:bg-rose-500/10 rounded-lg transition-colors"
                        title="Remove Player from Baseline Model"
                      >
                        <Trash2 className="w-4 h-4" />
@@ -3352,25 +4785,28 @@ function Baselines({ players, updatePlayer, addPlayer, deletePlayer, onBack }: B
                    </td>
                  </tr>
                );
-               })}
+                 })
+               )}
                
                {/* Add Player Row */}
                <tr>
-                 <td colSpan={8} className="px-6 py-4 text-center border-t border-dashed border-white/10">
+                 <td colSpan={12} className="px-6 py-4 text-center border-t border-dashed border-white/10">
                    <button 
-                     onClick={() => addPlayer("New Player", "Fast Bowler", false, false)}
+                     onClick={addDraftPlayer}
+                     disabled={isLoadingBaselines}
                      className="flex items-center gap-2 mx-auto text-sm font-bold text-slate-500 hover:text-emerald-400 transition-colors py-4 w-full justify-center group"
                    >
                      <div className="w-8 h-8 rounded-full border border-slate-600 group-hover:border-emerald-500 flex items-center justify-center transition-colors">
                         <Plus className="w-4 h-4" />
                      </div>
-                     Add New Player to Baseline Model
+                     Add New Player Baseline (Draft)
                    </button>
                  </td>
                </tr>
              </tbody>
            </table>
-         </div>
+	         </div>
+        )}
       </div>
     </motion.div>
   );

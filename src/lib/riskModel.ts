@@ -1,6 +1,7 @@
 export type Role = 'Fast Bowler' | 'All-rounder' | 'Spinner';
 export type Phase = 'Powerplay' | 'Middle' | 'Death';
 export type RiskLevel = 'Low' | 'Medium' | 'High';
+export type InjuryRiskLevel = RiskLevel | 'Critical';
 export type RecoveryLevel = 'Good' | 'Moderate' | 'Poor';
 export type RecoveryMode = 'auto' | 'manual';
 export type StatusLevel = 'WITHIN SAFE RANGE' | 'APPROACHING LIMIT' | 'EXCEEDED LIMIT';
@@ -20,6 +21,19 @@ export const phaseMult = (phase: Phase): number => {
   return 1.0;
 };
 
+const toWorkloadRatio = (oversBowled: number, maxOvers: number): number => {
+  const safeMax = Math.max(1, Math.floor(Number.isFinite(maxOvers) ? maxOvers : 1));
+  const safeOvers = clamp(Math.floor(Number.isFinite(oversBowled) ? oversBowled : 0), 0, safeMax);
+  return safeOvers / safeMax;
+};
+
+const intensityMultiplier = (intensity?: string): number => {
+  const normalized = String(intensity || '').trim().toUpperCase();
+  if (normalized === 'LOW' || normalized === 'COOL') return 0.92;
+  if (normalized === 'POWERPLAY' || normalized === 'DEATH' || normalized === 'HIGH') return 1.12;
+  return 1.0;
+};
+
 export const computeBaselineRecoveryScore = (sleepHrs: number, recoveryMin: number): number => {
   // Weighted baseline readiness from sleep and recovery profile.
   const sleepScore = clamp((sleepHrs - 5) / 3, 0, 1);
@@ -35,11 +49,14 @@ export const computeFatigue = (
   baselineRecoveryScore: number
 ): number => {
   // Match load scaled by phase/role, then reduced by baseline recovery ability.
-  const baseLoad = (oversBowled * 0.55) + (consecutiveOvers * 0.9);
+  const safeOvers = Math.max(0, oversBowled);
+  const safeConsecutive = Math.max(0, Math.min(consecutiveOvers, safeOvers));
+  const baseLoad = (safeOvers * 0.55) + (safeConsecutive * 0.9);
   let raw = baseLoad * phaseMult(phase) * roleMult(role);
   const recoveryFactor = 1 - (0.25 * baselineRecoveryScore);
   raw *= recoveryFactor;
-  return clamp(round1(raw), 0, 10);
+  const floorAtFreshSpell = safeOvers === 0 && safeConsecutive === 0 ? 2.5 : 0;
+  return clamp(round1(Math.max(raw, floorAtFreshSpell)), 0, 10);
 };
 
 export const computeLoadRatio = (fatigue: number, fatigueLimit: number): number => {
@@ -63,44 +80,38 @@ export const computeRecoveryLevelAuto = (
 };
 
 export const computeInjuryRisk = (
-  loadRatio: number,
-  consecutiveOvers: number,
-  role: Role,
-  recoveryDisplayed: RecoveryLevel
-): RiskLevel => {
-  // Injury score combines tolerance breach, spell pressure, role, and shown recovery.
-  let score = 1;
-  if (loadRatio > 1.0) score = 3;
-  else if (loadRatio > 0.7) score = 2;
-
-  if (consecutiveOvers >= 3) score += 1;
-  if (role === 'Fast Bowler') score += 1;
-
-  if (recoveryDisplayed === 'Poor') score += 1;
-  if (recoveryDisplayed === 'Good') score -= 1;
-
-  const bounded = clamp(score, 1, 3);
-  if (bounded === 1) return 'Low';
-  if (bounded === 2) return 'Medium';
-  return 'High';
+  fatigueIndex: number,
+  _oversBowled: number,
+  _maxOvers: number,
+  isUnfit: boolean = false
+): InjuryRiskLevel => {
+  const safeFatigue = clamp(Number.isFinite(fatigueIndex) ? fatigueIndex : 0, 0, 10);
+  if (!isUnfit && safeFatigue < 4) return 'Low';
+  if (isUnfit || safeFatigue >= 9) return 'Critical';
+  if (safeFatigue >= 7) return 'High';
+  if (safeFatigue >= 4) return 'Medium';
+  return 'Low';
 };
 
 export const computeNoBallRisk = (
   fatigue: number,
-  consecutiveOvers: number,
-  phase: Phase
+  oversBowled: number,
+  maxOvers: number,
+  intensity?: string,
+  isUnfit: boolean = false
 ): RiskLevel => {
-  // No-ball risk follows fatigue band + pressure modifiers from spell/phase.
-  let score = 1;
-  if (fatigue > 7) score = 3;
-  else if (fatigue >= 5) score = 2;
-
-  if (consecutiveOvers >= 3) score += 1;
-  if (phase === 'Powerplay' || phase === 'Death') score += 1;
-
-  const bounded = clamp(score, 1, 3);
-  if (bounded === 1) return 'Low';
-  if (bounded === 2) return 'Medium';
+  const safeFatigue = clamp(Number.isFinite(fatigue) ? fatigue : 0, 0, 10);
+  const safeMax = Math.max(1, Math.floor(Number.isFinite(maxOvers) ? maxOvers : 1));
+  const safeOvers = clamp(Math.floor(Number.isFinite(oversBowled) ? oversBowled : 0), 0, safeMax);
+  const workloadRatio = toWorkloadRatio(safeOvers, safeMax);
+  const score = clamp(
+    safeFatigue * 0.55 + workloadRatio * 3.0 * intensityMultiplier(intensity) + (isUnfit ? 1.2 : 0),
+    0,
+    10
+  );
+  if (!isUnfit && safeOvers === 0 && safeFatigue < 4) return 'Low';
+  if (score < 3) return 'Low';
+  if (score <= 5.4) return 'Medium';
   return 'High';
 };
 

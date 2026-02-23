@@ -7,12 +7,7 @@ const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '')
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, process.cwd(), '');
-    const configuredApiBase = trimTrailingSlashes((env.VITE_API_BASE_URL || '').trim());
-    const functionsPort = (env.VITE_FUNCTIONS_PORT || env.FUNCTION_PORT || '7071').trim();
-    const proxyTarget = configuredApiBase || `http://localhost:${functionsPort}`;
-    const configuredAgentFrameworkBase = trimTrailingSlashes((env.VITE_AGENT_FRAMEWORK_BASE_URL || '').trim());
-    const agentFrameworkPort = (env.VITE_AGENT_FRAMEWORK_PORT || '3978').trim();
-    const agentFrameworkProxyTarget = configuredAgentFrameworkBase || `http://localhost:${agentFrameworkPort}`;
+    const proxyTarget = 'http://localhost:8080';
 
     return {
     plugins: [react()],
@@ -68,12 +63,12 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       open: true,
       proxy: {
-        '/api/messages': {
-          target: agentFrameworkProxyTarget,
+        '/api': {
+          target: proxyTarget,
           changeOrigin: true,
           secure: false,
         },
-        '/api': {
+        '/health': {
           target: proxyTarget,
           changeOrigin: true,
           secure: false,

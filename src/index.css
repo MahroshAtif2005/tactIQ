@@ -3309,3 +3309,9 @@ body {
 .coach-output::-webkit-scrollbar-track {
   background: transparent;
 }
+
+[data-testid="overs-bowled"] [data-testid="overs-bowled-value"] {
+  font-size: 3rem !important;
+  line-height: 1 !important;
+  font-weight: 600 !important;
+}

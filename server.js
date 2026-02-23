@@ -1,18 +1,102 @@
 const express = require("express");
+const fs = require("fs");
 const path = require("path");
 const { randomUUID } = require("crypto");
 const { execSync } = require("child_process");
-require("dotenv").config();
+const dotenv = require("dotenv");
+require("dotenv").config({ path: "server/agent-framework/.env" });
+const {
+  buildDefaultBaselines,
+  deleteBaseline,
+  getAllBaselines,
+  getBaseline,
+  getContainer,
+  getCosmosDiagnostics,
+  isCosmosConfigured,
+  resetBaselines,
+  setBaselineActive,
+  upsertBaselines,
+  validateAndNormalizeBaseline,
+} = require("./server/db/cosmos");
+
+const rootEnvPath = path.resolve(process.cwd(), ".env");
+const rootEnvResult = dotenv.config({ path: rootEnvPath });
+const agentFrameworkEnvPath = path.resolve(process.cwd(), "server/agent-framework/.env");
+let agentFrameworkEnvLoaded = false;
+if (fs.existsSync(agentFrameworkEnvPath)) {
+  dotenv.config({ path: agentFrameworkEnvPath, override: false });
+  agentFrameworkEnvLoaded = true;
+}
+
+const requiredAzureEnvVars = [
+  "AZURE_OPENAI_ENDPOINT",
+  "AZURE_OPENAI_API_KEY",
+  "AZURE_OPENAI_DEPLOYMENT",
+  "AZURE_OPENAI_API_VERSION",
+];
+const isNonEmptyEnv = (value) => typeof value === "string" && value.trim().length > 0;
+const getMissingAzureEnvVars = () => requiredAzureEnvVars.filter((name) => !isNonEmptyEnv(process.env[name]));
+const getAzureEnvPresence = () => ({
+  endpointPresent: isNonEmptyEnv(process.env.AZURE_OPENAI_ENDPOINT),
+  apiKeyPresent: isNonEmptyEnv(process.env.AZURE_OPENAI_API_KEY),
+  deploymentPresent: isNonEmptyEnv(process.env.AZURE_OPENAI_DEPLOYMENT),
+  apiVersionPresent: isNonEmptyEnv(process.env.AZURE_OPENAI_API_VERSION),
+});
+const isRecord = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const hasAnyKeys = (value) => isRecord(value) && Object.keys(value).length > 0;
+const getMissingOrchestrateFields = (payload) =>
+  ["telemetry", "matchContext", "players"].filter((field) => payload[field] === undefined || payload[field] === null);
+const normalizePlayerId = (value) => String(value || "").trim().toUpperCase();
+const normalizeBaselineId = (value) => String(value || "").trim();
+const parseNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+console.log("[env] files", {
+  rootEnvPath,
+  rootEnvLoaded: !rootEnvResult.error,
+  agentFrameworkEnvPath,
+  agentFrameworkEnvLoaded,
+});
+console.log("[env] azure-openai", getAzureEnvPresence());
+console.log("Cosmos env loaded:", {
+  endpoint: !!process.env.COSMOS_ENDPOINT,
+  key: !!process.env.COSMOS_KEY,
+  db: process.env.COSMOS_DB,
+  container: process.env.COSMOS_CONTAINER
+});
+const cosmosDiagnostics = getCosmosDiagnostics();
+console.log("[env] cosmos", {
+  configured: cosmosDiagnostics.configured,
+  database: cosmosDiagnostics.databaseId,
+  container: cosmosDiagnostics.containerId,
+  sdkAvailable: cosmosDiagnostics.sdkAvailable,
+});
+getContainer()
+  .then((container) => {
+    if (container) {
+      console.log("[cosmos] container ready.");
+    } else {
+      console.warn("[cosmos] not configured or unavailable. Using fallback baselines.");
+    }
+  })
+  .catch((error) => {
+    console.warn("[cosmos] init failed. Using fallback baselines.", error instanceof Error ? error.message : String(error));
+  });
 
 let adapter = null;
 let bot = null;
 let botRuntimeLoadError = null;
-try {
-  ({ adapter } = require("./server/bot/adapter"));
-  ({ bot } = require("./server/bot/TactIQBot"));
-} catch (error) {
-  botRuntimeLoadError = error;
-  console.error("Bot runtime modules unavailable:", error.message);
+const isBotEnabled = String(process.env.ENABLE_BOT || "").toLowerCase() === "true";
+if (isBotEnabled) {
+  try {
+    ({ adapter } = require("./server/bot/adapter"));
+    ({ bot } = require("./server/bot/TactIQBot"));
+  } catch (error) {
+    botRuntimeLoadError = error;
+    console.error("Bot runtime modules unavailable:", error.message);
+  }
 }
 
 let backend = null;
@@ -78,12 +162,25 @@ const sanitizeFatigueRequest = (payload = {}) => {
     return upper === "LOW" || upper === "MEDIUM" || upper === "HIGH" ? upper : fallback;
   };
 
+  const format = String(payload.matchContext?.format || "T20");
+  const formatMaxOvers =
+    format.toUpperCase().includes("T20") ? 4 : format.toUpperCase().includes("ODI") ? 10 : 999;
+  const maxOvers = Math.max(1, Math.floor(toNum(payload.maxOvers ?? payload.matchContext?.maxOvers, formatMaxOvers)));
+  const oversBowled = Math.min(maxOvers, Math.max(0, toNum(payload.oversBowled, 0)));
+  const oversRemaining = Math.max(
+    0,
+    Math.min(maxOvers, toNum(payload.oversRemaining ?? payload.matchContext?.oversRemaining, maxOvers - oversBowled))
+  );
+
   return {
     playerId: String(payload.playerId || "UNKNOWN"),
     playerName: String(payload.playerName || "Unknown Player"),
     role: String(payload.role || "Unknown Role"),
-    oversBowled: Math.max(0, toNum(payload.oversBowled, 0)),
+    oversBowled,
     consecutiveOvers: Math.max(0, toNum(payload.consecutiveOvers, 0)),
+    oversRemaining,
+    maxOvers,
+    quotaComplete: payload.quotaComplete === true,
     fatigueIndex: Math.max(0, Math.min(10, toNum(payload.fatigueIndex, 3))),
     injuryRisk: toRisk(payload.injuryRisk, "MEDIUM"),
     noBallRisk: toRisk(payload.noBallRisk, "MEDIUM"),
@@ -93,7 +190,7 @@ const sanitizeFatigueRequest = (payload = {}) => {
     recoveryMinutes: Math.max(0, toNum(payload.recoveryMinutes, 0)),
     snapshotId: String(payload.snapshotId || ""),
     matchContext: {
-      format: String(payload.matchContext?.format || "T20"),
+      format,
       phase: String(payload.matchContext?.phase || "Middle"),
       over: toNum(payload.matchContext?.over, 0),
       intensity: String(payload.matchContext?.intensity || "Medium"),
@@ -101,32 +198,182 @@ const sanitizeFatigueRequest = (payload = {}) => {
   };
 };
 
-const sanitizeRiskRequest = (payload = {}) => ({
-  playerId: String(payload.playerId || "UNKNOWN"),
-  fatigueIndex: Math.max(0, Math.min(10, toNum(payload.fatigueIndex, 0))),
-  injuryRisk: String(payload.injuryRisk || "LOW").toUpperCase(),
-  noBallRisk: String(payload.noBallRisk || "LOW").toUpperCase(),
-  oversBowled: Math.max(0, toNum(payload.oversBowled, 0)),
-  consecutiveOvers: Math.max(0, toNum(payload.consecutiveOvers, 0)),
-  heartRateRecovery: payload.heartRateRecovery ? String(payload.heartRateRecovery) : undefined,
-  format: String(payload.format || payload.match?.format || "T20"),
-  phase: String(payload.phase || payload.match?.phase || "Middle"),
-  intensity: String(payload.intensity || payload.match?.intensity || "Medium"),
-  conditions: payload.conditions ? String(payload.conditions) : payload.match?.conditions ? String(payload.match.conditions) : undefined,
-  target: Number.isFinite(toNum(payload.target, NaN)) ? toNum(payload.target, 0) : undefined,
-  score: Number.isFinite(toNum(payload.score, NaN)) ? toNum(payload.score, 0) : undefined,
-  over: Number.isFinite(toNum(payload.over, NaN)) ? toNum(payload.over, 0) : undefined,
-  balls: Number.isFinite(toNum(payload.balls, NaN)) ? toNum(payload.balls, 0) : undefined,
-});
+const sanitizeRiskRequest = (payload = {}) => {
+  const format = String(payload.format || payload.match?.format || "T20");
+  const formatMaxOvers =
+    format.toUpperCase().includes("T20") ? 4 : format.toUpperCase().includes("ODI") ? 10 : 999;
+  const maxOvers = Math.max(1, Math.floor(toNum(payload.maxOvers, formatMaxOvers)));
+  const oversBowled = toNum(payload.oversBowled, Number.NaN);
+  const spellOvers = toNum(payload.consecutiveOvers, Number.NaN);
+  const normalizedOvers = Number.isFinite(oversBowled) ? Math.min(maxOvers, Math.max(0, oversBowled)) : Number.NaN;
+  const normalizedSpellOvers = Number.isFinite(spellOvers) ? Math.max(0, spellOvers) : Number.NaN;
+  const clampedSpellOvers =
+    Number.isFinite(normalizedOvers) && Number.isFinite(normalizedSpellOvers)
+      ? Math.min(normalizedSpellOvers, normalizedOvers)
+      : normalizedSpellOvers;
+  const oversRemainingRaw = toNum(payload.oversRemaining, Number.NaN);
+  const oversRemaining = Number.isFinite(oversRemainingRaw)
+    ? Math.min(maxOvers, Math.max(0, oversRemainingRaw))
+    : Number.isFinite(normalizedOvers)
+      ? Math.max(0, maxOvers - normalizedOvers)
+      : Number.NaN;
+
+  return {
+    playerId: String(payload.playerId || "UNKNOWN"),
+    fatigueIndex: Math.max(0, Math.min(10, toNum(payload.fatigueIndex, Number.NaN))),
+    injuryRisk: ["LOW", "MED", "MEDIUM", "HIGH", "UNKNOWN"].includes(String(payload.injuryRisk || "").toUpperCase())
+      ? String(payload.injuryRisk || "").toUpperCase()
+      : "UNKNOWN",
+    noBallRisk: ["LOW", "MED", "MEDIUM", "HIGH", "UNKNOWN"].includes(String(payload.noBallRisk || "").toUpperCase())
+      ? String(payload.noBallRisk || "").toUpperCase()
+      : "UNKNOWN",
+    oversBowled: normalizedOvers,
+    consecutiveOvers: clampedSpellOvers,
+    oversRemaining,
+    maxOvers,
+    quotaComplete: payload.quotaComplete === true,
+    heartRateRecovery: payload.heartRateRecovery ? String(payload.heartRateRecovery) : undefined,
+    isUnfit: payload.isUnfit === true,
+    format,
+    phase: String(payload.phase || payload.match?.phase || "Middle"),
+    intensity: String(payload.intensity || payload.match?.intensity || "Medium"),
+    conditions: payload.conditions ? String(payload.conditions) : payload.match?.conditions ? String(payload.match.conditions) : undefined,
+    target: Number.isFinite(toNum(payload.target, NaN)) ? toNum(payload.target, 0) : undefined,
+    score: Number.isFinite(toNum(payload.score, NaN)) ? toNum(payload.score, 0) : undefined,
+    over: Number.isFinite(toNum(payload.over, NaN)) ? toNum(payload.over, 0) : undefined,
+    balls: Number.isFinite(toNum(payload.balls, NaN)) ? toNum(payload.balls, 0) : undefined,
+  };
+};
+
+const resolveBaselineSource = async () => {
+  if (!isCosmosConfigured()) {
+    return { source: "fallback", warning: "Cosmos not configured; using local defaults." };
+  }
+  const container = await getContainer();
+  if (!container) {
+    return { source: "fallback", warning: "Cosmos unavailable; using local defaults." };
+  }
+  return { source: "cosmos", warning: null };
+};
+
+const normalizeBaselinesForSave = (body) => {
+  const items = Array.isArray(body?.players)
+    ? body.players
+    : Array.isArray(body?.baselines)
+      ? body.baselines
+      : null;
+
+  if (!Array.isArray(items)) {
+    return {
+      ok: false,
+      message: "Body must be { players: PlayerBaseline[] }.",
+      players: [],
+      errors: ["players must be an array"],
+    };
+  }
+
+  const players = [];
+  const errors = [];
+
+  for (let index = 0; index < items.length; index += 1) {
+    const result = validateAndNormalizeBaseline(
+      {
+        ...items[index],
+        updatedAt: new Date().toISOString(),
+      },
+      { strict: true }
+    );
+
+    if (!result.ok) {
+      errors.push(`players[${index}]: ${result.errors.join(", ")}`);
+      continue;
+    }
+    players.push(result.value);
+  }
+
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      message: "Invalid baselines payload.",
+      players: [],
+      errors,
+    };
+  }
+
+  return { ok: true, message: null, players, errors: [] };
+};
+
+const applyStoredBaselineToPayload = async (payload) => {
+  if (!isRecord(payload)) return payload;
+
+  const telemetry = isRecord(payload.telemetry) ? { ...payload.telemetry } : {};
+  const candidateIds = [
+    normalizeBaselineId(telemetry.playerId),
+    normalizeBaselineId(payload.playerId),
+    normalizeBaselineId(payload.player?.playerId),
+    normalizeBaselineId(payload.player?.id),
+    normalizeBaselineId(telemetry.playerName),
+  ].filter(Boolean);
+  const uniqueCandidates = [...new Set(candidateIds)];
+
+  if (uniqueCandidates.length === 0) {
+    return payload;
+  }
+
+  let baseline = null;
+  for (const candidateId of uniqueCandidates) {
+    // Point-read first match to keep RU usage low.
+    // eslint-disable-next-line no-await-in-loop
+    baseline = await getBaseline(candidateId);
+    if (baseline) break;
+  }
+
+  if (!baseline) {
+    return {
+      ...payload,
+      telemetry: {
+        ...telemetry,
+      },
+    };
+  }
+
+  return {
+    ...payload,
+    telemetry: {
+      ...telemetry,
+      playerId: telemetry.playerId || baseline.id,
+      playerName: telemetry.playerName || baseline.name || baseline.id,
+      fatigueLimit: parseNumber(baseline.fatigueLimit, parseNumber(telemetry.fatigueLimit, 6)),
+      sleepHours: parseNumber(baseline.sleep, parseNumber(telemetry.sleepHours, 7)),
+      recoveryMinutes: parseNumber(baseline.recovery, parseNumber(telemetry.recoveryMinutes, 45)),
+    },
+  };
+};
 
 /* API ROUTES FIRST */
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
 app.get("/api/health", (_req, res) => {
   const aoai = backend?.getAoaiConfig ? backend.getAoaiConfig() : { ok: false, missing: ["api-dist-not-loaded"] };
   res.json({
+    ok: true,
     status: "ok",
     service: "tactiq-express",
     timestamp: new Date().toISOString(),
-    routes: ["/api/health", "/api/router", "/api/agents/fatigue", "/api/agents/risk", "/api/agents/tactical", "/api/orchestrate", "/api/messages"],
+    routes: [
+      "/api/health",
+      "/api/baselines",
+      "/api/baselines/:id",
+      "/api/baselines/reset",
+      "/api/router",
+      "/api/agents/fatigue",
+      "/api/agents/risk",
+      "/api/agents/tactical",
+      "/api/orchestrate",
+      "/api/messages",
+    ],
     aoai: aoai.ok
       ? {
           configured: true,
@@ -137,6 +384,128 @@ app.get("/api/health", (_req, res) => {
           missing: aoai.missing,
         },
   });
+});
+
+app.get("/api/baselines", async (_req, res) => {
+  try {
+    const baselineSource = await resolveBaselineSource();
+    const players = await getAllBaselines();
+    return res.status(200).json({
+      players,
+      source: baselineSource.source,
+      ...(baselineSource.warning ? { warning: baselineSource.warning } : {}),
+    });
+  } catch (error) {
+    console.error("Baselines GET error", error);
+    return res.status(500).json({ error: "Failed to load baselines." });
+  }
+});
+
+app.get("/api/baselines/:id", async (req, res) => {
+  try {
+    const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
+    if (!id) {
+      return res.status(400).json({ error: "id is required." });
+    }
+    const baseline = await getBaseline(id);
+    if (!baseline) {
+      return res.status(404).json({ error: `Baseline ${id} not found.` });
+    }
+    return res.status(200).json(baseline);
+  } catch (error) {
+    console.error("Baseline by id GET error", error);
+    return res.status(500).json({ error: "Failed to load baseline." });
+  }
+});
+
+const saveBaselinesHandler = async (req, res) => {
+  try {
+    const normalized = normalizeBaselinesForSave(req.body);
+    if (!normalized.ok) {
+      return res.status(400).json({
+        error: normalized.message,
+        details: normalized.errors,
+      });
+    }
+
+    await upsertBaselines(normalized.players);
+    const players = await getAllBaselines();
+    return res.status(200).json({ ok: true, players });
+  } catch (error) {
+    console.error("Baselines PUT error", error);
+    if (error && typeof error === "object" && "code" in error && error.code === "VALIDATION_ERROR") {
+      return res.status(400).json({
+        error: "Invalid baselines payload.",
+        details: Array.isArray(error.details) ? error.details : [String(error.message || error)],
+      });
+    }
+    return res.status(500).json({ error: "Failed to save baselines." });
+  }
+};
+
+app.post("/api/baselines", saveBaselinesHandler);
+app.put("/api/baselines", saveBaselinesHandler);
+
+app.patch("/api/baselines/:id", async (req, res) => {
+  try {
+    const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
+    if (!id) {
+      return res.status(400).json({ error: "id is required." });
+    }
+
+    if (!isRecord(req.body) || typeof req.body.active !== "boolean") {
+      return res.status(400).json({ error: "Body must include boolean field: active." });
+    }
+
+    const updated = await setBaselineActive(id, req.body.active);
+    return res.status(200).json({ ok: true, player: updated });
+  } catch (error) {
+    console.error("Baselines PATCH error", error);
+    if (error && typeof error === "object" && "code" in error && Number(error.code) === 404) {
+      return res.status(404).json({ error: `Baseline ${req.params.id} not found.` });
+    }
+    if (error && typeof error === "object" && "code" in error && error.code === "VALIDATION_ERROR") {
+      return res.status(400).json({
+        error: "Invalid baseline patch payload.",
+        details: Array.isArray(error.details) ? error.details : [String(error.message || error)],
+      });
+    }
+    return res.status(500).json({ error: "Failed to update baseline." });
+  }
+});
+
+app.delete("/api/baselines/:id", async (req, res) => {
+  try {
+    const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
+    if (!id) {
+      return res.status(400).json({ error: "id is required." });
+    }
+
+    await deleteBaseline(id);
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    console.error("Baselines DELETE error", error);
+    const code = error && typeof error === "object" && "code" in error ? Number(error.code) : undefined;
+    if (code === 404) {
+      return res.status(404).json({ error: `Baseline ${req.params.id} not found.` });
+    }
+    return res.status(500).json({ error: "Failed to delete baseline." });
+  }
+});
+
+app.post("/api/baselines/reset", async (_req, res) => {
+  try {
+    const result = await resetBaselines({ seed: true });
+    return res.status(200).json({
+      ok: true,
+      deleted: result.deleted,
+      seeded: result.seeded,
+      players: await getAllBaselines(),
+    });
+  } catch (error) {
+    console.error("Baselines reset error", error);
+    return res.status(500).json({ error: "Failed to reset baselines." });
+  }
 });
 
 app.post("/api/router", async (req, res) => {
@@ -240,10 +609,39 @@ app.post("/api/agents/tactical", async (req, res) => {
 app.post("/api/orchestrate", async (req, res) => {
   if (!ensureBackendLoaded(res)) return;
   try {
-    const validated = backend.validateOrchestrateRequest(req.body);
-    if (!validated.ok) {
-      return res.status(400).json({ error: validated.message });
+    const rawPayload = isRecord(req.body) ? req.body : {};
+    const payload = await applyStoredBaselineToPayload(rawPayload);
+    const missingEnv = getMissingAzureEnvVars();
+    const missingRequestFields = getMissingOrchestrateFields(payload);
+    const hasMinimalPayload = (typeof payload.text === "string" && payload.text.trim().length > 0) || hasAnyKeys(payload.signals);
+    const hasFullPayload = payload.telemetry !== undefined && payload.matchContext !== undefined && payload.players !== undefined;
+
+    if (!hasMinimalPayload && !hasFullPayload) {
+      return res.status(400).json({
+        error: "Invalid orchestrate payload",
+        message: "Provide minimal payload { text, mode, signals } or full payload { telemetry, matchContext, players }.",
+        missingFields: missingRequestFields,
+        missingEnv,
+      });
     }
+
+    if (missingEnv.length > 0) {
+      return res.status(400).json({
+        error: "Missing Azure OpenAI environment variables",
+        missingEnv,
+        missingFields: missingRequestFields,
+      });
+    }
+
+    const validated = backend.validateOrchestrateRequest(payload);
+    if (!validated.ok) {
+      return res.status(400).json({
+        error: validated.message,
+        missingFields: missingRequestFields,
+        missingEnv,
+      });
+    }
+
     const result = await backend.orchestrateAgents(validated.value, createInvocationContext());
     return res.status(Array.isArray(result.errors) && result.errors.length > 0 ? 207 : 200).json(result);
   } catch (error) {
@@ -253,6 +651,12 @@ app.post("/api/orchestrate", async (req, res) => {
 });
 
 app.post("/api/messages", async (req, res) => {
+  if (!isBotEnabled) {
+    return res.status(501).json({
+      error: "Bot disabled",
+      message: "Set ENABLE_BOT=true to enable Bot Framework runtime.",
+    });
+  }
   if (botRuntimeLoadError || !adapter || !bot) {
     return res.status(500).json({
       error: "Bot runtime unavailable",
@@ -269,6 +673,10 @@ app.post("/api/messages", async (req, res) => {
       res.status(500).json({ error: "Bot runtime error" });
     }
   }
+});
+
+app.use("/api", (_req, res) => {
+  res.status(404).json({ error: "API route not found." });
 });
 
 /* STATIC FILES */
