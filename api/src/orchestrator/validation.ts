@@ -1,133 +1,213 @@
-import { OrchestrateIntent, OrchestrateRequest, TacticalAgentInput } from '../agents/types';
+import { OrchestrateIntent, OrchestrateRequest, OrchestrateRequestBody, TacticalAgentInput } from '../agents/types';
 
 const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 const validIntents: OrchestrateIntent[] = ['monitor', 'substitution', 'strategy', 'full'];
+const validPhases = new Set(['powerplay', 'middle', 'death']);
+const validRisks = new Set(['LOW', 'MED', 'MEDIUM', 'HIGH', 'UNKNOWN']);
+
+function toReqObject(body: unknown): Record<string, unknown> {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
+  return body as Record<string, unknown>;
+}
+
+function toNum(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toOptionalNumber(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
 
 function normalizeIntent(intent: unknown): OrchestrateIntent {
   const value = String(intent || 'monitor').toLowerCase() as OrchestrateIntent;
   return validIntents.includes(value) ? value : 'monitor';
 }
 
-function toReqObject(body: unknown): Record<string, unknown> {
-  if (!body || typeof body !== 'object') return {};
-  return body as Record<string, unknown>;
+function normalizeMode(mode: unknown): 'route' | 'auto' | 'full' {
+  const value = String(mode ?? 'route').toLowerCase().trim();
+  if (value === 'full' || value === 'all') return 'full';
+  if (value === 'auto') return 'auto';
+  return 'route';
+}
+
+function normalizeRisk(value: unknown, fallback: 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN' = 'UNKNOWN'): 'LOW' | 'MED' | 'HIGH' | 'UNKNOWN' {
+  const upper = String(value || fallback).toUpperCase();
+  if (upper === 'UNKNOWN') return 'UNKNOWN';
+  if (!validRisks.has(upper)) return fallback === 'MEDIUM' ? 'MED' : fallback;
+  if (upper === 'MEDIUM') return 'MED';
+  return upper as 'LOW' | 'MED' | 'HIGH';
+}
+
+function normalizePhase(value: unknown): 'powerplay' | 'middle' | 'death' {
+  const lower = String(value || 'middle').toLowerCase();
+  if (!validPhases.has(lower)) return 'middle';
+  return lower as 'powerplay' | 'middle' | 'death';
+}
+
+function maxOversByFormat(format: unknown): number {
+  const upper = String(format || '').toUpperCase().trim();
+  if (upper === 'T20') return 4;
+  if (upper === 'ODI') return 10;
+  return 999;
+}
+
+function inferIntent(
+  requestedIntent: unknown,
+  text: string,
+  injuryRisk: 'LOW' | 'MED' | 'HIGH' | 'UNKNOWN',
+  fatigueIndex: number,
+  noBallRisk: 'LOW' | 'MED' | 'HIGH' | 'UNKNOWN'
+): OrchestrateIntent {
+  const normalizedRequested = normalizeIntent(requestedIntent);
+  if (requestedIntent !== undefined && requestedIntent !== null && String(requestedIntent).trim() !== '') {
+    return normalizedRequested;
+  }
+
+  const lowerText = text.toLowerCase();
+  if (lowerText.includes('strategy') || lowerText.includes('plan')) return 'strategy';
+  if (
+    lowerText.includes('substitut') ||
+    lowerText.includes('injur') ||
+    injuryRisk === 'HIGH' ||
+    fatigueIndex >= 7 ||
+    noBallRisk === 'HIGH'
+  ) {
+    return 'substitution';
+  }
+  return 'monitor';
+}
+
+function normalizePlayers(rawPlayers: unknown, fallbackBowler: string): OrchestrateRequest['players'] {
+  const playersObject = toReqObject(rawPlayers);
+  const playersList = Array.isArray(rawPlayers) ? rawPlayers.map((entry) => String(entry)) : [];
+  const benchFromObject = Array.isArray(playersObject.bench) ? playersObject.bench.map((entry) => String(entry)) : [];
+  const benchFromList = playersList.slice(3);
+  const bench = [...benchFromObject, ...benchFromList].filter(Boolean);
+
+  return {
+    striker: String(playersObject.striker || playersList[0] || 'Unknown Striker'),
+    nonStriker: String(playersObject.nonStriker || playersList[1] || 'Unknown Non-Striker'),
+    bowler: String(playersObject.bowler || playersList[2] || fallbackBowler || 'Current Bowler'),
+    bench: bench.length > 0 ? bench : undefined,
+  };
 }
 
 export const validateOrchestrateRequest = (body: unknown): { ok: true; value: OrchestrateRequest } | { ok: false; message: string } => {
-  const payload = toReqObject(body);
-
-  // New schema
+  const payload = toReqObject(body) as OrchestrateRequestBody;
   const telemetry = toReqObject(payload.telemetry);
   const matchContext = toReqObject(payload.matchContext);
-  const players = toReqObject(payload.players);
-  const hasNewSchema = Object.keys(telemetry).length > 0 && Object.keys(matchContext).length > 0 && Object.keys(players).length > 0;
+  const signals = toReqObject(payload.signals);
 
   // Backward compatible schema mapper (player+match -> telemetry+matchContext)
   const legacyPlayer = toReqObject(payload.player);
   const legacyMatch = toReqObject(payload.match);
   const legacyTactical = toReqObject(legacyMatch.tactical);
-  const hasLegacySchema = Object.keys(legacyPlayer).length > 0 && Object.keys(legacyMatch).length > 0 && Object.keys(players).length > 0;
+  const sourceTelemetry = Object.keys(telemetry).length > 0 ? telemetry : legacyPlayer;
+  const sourceMatchContext =
+    Object.keys(matchContext).length > 0
+      ? matchContext
+      : {
+          phase: legacyTactical.phase ?? legacyMatch.phase,
+          requiredRunRate: legacyTactical.requiredRunRate,
+          currentRunRate: legacyTactical.currentRunRate,
+          wicketsInHand: legacyTactical.wicketsInHand,
+          oversRemaining: legacyTactical.oversRemaining,
+          format: legacyMatch.format,
+          over: legacyMatch.over,
+          intensity: legacyMatch.intensity,
+          conditions: legacyMatch.conditions,
+          target: legacyMatch.target,
+          score: legacyMatch.score,
+          balls: legacyMatch.balls,
+        };
 
-  const sourceTelemetry = hasNewSchema ? telemetry : legacyPlayer;
-  const sourceMatchContext = hasNewSchema
-    ? matchContext
-    : {
-        phase: legacyTactical.phase ?? legacyMatch.phase,
-        requiredRunRate: legacyTactical.requiredRunRate,
-        currentRunRate: legacyTactical.currentRunRate,
-        wicketsInHand: legacyTactical.wicketsInHand,
-        oversRemaining: legacyTactical.oversRemaining,
-        format: legacyMatch.format,
-        over: legacyMatch.over,
-        intensity: legacyMatch.intensity,
-        conditions: legacyMatch.conditions,
-        target: legacyMatch.target,
-        score: legacyMatch.score,
-        balls: legacyMatch.balls,
-      };
+  const text = String(payload.text || '').trim();
+  const lowerText = text.toLowerCase();
+  const rawMode = normalizeMode(payload.mode);
+  const normalizedMode: OrchestrateRequest['mode'] = rawMode === 'full' ? 'full' : 'auto';
 
-  if (!hasNewSchema && !hasLegacySchema) {
-    return { ok: false, message: 'Body must include telemetry, matchContext, and players' };
-  }
-
-  const modeRaw = payload.mode;
-  if (modeRaw !== undefined && modeRaw !== 'auto' && modeRaw !== 'full') {
-    return { ok: false, message: 'mode must be "auto" or "full"' };
-  }
-
-  const requiredTelemetry = ['playerId', 'playerName', 'role', 'fatigueIndex', 'heartRateRecovery', 'oversBowled', 'consecutiveOvers', 'injuryRisk', 'noBallRisk'];
-  for (const field of requiredTelemetry) {
-    if (sourceTelemetry[field] === undefined || sourceTelemetry[field] === null || sourceTelemetry[field] === '') {
-      return { ok: false, message: `Missing required telemetry field: ${field}` };
-    }
-  }
-
-  if (
-    !isFiniteNumber(sourceTelemetry.fatigueIndex) ||
-    !isFiniteNumber(sourceTelemetry.oversBowled) ||
-    !isFiniteNumber(sourceTelemetry.consecutiveOvers)
-  ) {
-    return { ok: false, message: 'telemetry.fatigueIndex, telemetry.oversBowled, telemetry.consecutiveOvers must be numbers' };
-  }
-
-  const requiredMatchContext = ['phase', 'requiredRunRate', 'currentRunRate', 'wicketsInHand', 'oversRemaining'];
-  for (const field of requiredMatchContext) {
-    if (sourceMatchContext[field] === undefined || sourceMatchContext[field] === null || sourceMatchContext[field] === '') {
-      return { ok: false, message: `Missing required matchContext field: ${field}` };
-    }
-  }
-
-  if (
-    !isFiniteNumber(sourceMatchContext.requiredRunRate) ||
-    !isFiniteNumber(sourceMatchContext.currentRunRate) ||
-    !isFiniteNumber(sourceMatchContext.wicketsInHand) ||
-    !isFiniteNumber(sourceMatchContext.oversRemaining)
-  ) {
-    return { ok: false, message: 'matchContext requiredRunRate/currentRunRate/wicketsInHand/oversRemaining must be numbers' };
-  }
-
-  if (!players.striker || !players.nonStriker || !players.bowler) {
-    return { ok: false, message: 'players.striker, players.nonStriker and players.bowler are required' };
-  }
+  const fatigueSignal = signals.fatigue ?? signals.fatigueIndex;
+  const rawFatigueIndex = toNum(sourceTelemetry.fatigueIndex ?? fatigueSignal, Number.NaN);
+  const fatigueIndex = Number.isFinite(rawFatigueIndex) ? Math.max(0, Math.min(10, rawFatigueIndex)) : Number.NaN;
+  const injuryFlag =
+    sourceTelemetry.isUnfit === true ||
+    signals.isUnfit === true ||
+    signals.injury === true ||
+    signals.injured === true;
+  const injuryRisk = normalizeRisk(sourceTelemetry.injuryRisk ?? signals.injuryRisk, 'UNKNOWN');
+  const noBallRisk = normalizeRisk(sourceTelemetry.noBallRisk ?? signals.noBallRisk, 'UNKNOWN');
+  const intent = inferIntent(payload.intent, text, injuryRisk, fatigueIndex, noBallRisk);
 
   const value: OrchestrateRequest = {
-    mode: modeRaw === 'full' ? 'full' : 'auto',
-    intent: normalizeIntent(payload.intent),
+    mode: normalizedMode,
+    rawMode,
+    intent,
+    text,
+    signals,
     telemetry: {
-      playerId: String(sourceTelemetry.playerId),
-      playerName: String(sourceTelemetry.playerName),
-      role: String(sourceTelemetry.role),
-      fatigueIndex: Number(sourceTelemetry.fatigueIndex),
-      heartRateRecovery: String(sourceTelemetry.heartRateRecovery),
-      oversBowled: Number(sourceTelemetry.oversBowled),
-      consecutiveOvers: Number(sourceTelemetry.consecutiveOvers),
-      injuryRisk: String(sourceTelemetry.injuryRisk).toUpperCase() as OrchestrateRequest['telemetry']['injuryRisk'],
-      noBallRisk: String(sourceTelemetry.noBallRisk).toUpperCase() as OrchestrateRequest['telemetry']['noBallRisk'],
-      fatigueLimit: sourceTelemetry.fatigueLimit !== undefined ? Number(sourceTelemetry.fatigueLimit) : undefined,
-      sleepHours: sourceTelemetry.sleepHours !== undefined ? Number(sourceTelemetry.sleepHours) : undefined,
-      recoveryMinutes: sourceTelemetry.recoveryMinutes !== undefined ? Number(sourceTelemetry.recoveryMinutes) : undefined,
-      isUnfit: sourceTelemetry.isUnfit === true,
+      ...(function () {
+        const format = sourceMatchContext.format || legacyMatch.format || signals.format || 'T20';
+        const derivedMaxOvers = maxOversByFormat(format);
+        const rawMaxOvers = toNum(sourceTelemetry.maxOvers ?? signals.maxOvers, derivedMaxOvers);
+        const maxOvers = Math.max(1, Math.floor(rawMaxOvers));
+        const rawOvers = toNum(sourceTelemetry.oversBowled ?? signals.oversBowled, Number.NaN);
+        const oversBowled = Number.isFinite(rawOvers) ? Math.min(maxOvers, Math.max(0, rawOvers)) : Number.NaN;
+        const rawOversRemaining = toNum(sourceTelemetry.oversRemaining ?? signals.oversRemaining, Number.NaN);
+        const oversRemaining = Number.isFinite(rawOversRemaining)
+          ? Math.min(maxOvers, Math.max(0, rawOversRemaining))
+          : Number.isFinite(oversBowled)
+            ? Math.max(0, maxOvers - oversBowled)
+            : Number.NaN;
+        const rawSpell = toNum(sourceTelemetry.consecutiveOvers ?? signals.consecutiveOvers, Number.NaN);
+        const consecutiveOvers = Number.isFinite(rawSpell)
+          ? Math.min(Math.max(0, rawSpell), Number.isFinite(oversBowled) ? oversBowled : maxOvers)
+          : 0;
+        return {
+          oversBowled,
+          consecutiveOvers,
+          oversRemaining,
+          maxOvers,
+        };
+      })(),
+      playerId: String(sourceTelemetry.playerId || sourceTelemetry.id || 'UNKNOWN'),
+      playerName: String(sourceTelemetry.playerName || sourceTelemetry.name || 'Unknown Player'),
+      role: String(sourceTelemetry.role || sourceTelemetry.playerRole || 'Unknown Role'),
+      fatigueIndex,
+      heartRateRecovery: String(
+        sourceTelemetry.heartRateRecovery || signals.heartRateRecovery || ''
+      ),
+      injuryRisk: injuryRisk as OrchestrateRequest['telemetry']['injuryRisk'],
+      noBallRisk: noBallRisk as OrchestrateRequest['telemetry']['noBallRisk'],
+      fatigueLimit: toOptionalNumber(sourceTelemetry.fatigueLimit ?? signals.fatigueLimit),
+      sleepHours: toOptionalNumber(sourceTelemetry.sleepHours ?? signals.sleepHours),
+      recoveryMinutes: toOptionalNumber(sourceTelemetry.recoveryMinutes ?? signals.recoveryMinutes),
+      isUnfit: injuryFlag,
+      quotaComplete:
+        sourceTelemetry.quotaComplete === true ||
+        signals.quotaComplete === true ||
+        false,
     },
     matchContext: {
-      phase: String(sourceMatchContext.phase).toLowerCase() as OrchestrateRequest['matchContext']['phase'],
-      requiredRunRate: Number(sourceMatchContext.requiredRunRate),
-      currentRunRate: Number(sourceMatchContext.currentRunRate),
-      wicketsInHand: Number(sourceMatchContext.wicketsInHand),
-      oversRemaining: Number(sourceMatchContext.oversRemaining),
-      format: sourceMatchContext.format ? String(sourceMatchContext.format) : undefined,
-      over: sourceMatchContext.over !== undefined ? Number(sourceMatchContext.over) : undefined,
-      intensity: sourceMatchContext.intensity ? String(sourceMatchContext.intensity) : undefined,
-      conditions: sourceMatchContext.conditions ? String(sourceMatchContext.conditions) : undefined,
-      target: sourceMatchContext.target !== undefined ? Number(sourceMatchContext.target) : undefined,
-      score: sourceMatchContext.score !== undefined ? Number(sourceMatchContext.score) : undefined,
-      balls: sourceMatchContext.balls !== undefined ? Number(sourceMatchContext.balls) : undefined,
+      phase: normalizePhase(sourceMatchContext.phase ?? signals.phase),
+      requiredRunRate: toNum(sourceMatchContext.requiredRunRate ?? signals.requiredRunRate, 0),
+      currentRunRate: toNum(sourceMatchContext.currentRunRate ?? signals.currentRunRate, 0),
+      wicketsInHand: Math.max(0, toNum(sourceMatchContext.wicketsInHand ?? signals.wicketsInHand, 7)),
+      oversRemaining: Math.max(0, toNum(sourceMatchContext.oversRemaining ?? signals.oversRemaining, 10)),
+      format: String(sourceMatchContext.format || legacyMatch.format || signals.format || 'T20'),
+      over: toOptionalNumber(sourceMatchContext.over ?? legacyMatch.over ?? signals.over),
+      intensity: String(sourceMatchContext.intensity || legacyMatch.intensity || signals.intensity || 'Medium'),
+      conditions: sourceMatchContext.conditions
+        ? String(sourceMatchContext.conditions)
+        : signals.conditions
+          ? String(signals.conditions)
+          : undefined,
+      target: toOptionalNumber(sourceMatchContext.target ?? legacyMatch.target ?? signals.target),
+      score: toOptionalNumber(sourceMatchContext.score ?? legacyMatch.score ?? signals.score),
+      balls: toOptionalNumber(sourceMatchContext.balls ?? legacyMatch.balls ?? signals.balls),
     },
-    players: {
-      striker: String(players.striker),
-      nonStriker: String(players.nonStriker),
-      bowler: String(players.bowler),
-      bench: Array.isArray(players.bench) ? players.bench.map((x) => String(x)) : undefined,
-    },
+    players: normalizePlayers(payload.players ?? [], String(sourceTelemetry.playerName || 'Current Bowler')),
   };
 
   return { ok: true, value };
@@ -175,6 +255,9 @@ export const validateTacticalRequest = (body: unknown): { ok: true; value: Tacti
         heartRateRecovery: String(telemetry.heartRateRecovery || 'Moderate'),
         oversBowled: Number(telemetry.oversBowled || 0),
         consecutiveOvers: Number(telemetry.consecutiveOvers || 0),
+        oversRemaining: telemetry.oversRemaining !== undefined ? Number(telemetry.oversRemaining) : undefined,
+        maxOvers: telemetry.maxOvers !== undefined ? Number(telemetry.maxOvers) : undefined,
+        quotaComplete: telemetry.quotaComplete === true,
         injuryRisk: String(telemetry.injuryRisk || 'MEDIUM').toUpperCase() as TacticalAgentInput['telemetry']['injuryRisk'],
         noBallRisk: String(telemetry.noBallRisk || 'MEDIUM').toUpperCase() as TacticalAgentInput['telemetry']['noBallRisk'],
         fatigueLimit: telemetry.fatigueLimit !== undefined ? Number(telemetry.fatigueLimit) : undefined,

@@ -1,6 +1,7 @@
 import { FatigueAgentRequest, FatigueAgentResponse, RiskAgentRequest, RiskAgentResponse } from '../shared/types';
 
 export type OrchestrateMode = 'auto' | 'full';
+export type OrchestrateRequestMode = 'route' | 'auto' | 'full';
 export type OrchestrateIntent = 'monitor' | 'substitution' | 'strategy' | 'full';
 export type RouterIntent = 'fatigue_check' | 'risk_check' | 'substitution' | 'full';
 
@@ -34,6 +35,9 @@ export interface TelemetryInput {
   heartRateRecovery: string;
   oversBowled: number;
   consecutiveOvers: number;
+  oversRemaining?: number;
+  maxOvers?: number;
+  quotaComplete?: boolean;
   injuryRisk: FatigueAgentRequest['injuryRisk'];
   noBallRisk: FatigueAgentRequest['noBallRisk'];
   fatigueLimit?: number;
@@ -91,6 +95,8 @@ export interface RouterDecision {
     heartRateRecovery: string;
     oversBowled: number;
     consecutiveOvers: number;
+    maxOvers?: number;
+    quotaComplete?: boolean;
     phase: string;
     wicketsInHand: number;
     oversRemaining: number;
@@ -106,10 +112,25 @@ export interface TacticalAgentResult {
 
 export interface OrchestrateRequest {
   mode?: OrchestrateMode;
+  rawMode?: OrchestrateRequestMode;
   intent?: OrchestrateIntent;
+  text?: string;
+  signals?: Record<string, unknown>;
   matchContext: TacticalMatchContext;
   telemetry: TelemetryInput;
   players: TacticalPlayersInput;
+}
+
+export interface OrchestrateRequestBody {
+  text?: string;
+  mode?: OrchestrateRequestMode | string;
+  intent?: OrchestrateIntent | string;
+  telemetry?: Partial<TelemetryInput> | Record<string, unknown>;
+  matchContext?: Partial<TacticalMatchContext> | Record<string, unknown>;
+  players?: TacticalPlayersInput | string[] | Record<string, unknown>;
+  signals?: Record<string, unknown>;
+  player?: Record<string, unknown>;
+  match?: Record<string, unknown>;
 }
 
 export interface AgentError {
@@ -169,6 +190,7 @@ export interface OrchestrateResponse {
     confidence: number;
     source: 'MODEL' | 'FALLBACK';
   };
+  riskDebug?: RiskAgentResponse['riskDebug'];
   routerDecision: RouterDecision;
   meta: {
     requestId: string;
@@ -202,6 +224,13 @@ export const toFatigueRequest = (input: OrchestrateRequest, snapshotId: string):
   role: String(input.telemetry.role || 'Unknown Role'),
   oversBowled: Math.max(0, Number(input.telemetry.oversBowled) || 0),
   consecutiveOvers: Math.max(0, Number(input.telemetry.consecutiveOvers) || 0),
+  oversRemaining: Number.isFinite(Number(input.telemetry.oversRemaining))
+    ? Math.max(0, Number(input.telemetry.oversRemaining))
+    : undefined,
+  maxOvers: Number.isFinite(Number(input.telemetry.maxOvers))
+    ? Math.max(1, Number(input.telemetry.maxOvers))
+    : undefined,
+  quotaComplete: Boolean(input.telemetry.quotaComplete),
   fatigueIndex: Math.max(0, Math.min(10, Number(input.telemetry.fatigueIndex) || 0)),
   injuryRisk: String(input.telemetry.injuryRisk || 'MEDIUM').toUpperCase() as FatigueAgentRequest['injuryRisk'],
   noBallRisk: String(input.telemetry.noBallRisk || 'MEDIUM').toUpperCase() as FatigueAgentRequest['noBallRisk'],
@@ -220,12 +249,33 @@ export const toFatigueRequest = (input: OrchestrateRequest, snapshotId: string):
 
 export const toRiskRequest = (input: OrchestrateRequest): RiskAgentRequest => ({
   playerId: String(input.telemetry.playerId || 'UNKNOWN'),
-  fatigueIndex: Math.max(0, Math.min(10, Number(input.telemetry.fatigueIndex) || 0)),
-  injuryRisk: String(input.telemetry.injuryRisk || 'MEDIUM').toUpperCase() as RiskAgentRequest['injuryRisk'],
-  noBallRisk: String(input.telemetry.noBallRisk || 'MEDIUM').toUpperCase() as RiskAgentRequest['noBallRisk'],
-  oversBowled: Math.max(0, Number(input.telemetry.oversBowled) || 0),
-  consecutiveOvers: Math.max(0, Number(input.telemetry.consecutiveOvers) || 0),
-  heartRateRecovery: String(input.telemetry.heartRateRecovery || 'Moderate'),
+  fatigueIndex: Number.isFinite(Number(input.telemetry.fatigueIndex))
+    ? Math.max(0, Math.min(10, Number(input.telemetry.fatigueIndex)))
+    : Number.NaN,
+  injuryRisk: String(input.telemetry.injuryRisk || 'UNKNOWN').toUpperCase() as RiskAgentRequest['injuryRisk'],
+  noBallRisk: String(input.telemetry.noBallRisk || 'UNKNOWN').toUpperCase() as RiskAgentRequest['noBallRisk'],
+  oversBowled: Number.isFinite(Number(input.telemetry.oversBowled))
+    ? Math.max(0, Number(input.telemetry.oversBowled))
+    : Number.NaN,
+  consecutiveOvers: (() => {
+    const overs = Number.isFinite(Number(input.telemetry.oversBowled))
+      ? Math.max(0, Number(input.telemetry.oversBowled))
+      : Number.NaN;
+    const spell = Number.isFinite(Number(input.telemetry.consecutiveOvers))
+      ? Math.max(0, Number(input.telemetry.consecutiveOvers))
+      : Number.NaN;
+    if (!Number.isFinite(overs) || !Number.isFinite(spell)) return spell;
+    return Math.min(spell, overs);
+  })(),
+  heartRateRecovery: input.telemetry.heartRateRecovery ? String(input.telemetry.heartRateRecovery) : undefined,
+  isUnfit: Boolean(input.telemetry.isUnfit),
+  oversRemaining: Number.isFinite(Number(input.telemetry.oversRemaining))
+    ? Math.max(0, Number(input.telemetry.oversRemaining))
+    : undefined,
+  maxOvers: Number.isFinite(Number(input.telemetry.maxOvers))
+    ? Math.max(1, Number(input.telemetry.maxOvers))
+    : undefined,
+  quotaComplete: Boolean(input.telemetry.quotaComplete),
   format: String(input.matchContext.format || 'T20'),
   phase: String(input.matchContext.phase || 'Middle'),
   intensity: String(input.matchContext.intensity || 'Medium'),

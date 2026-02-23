@@ -1,0 +1,58 @@
+[
+  {
+    "id": "B. Stokes",
+    "type": "playerBaseline",
+    "name": "B. Stokes",
+    "role": "AR",
+    "sleep": 7.1,
+    "recovery": 55,
+    "fatigueLimit": 6,
+    "control": 76,
+    "speed": 8,
+    "power": 8,
+    "active": true,
+    "updatedAt": "2026-02-22T11:30:15.029Z"
+  },
+  {
+    "id": "J. Archer",
+    "type": "playerBaseline",
+    "name": "J. Archer",
+    "role": "FAST",
+    "sleep": 7.2,
+    "recovery": 48,
+    "fatigueLimit": 6,
+    "control": 82,
+    "speed": 9,
+    "power": 4,
+    "active": true,
+    "updatedAt": "2026-02-22T11:30:15.029Z"
+  },
+  {
+    "id": "M. Starc",
+    "type": "playerBaseline",
+    "name": "M. Starc",
+    "role": "FAST",
+    "sleep": 6.9,
+    "recovery": 50,
+    "fatigueLimit": 6,
+    "control": 80,
+    "speed": 9,
+    "power": 4,
+    "active": true,
+    "updatedAt": "2026-02-22T11:30:15.029Z"
+  },
+  {
+    "id": "R. Khan",
+    "type": "playerBaseline",
+    "name": "R. Khan",
+    "role": "SPIN",
+    "sleep": 7.6,
+    "recovery": 42,
+    "fatigueLimit": 5,
+    "control": 90,
+    "speed": 6,
+    "power": 5,
+    "active": true,
+    "updatedAt": "2026-02-22T11:30:15.029Z"
+  }
+]
