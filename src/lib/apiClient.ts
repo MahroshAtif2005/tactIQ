@@ -45,7 +45,6 @@ const fatigueEndpoint = resolveApiUrl('/api/agents/fatigue');
 const riskEndpoint = resolveApiUrl('/api/agents/risk');
 const orchestrateEndpoint = apiOrchestrateUrl;
 const baselinesEndpoint = resolveApiUrl('/api/baselines');
-const rosterEndpoint = resolveApiUrl('/api/roster');
 
 interface ApiClientErrorOptions {
   message: string;
@@ -414,11 +413,6 @@ export interface BaselinesResponse {
   warning?: string;
 }
 
-export interface BaselinePatch {
-  active?: boolean;
-  inRoster?: boolean;
-}
-
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
 const toNumberOr = (value: unknown, fallback: number): number => {
   const parsed = Number(value);
@@ -444,23 +438,11 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
   const controlBaseline = Number(item.control ?? item.controlBaseline);
   const speed = Number(item.speed);
   const power = Number(item.power);
-  const isActive =
-    typeof item.active === 'boolean'
-      ? item.active
-      : typeof item.isActive === 'boolean'
-        ? item.isActive
-        : true;
-  const inRoster =
-    typeof item.inRoster === 'boolean'
-      ? item.inRoster
-      : typeof item.roster === 'boolean'
-        ? item.roster
-        : false;
+  const isActive = typeof item.active === 'boolean' ? item.active : Boolean(item.isActive);
   const name = String(item.name || id).trim() || id;
 
   return {
     id,
-    type: 'playerBaseline',
     playerId: id,
     name,
     role,
@@ -475,7 +457,6 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
     recovery: Number.isFinite(recoveryMinutes) ? clamp(recoveryMinutes, 0, 240) : 45,
     control: Number.isFinite(controlBaseline) ? clamp(controlBaseline, 0, 100) : 78,
     active: isActive,
-    inRoster,
     orderIndex: normalizeOrderIndex(item.orderIndex),
     createdAt: typeof item.createdAt === 'string' ? item.createdAt : undefined,
     updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : undefined,
@@ -509,27 +490,8 @@ export async function getBaselines(signal?: AbortSignal): Promise<Baseline[]> {
   return response.baselines;
 }
 
-export async function getRosterPlayers(signal?: AbortSignal): Promise<Baseline[]> {
-  const raw = await getJson<unknown>(rosterEndpoint, signal);
-  if (Array.isArray(raw)) {
-    return raw.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
-  }
-
-  if (raw && typeof raw === 'object') {
-    const record = raw as Record<string, unknown>;
-    const rows = Array.isArray(record.players)
-      ? record.players
-      : Array.isArray(record.baselines)
-        ? record.baselines
-        : [];
-    return rows.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
-  }
-  return [];
-}
-
 export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal): Promise<Baseline[]> {
   const players: PlayerBaseline[] = baselines.map((row) => ({
-    type: 'playerBaseline',
     id: String(row.id || row.playerId || '').trim(),
     role: row.role,
     sleep: clamp(toNumberOr(row.sleep ?? row.sleepHoursToday, 7), 0, 12),
@@ -539,7 +501,6 @@ export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal)
     speed: clamp(toNumberOr(row.speed, 7), 0, 100),
     power: clamp(toNumberOr(row.power, 0), 0, 100),
     active: typeof row.active === 'boolean' ? row.active : Boolean(row.isActive),
-    inRoster: typeof row.inRoster === 'boolean' ? row.inRoster : false,
     name: String(row.name || row.id || row.playerId || '').trim() || undefined,
     ...(normalizeOrderIndex(row.orderIndex) > 0 ? { orderIndex: normalizeOrderIndex(row.orderIndex) } : {}),
     createdAt: row.createdAt,
@@ -569,16 +530,8 @@ export async function updateBaselineActive(
   active: boolean,
   signal?: AbortSignal
 ): Promise<Baseline | null> {
-  return updateBaseline(baselineId, { active }, signal);
-}
-
-export async function updateBaseline(
-  baselineId: string,
-  patch: BaselinePatch,
-  signal?: AbortSignal
-): Promise<Baseline | null> {
   const id = encodeURIComponent(String(baselineId || '').trim());
-  const raw = await patchJson<unknown>(`${baselinesEndpoint}/${id}`, patch, signal);
+  const raw = await patchJson<unknown>(`${baselinesEndpoint}/${id}`, { active }, signal);
   if (raw && typeof raw === 'object') {
     const record = raw as Record<string, unknown>;
     const candidate = normalizeBaseline(record.player ?? record.baseline ?? record);
