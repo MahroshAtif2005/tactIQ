@@ -3328,3 +3328,37 @@ body {
 .neon-breathe {
   animation: neon-breathe 2.5s ease-in-out infinite;
 }
+
+.dismissal-pill {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: 44px !important;
+  padding: 0 18px !important;
+  border-radius: 9999px !important;
+
+  background: rgba(255,255,255,0.06) !important;
+  border: 1px solid rgba(255,255,255,0.18) !important;
+
+  color: rgba(255,255,255,0.92) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.2px !important;
+
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06) !important;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease !important;
+}
+
+.dismissal-pill:hover {
+  background: rgba(255,255,255,0.10) !important;
+  border-color: rgba(255,255,255,0.26) !important;
+}
+
+.dismissal-pill:active {
+  transform: translateY(1px) !important;
+}
+
+.dismissal-pill:focus,
+.dismissal-pill:focus-visible {
+  outline: none !important;
+  box-shadow: 0 0 0 2px rgba(124,58,237,0.35), inset 0 1px 0 rgba(255,255,255,0.06) !important;
+}
