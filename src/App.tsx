@@ -85,6 +85,8 @@ interface MatchState {
   target?: number;
 }
 
+type DismissalStatus = 'NOT_OUT' | 'OUT';
+
 interface Player {
   id: string;
   baselineId?: string;
@@ -106,6 +108,7 @@ interface Player {
   runs: number;
   balls: number;
   boundaryEvents: Array<'4' | '6'>;
+  dismissalStatus?: DismissalStatus;
   isDismissed?: boolean;
   dismissalType?: 'Bowled' | 'Caught' | 'LBW' | 'Run Out' | 'Not Out';
   // Baseline Data
@@ -234,7 +237,7 @@ const INITIAL_PLAYERS: Player[] = [
     isActive: true,
     lastRestOvers: 0,
     overs: 2, consecutiveOvers: 2, fatigue: 3, hrRecovery: 'Good', injuryRisk: 'Low', noBallRisk: 'Low',
-    runs: 0, balls: 0, boundaryEvents: [], isDismissed: false, dismissalType: 'Not Out',
+    runs: 0, balls: 0, boundaryEvents: [], dismissalStatus: 'NOT_OUT', dismissalType: 'Not Out',
     baselineFatigue: 6, sleepHours: 7.5, recoveryTime: 45, controlBaseline: 80, speed: 9, power: 7
   },
   { 
@@ -242,7 +245,7 @@ const INITIAL_PLAYERS: Player[] = [
     isActive: true,
     lastRestOvers: 7,
     overs: 8, consecutiveOvers: 1, fatigue: 4, hrRecovery: 'Good', injuryRisk: 'Low', noBallRisk: 'Low',
-    runs: 0, balls: 0, boundaryEvents: [], isDismissed: false, dismissalType: 'Not Out',
+    runs: 0, balls: 0, boundaryEvents: [], dismissalStatus: 'NOT_OUT', dismissalType: 'Not Out',
     baselineFatigue: 8, sleepHours: 6, recoveryTime: 30, controlBaseline: 88, speed: 7, power: 5
   },
   { 
@@ -250,7 +253,7 @@ const INITIAL_PLAYERS: Player[] = [
     isActive: true,
     lastRestOvers: 0,
     overs: 3, consecutiveOvers: 3, fatigue: 5, hrRecovery: 'Moderate', injuryRisk: 'Medium', noBallRisk: 'Low',
-    runs: 24, balls: 18, boundaryEvents: ['4', '4', '6'], isDismissed: false, dismissalType: 'Not Out',
+    runs: 24, balls: 18, boundaryEvents: ['4', '4', '6'], dismissalStatus: 'NOT_OUT', dismissalType: 'Not Out',
     baselineFatigue: 5, sleepHours: 8, recoveryTime: 50, controlBaseline: 76, speed: 8, power: 8
   },
   { 
@@ -258,7 +261,7 @@ const INITIAL_PLAYERS: Player[] = [
     isActive: true,
     lastRestOvers: 10,
     overs: 10, consecutiveOvers: 0, fatigue: 7, hrRecovery: 'Poor', injuryRisk: 'High', noBallRisk: 'Medium',
-    runs: 0, balls: 0, boundaryEvents: [], isDismissed: false, dismissalType: 'Not Out',
+    runs: 0, balls: 0, boundaryEvents: [], dismissalStatus: 'NOT_OUT', dismissalType: 'Not Out',
     baselineFatigue: 7, sleepHours: 5.5, recoveryTime: 60, controlBaseline: 82, speed: 8, power: 8
   },
 ];
@@ -275,7 +278,7 @@ const GlowingBackButton = ({
   size?: 'default' | 'large';
 }) => {
   return (
-    <button 
+    <button type="button" 
       onClick={onClick}
       className="group flex items-center gap-3 text-slate-400 hover:text-white transition-colors px-2 py-2"
     >
@@ -650,6 +653,109 @@ const orderBaselinesForDisplay = (rows: Baseline[]): Baseline[] => {
 
 const MAX_ROSTER = 11;
 const BASELINES_CHANGED_EVENT = 'tactiq-baselines-changed';
+const BATTER_DISMISSAL_STORAGE_KEY = 'tactiq_batter_dismissal_v1';
+
+interface DismissalSessionEntry {
+  status: DismissalStatus;
+  dismissalType: Player['dismissalType'];
+}
+
+type DismissalSessionState = Record<string, DismissalSessionEntry>;
+
+const resolveDismissalStatus = (player: Pick<Player, 'dismissalStatus' | 'isDismissed'>): DismissalStatus => {
+  if (player.dismissalStatus === 'OUT' || player.dismissalStatus === 'NOT_OUT') return player.dismissalStatus;
+  return player.isDismissed ? 'OUT' : 'NOT_OUT';
+};
+
+const resolveDismissalType = (
+  status: DismissalStatus,
+  fallback?: Player['dismissalType']
+): Player['dismissalType'] => {
+  if (status === 'NOT_OUT') return 'Not Out';
+  if (fallback && fallback !== 'Not Out') return fallback;
+  return 'Caught';
+};
+
+const normalizeDismissalPlayerState = (player: Player): Player => {
+  const status = resolveDismissalStatus(player);
+  return {
+    ...player,
+    dismissalStatus: status,
+    isDismissed: status === 'OUT',
+    dismissalType: resolveDismissalType(status, player.dismissalType),
+  };
+};
+
+const readDismissalSessionState = (): DismissalSessionState => {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(BATTER_DISMISSAL_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return {};
+
+    const entries = Object.entries(parsed as Record<string, unknown>);
+    return entries.reduce<DismissalSessionState>((acc, [key, value]) => {
+      if (!value || typeof value !== 'object') return acc;
+      const record = value as Partial<DismissalSessionEntry>;
+      if (record.status !== 'OUT' && record.status !== 'NOT_OUT') return acc;
+      acc[String(key)] = {
+        status: record.status,
+        dismissalType: resolveDismissalType(record.status, record.dismissalType),
+      };
+      return acc;
+    }, {});
+  } catch {
+    return {};
+  }
+};
+
+const writeDismissalSessionState = (state: DismissalSessionState): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(BATTER_DISMISSAL_STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore storage write failures.
+  }
+};
+
+const persistDismissalStatusForPlayer = (
+  playerId: string,
+  status: DismissalStatus,
+  dismissalType?: Player['dismissalType']
+): void => {
+  const key = baselineKey(playerId);
+  if (!key) return;
+  const state = readDismissalSessionState();
+  state[key] = {
+    status,
+    dismissalType: resolveDismissalType(status, dismissalType),
+  };
+  writeDismissalSessionState(state);
+};
+
+const clearDismissalStatusForPlayer = (playerId: string): void => {
+  const key = baselineKey(playerId);
+  if (!key) return;
+  const state = readDismissalSessionState();
+  if (!(key in state)) return;
+  delete state[key];
+  writeDismissalSessionState(state);
+};
+
+const hydrateDismissalStateFromSession = (players: Player[]): Player[] => {
+  const state = readDismissalSessionState();
+  return players.map((player) => {
+    const key = baselineKey(player.id);
+    const entry = key ? state[key] : undefined;
+    if (!entry) return normalizeDismissalPlayerState(player);
+    return normalizeDismissalPlayerState({
+      ...player,
+      dismissalStatus: entry.status,
+      dismissalType: entry.dismissalType,
+    });
+  });
+};
 
 const resolveRosterIdsFromBaselines = (candidateIds: string[], baselines: Baseline[]): string[] => {
   const ordered = orderBaselinesForDisplay(baselines)
@@ -764,7 +870,7 @@ const buildRosterPlayersFromBaselines = (
         runs: 0,
         balls: 0,
         boundaryEvents: [],
-        isDismissed: false,
+        dismissalStatus: 'NOT_OUT',
         dismissalType: 'Not Out',
         baselineFatigue: baseline.fatigueLimit,
         sleepHours: baseline.sleepHoursToday,
@@ -775,7 +881,8 @@ const buildRosterPlayersFromBaselines = (
         recoveryOffset: 0,
       } satisfies Player;
     })
-    .filter((row): row is Player => Boolean(row));
+    .filter((row): row is Player => Boolean(row))
+    .map((row) => normalizeDismissalPlayerState(row));
 };
 
 const formatMMSS = (s: number): string => {
@@ -931,11 +1038,12 @@ export default function App() {
       setWorkingBaselines(syncedBaselines);
       setPlayers((prev) => {
         const derivedRoster = buildRosterPlayersFromBaselines(prev, syncedBaselines, resolvedIds);
+        const hydratedRoster = hydrateDismissalStateFromSession(derivedRoster);
         setActivePlayerId((currentId) => {
-          if (derivedRoster.some((player) => player.id === currentId)) return currentId;
-          return derivedRoster[0]?.id ?? '';
+          if (hydratedRoster.some((player) => player.id === currentId)) return currentId;
+          return hydratedRoster[0]?.id ?? '';
         });
-        return derivedRoster;
+        return hydratedRoster;
       });
       if (import.meta.env.DEV) {
         console.log('[roster-sync] applyBaselinesToRoster', {
@@ -1097,9 +1205,12 @@ export default function App() {
     };
   }, [activeDerived, normalizedPhase, matchContext, matchState.ballsBowled]);
 
-  const updateMatchState = (updates: Partial<MatchState>) => {
+  const updateMatchState = (
+    updates: Partial<MatchState> | ((prev: MatchState) => Partial<MatchState>)
+  ) => {
     setMatchState(prev => {
-      const next = { ...prev, ...updates };
+      const patch = typeof updates === 'function' ? updates(prev) : updates;
+      const next = { ...prev, ...patch };
       const maxBalls = totalBallsFromOvers(next.totalOvers);
       next.ballsBowled = Math.min(maxBalls, Math.max(0, Math.floor(next.ballsBowled)));
       next.wickets = Math.min(10, Math.max(0, Math.floor(next.wickets)));
@@ -1237,7 +1348,7 @@ export default function App() {
         ...sanitizeBowlerWorkload(updated, matchContext.format),
       };
 
-      return updated;
+      return normalizeDismissalPlayerState(updated);
     }));
   };
 
@@ -1263,11 +1374,12 @@ export default function App() {
     setMatchRosterIds(resolvedIds);
     setPlayers((prevPlayers) => {
       const derivedRoster = buildRosterPlayersFromBaselines(prevPlayers, nextBaselines, resolvedIds);
+      const hydratedRoster = hydrateDismissalStateFromSession(derivedRoster);
       setActivePlayerId((currentId) => {
-        if (derivedRoster.some((player) => player.id === currentId)) return currentId;
-        return derivedRoster[0]?.id ?? '';
+        if (hydratedRoster.some((player) => player.id === currentId)) return currentId;
+        return hydratedRoster[0]?.id ?? '';
       });
-      return derivedRoster;
+      return hydratedRoster;
     });
     if (import.meta.env.DEV) {
       console.log('[roster-sync] applyMatchRosterIds', {
@@ -1335,6 +1447,7 @@ export default function App() {
       return nextResolvedIds[replacementIndex] ?? '';
     });
     setRosterMutationError(null);
+    clearDismissalStatusForPlayer(normalizedId);
   };
 
   useEffect(() => {
@@ -1643,12 +1756,16 @@ export default function App() {
       typeof matchState.target === 'number' && matchState.target > 0 && ballsRemaining > 0
         ? Math.max(0, (matchState.target - matchState.runs) / (ballsRemaining / 6))
         : currentRunRate;
-    const batsmen = players.filter((p) => p.role === 'Batsman' && p.inRoster !== false && !p.isDismissed);
+    const batsmen = players.filter((p) => {
+      if (p.role !== 'Batsman') return false;
+      if (p.inRoster === false) return false;
+      return resolveDismissalStatus(p) !== 'OUT';
+    });
     const bench = players
       .filter((p) => {
         if (p.id === activePlayer?.id) return false;
         if (p.inRoster === false) return false;
-        if (p.isDismissed) return false;
+        if (resolveDismissalStatus(p) === 'OUT') return false;
         const workload = sanitizeBowlerWorkload(p, matchContext.format);
         return workload.oversRemaining > 0;
       })
@@ -1860,11 +1977,12 @@ export default function App() {
     }
     setPlayers((prev) => {
       const derivedRoster = buildRosterPlayersFromBaselines(prev, syncedBaselines, resolvedRosterIds);
+      const hydratedRoster = hydrateDismissalStateFromSession(derivedRoster);
       setActivePlayerId((currentId) => {
-        if (derivedRoster.some((player) => player.id === currentId)) return currentId;
-        return derivedRoster[0]?.id ?? '';
+        if (hydratedRoster.some((player) => player.id === currentId)) return currentId;
+        return hydratedRoster[0]?.id ?? '';
       });
-      return derivedRoster;
+      return hydratedRoster;
     });
     if (import.meta.env.DEV) {
       console.log('[roster-sync] handleBaselinesSynced', {
@@ -1922,13 +2040,13 @@ export default function App() {
             <div className="flex items-center gap-6 relative">
               {page !== 'landing' && (
                 <>
-                  <button 
+                  <button type="button" 
                     onClick={() => navigateTo('dashboard')}
                     className={`text-sm font-medium transition-colors px-3 py-1.5 rounded-md ${page === 'dashboard' ? 'bg-emerald-500/10 text-emerald-400' : 'text-slate-400 hover:text-white'}`}
                   >
                     Dashboard
                   </button>
-                  <button 
+                  <button type="button" 
                     onClick={() => navigateTo('baselines')}
                     className={`text-sm font-medium transition-colors px-3 py-1.5 rounded-md ${page === 'baselines' ? 'bg-emerald-500/10 text-emerald-400' : 'text-slate-400 hover:text-white'}`}
                   >
@@ -1939,7 +2057,7 @@ export default function App() {
               
               {/* Profile Dropdown */}
               <div className="relative">
-                <button 
+                <button type="button" 
                   onClick={() => setIsProfileOpen(!isProfileOpen)}
                   className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-slate-700 text-xs font-medium text-slate-400 hover:text-white hover:border-emerald-500 transition-colors"
                 >
@@ -1963,10 +2081,10 @@ export default function App() {
                           <p className="text-xs text-slate-400">coach.mahrosh@tactical.ai</p>
                         </div>
                       </div>
-                      <button className="w-full flex items-center gap-2 text-sm text-slate-400 hover:text-white py-2 px-2 hover:bg-white/5 rounded-lg transition-colors">
+                      <button type="button" className="w-full flex items-center gap-2 text-sm text-slate-400 hover:text-white py-2 px-2 hover:bg-white/5 rounded-lg transition-colors">
                         <Settings className="w-4 h-4" /> Account Settings
                       </button>
-                      <button className="w-full flex items-center gap-2 text-sm text-rose-400 hover:text-rose-300 py-2 px-2 hover:bg-rose-500/10 rounded-lg transition-colors">
+                      <button type="button" className="w-full flex items-center gap-2 text-sm text-rose-400 hover:text-rose-300 py-2 px-2 hover:bg-rose-500/10 rounded-lg transition-colors">
                         <LogOut className="w-4 h-4" /> Sign Out
                       </button>
                     </motion.div>
@@ -2005,13 +2123,13 @@ export default function App() {
                   </p>
                   
                   <div className="flex gap-3 w-full">
-                    <button 
+                    <button type="button" 
                        onClick={() => updatePlayer(activePlayer.id, { isInjured: false })}
                        className="flex-1 py-3 rounded-xl bg-slate-800 text-slate-300 font-bold hover:bg-slate-700 transition-colors text-sm"
                     >
                       Dismiss
                     </button>
-                    <button 
+                    <button type="button" 
                        onClick={() => movePlayerToSub(activePlayer.id)}
                        className="flex-1 py-3 rounded-xl bg-rose-600 text-white font-bold hover:bg-rose-500 shadow-lg shadow-rose-900/20 transition-colors flex items-center justify-center gap-2 text-sm"
                     >
@@ -2100,7 +2218,7 @@ export default function App() {
       
       {/* Help Icon (Bottom Right from screenshot) */}
       <div className="fixed bottom-6 right-6 z-50">
-        <button className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center hover:bg-slate-700 hover:text-white transition-colors shadow-lg border border-white/5">
+        <button type="button" className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center hover:bg-slate-700 hover:text-white transition-colors shadow-lg border border-white/5">
           <HelpCircle className="w-4 h-4" />
         </button>
       </div>
@@ -2139,7 +2257,7 @@ function LandingPage({ onStart }: { onStart: () => void }) {
           <p className="text-xl text-slate-400 mb-12 font-medium">Tactical Coach AI</p>
           
           <div className="flex justify-center mb-24">
-            <button 
+            <button type="button" 
               onClick={onStart}
               className="group relative bg-emerald-600 hover:bg-emerald-500 text-white px-8 py-4 rounded-xl text-lg font-bold transition-all flex items-center gap-4 shadow-[0_0_30px_rgba(16,185,129,0.3)] hover:shadow-[0_0_50px_rgba(16,185,129,0.6)] active:scale-95 overflow-hidden"
             >
@@ -2239,7 +2357,7 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
             <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 block">Match Format</label>
             <div className="grid grid-cols-3 gap-3">
               {['T20', 'ODI', 'Test'].map(opt => (
-                <button
+                <button type="button"
                   key={opt}
                   onClick={() => handleChange('format', opt)}
                   className={`py-3 rounded-lg text-sm font-semibold transition-all border ${
@@ -2258,7 +2376,7 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 block">Match Phase</label>
              <div className="grid grid-cols-3 gap-3">
               {['Powerplay', 'Middle', 'Death'].map(opt => (
-                <button
+                <button type="button"
                   key={opt}
                   onClick={() => handleChange('phase', opt)}
                   className={`py-3 rounded-lg text-sm font-semibold transition-all border ${
@@ -2287,13 +2405,13 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
             <div className="space-y-3">
                <label className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Weather</label>
                 <div className="flex gap-2">
-                  <button 
+                  <button type="button" 
                     onClick={() => handleChange('weather', 'Cool')}
                     className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg text-sm font-medium border ${context.weather === 'Cool' ? 'bg-indigo-500/20 border-indigo-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400'}`}
                   >
                     <Wind className="w-4 h-4" /> Cool
                   </button>
-                  <button 
+                  <button type="button" 
                     onClick={() => handleChange('weather', 'Hot')}
                     className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg text-sm font-medium border ${context.weather === 'Hot' ? 'bg-orange-500/20 border-orange-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400'}`}
                   >
@@ -2303,7 +2421,7 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
             </div>
           </div>
 
-          <button 
+          <button type="button" 
             onClick={onNext}
             className="w-full mt-6 bg-emerald-600 hover:bg-emerald-500 text-white py-4 rounded-lg font-bold transition-all shadow-lg shadow-emerald-900/50"
           >
@@ -2318,6 +2436,11 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
 interface FatigueForecastPoint {
   overAhead: number;
   fatigue: number;
+}
+
+interface PressureForecastPoint {
+  overAhead: number;
+  pressure: number;
 }
 
 const FORECAST_OVERS = [0, 1, 2, 3, 4, 5];
@@ -2476,6 +2599,154 @@ function FatigueForecastChart({
   );
 }
 
+const buildPressureForecast = ({
+  currentPressure,
+  requiredRunRate,
+  currentRunRate,
+  wicketsDown,
+  phase,
+}: {
+  currentPressure: number;
+  requiredRunRate: number;
+  currentRunRate: number;
+  wicketsDown: number;
+  phase?: string;
+}): PressureForecastPoint[] => {
+  const startPressure = clamp(currentPressure, 0, 10);
+  const rrGap = Math.max(0, requiredRunRate - currentRunRate);
+  const runRateDrift = rrGap > 0 ? Math.min(0.42, rrGap * 0.07) : 0.06;
+  const wicketDrift = Math.min(0.30, Math.max(0, wicketsDown - 2) * 0.06);
+  const normalizedPhase = String(phase || '').trim().toUpperCase();
+  const phaseDrift = normalizedPhase === 'DEATH' ? 0.12 : normalizedPhase === 'MIDDLE' ? 0.08 : 0.05;
+  // Deterministic projection so pressure trend is stable across rerenders.
+  const incrementPerOver = runRateDrift + wicketDrift + phaseDrift;
+
+  return FORECAST_OVERS.map((overAhead) => ({
+    overAhead,
+    pressure: Number(clamp(startPressure + incrementPerOver * overAhead, 0, 10).toFixed(1)),
+  }));
+};
+
+function PressureForecastChart({
+  currentPressure,
+  requiredRunRate,
+  currentRunRate,
+  wicketsDown,
+  phase,
+}: {
+  currentPressure: number;
+  requiredRunRate: number;
+  currentRunRate: number;
+  wicketsDown: number;
+  phase?: string;
+}) {
+  const points: PressureForecastPoint[] = React.useMemo(
+    () =>
+      buildPressureForecast({
+        currentPressure,
+        requiredRunRate,
+        currentRunRate,
+        wicketsDown,
+        phase,
+      }),
+    [currentPressure, requiredRunRate, currentRunRate, wicketsDown, phase]
+  );
+
+  return (
+    <div className="relative rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] p-4 overflow-hidden">
+      <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-rose-500/12 via-red-500/8 to-transparent pointer-events-none" />
+      <div className="relative z-10">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-bold text-white">Pressure Forecast</h3>
+            <p className="text-xs text-slate-400">Next 5 overs • AI projection</p>
+          </div>
+          <span className="rounded-full border border-rose-400/35 bg-rose-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-200">
+            AI
+          </span>
+        </div>
+
+        <div className="mt-4 h-[240px] w-full" style={{ height: 240 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={points} margin={{ top: 10, right: 12, left: 0, bottom: 18 }}>
+              <defs>
+                <linearGradient id="pressureLine" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="rgba(248,113,113,0.95)" />
+                  <stop offset="100%" stopColor="rgba(239,68,68,0.95)" />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="4 6" vertical={false} stroke="rgba(255,255,255,0.08)" />
+              <XAxis
+                dataKey="overAhead"
+                ticks={FORECAST_OVERS}
+                tickFormatter={(value) => (value === 0 ? 'Now' : `+${value}`)}
+                tickLine={false}
+                axisLine={{ stroke: 'rgba(255,255,255,0.10)' }}
+                tick={{ fill: 'rgba(255,255,255,0.55)', fontSize: 12 }}
+                label={{ value: 'Overs Ahead', position: 'insideBottom', offset: -8, fill: 'rgba(255,255,255,0.55)' }}
+              />
+              <YAxis
+                domain={[0, 10]}
+                ticks={FORECAST_Y_TICKS}
+                tickLine={false}
+                axisLine={false}
+                tick={{ fill: 'rgba(255,255,255,0.55)', fontSize: 12 }}
+                label={{ value: 'Pressure (0–10)', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.55)' }}
+              />
+              <Tooltip
+                contentStyle={{
+                  backgroundColor: '#0f172a',
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  borderRadius: '12px'
+                }}
+                formatter={(value: number) => `pressure: ${Number(value).toFixed(1)}`}
+                labelFormatter={(label) => `+${label} overs`}
+              />
+              <ReferenceLine
+                y={7}
+                stroke="rgba(255,255,255,0.12)"
+                strokeDasharray="6 6"
+                label={{ value: 'High pressure ≥ 7', position: 'insideTopRight', fill: 'rgba(255,255,255,0.40)' }}
+              />
+              <Line
+                type="monotone"
+                dataKey="pressure"
+                stroke="url(#pressureLine)"
+                strokeWidth={3}
+                dot={{ r: 5, fill: '#f87171', stroke: '#fecaca', strokeWidth: 1 }}
+                activeDot={{ r: 6, fill: '#ef4444' }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="mt-4 border-t border-white/10" />
+
+        <div className="mt-4 grid grid-cols-3 sm:grid-cols-6 gap-2">
+          {points.map((point, index) => {
+            const isLast = index === points.length - 1;
+            return (
+              <div
+                key={`pressure-forecast-chip-${point.overAhead}`}
+                className={`rounded-xl border bg-white/[0.03] px-3 py-2 ${
+                  isLast ? 'border-rose-400/45 shadow-[0_0_14px_rgba(244,63,94,0.16)]' : 'border-white/10'
+                }`}
+              >
+                <p className="text-[10px] uppercase tracking-wide text-slate-400">
+                  {point.overAhead === 0 ? 'Now' : `+${point.overAhead} ov`}
+                </p>
+                <p className={`text-xs font-mono font-bold ${isLast ? 'text-rose-300' : 'text-rose-200'}`}>
+                  {point.pressure.toFixed(1)}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface DashboardProps {
   matchContext: MatchContext;
   matchState: MatchState;
@@ -2483,7 +2754,7 @@ interface DashboardProps {
   activePlayer: (Player & { status: StatusLevel; loadRatio: number; maxOvers: number; oversRemaining: number }) | null;
   setActivePlayerId: React.Dispatch<React.SetStateAction<string>>;
   updatePlayer: (id: string, updates: Partial<Player> | ((player: Player) => Partial<Player>)) => void;
-  updateMatchState: (updates: Partial<MatchState>) => void;
+  updateMatchState: (updates: Partial<MatchState> | ((prev: MatchState) => Partial<MatchState>)) => void;
   deleteRosterPlayer: (id: string) => void;
   movePlayerToSub: (id: string) => void;
   agentState: 'idle' | 'thinking' | 'done' | 'offline' | 'invalid';
@@ -2525,6 +2796,7 @@ function Dashboard({
   const [rosterEmptyError, setRosterEmptyError] = useState<string | null>(null);
   const [substitutionRecommendation, setSubstitutionRecommendation] = useState<string | null>(null);
   const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
+  const [showCoachInsights, setShowCoachInsights] = useState(false);
   const [showRouterSignals, setShowRouterSignals] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -2543,6 +2815,11 @@ function Dashboard({
 
   useEffect(() => {
     setStrainIndex(0);
+  }, [activePlayer?.id]);
+
+  useEffect(() => {
+    // Keep coach expansion local to the currently selected player.
+    setShowCoachInsights(false);
   }, [activePlayer?.id]);
 
   const rosterPlayers = players.filter((p: Player) => p.inRoster !== false);
@@ -2577,6 +2854,7 @@ function Dashboard({
     console.log('dismiss analysis');
     setSubstitutionRecommendation(null);
     setShowRouterSignals(false);
+    setShowCoachInsights(false);
     onDismissAnalysis?.();
   };
 
@@ -2635,10 +2913,22 @@ function Dashboard({
   const requiredRunRate = matchState.target != null && ballsRemaining > 0 ? (runsNeeded / ballsRemaining) * 6 : 0;
   const requiredStrikeRate = matchState.target != null && ballsRemaining > 0 ? (runsNeeded / ballsRemaining) * 100 : 0;
   const projectedScoreAtCurrentRR = matchState.runs + (currentRunRate * (ballsRemaining / 6));
-  const winByRuns = matchState.target != null ? projectedScoreAtCurrentRR >= matchState.target : false;
+  const chaseStatus =
+    matchState.target == null
+      ? { label: 'On Track', tone: 'success' as const }
+      : currentRunRate >= requiredRunRate + 0.3
+        ? { label: 'Ahead', tone: 'info' as const }
+        : currentRunRate >= requiredRunRate
+          ? { label: 'On Track', tone: 'success' as const }
+          : { label: 'Behind', tone: 'warning' as const };
   const batsmanStrikeRate = activePlayer && activePlayer.balls > 0
     ? (activePlayer.runs / activePlayer.balls) * 100
     : 0;
+  const activeDismissalStatus: DismissalStatus = activePlayer ? resolveDismissalStatus(activePlayer) : 'NOT_OUT';
+  const dismissalStatusLabel = activeDismissalStatus === 'OUT' ? 'OUT' : 'NOT OUT';
+  const dismissalStatusClass = activeDismissalStatus === 'OUT'
+    ? 'border-rose-500/35 bg-rose-500/15 text-rose-300'
+    : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300';
 
   const srGap = Math.max(0, requiredStrikeRate - batsmanStrikeRate);
   const phaseMultiplier = matchContext.phase === 'Death' ? 1.2 : matchContext.phase === 'Middle' ? 1.0 : 0.9;
@@ -2703,7 +2993,6 @@ function Dashboard({
         : 'Pressure is building from multiple signals; adjust intent and shot map proactively.';
   const alertWhyLine = `Why this alert: SR gap ${srGap.toFixed(1)}, balls left ${ballsRemaining}, wickets ${matchState.wickets}, phase ${matchContext.phase}.`;
   const pressureToneClass = pressureIndex > 7 ? 'text-rose-400' : pressureIndex >= 4 ? 'text-amber-300' : 'text-emerald-400';
-  const pressureBarClass = pressureIndex > 7 ? 'bg-rose-500' : pressureIndex >= 4 ? 'bg-amber-400' : 'bg-emerald-500';
   const boundaryEvents = activePlayer?.boundaryEvents || [];
   const foursCount = boundaryEvents.filter((event) => event === '4').length;
   const sixesCount = boundaryEvents.filter((event) => event === '6').length;
@@ -2753,11 +3042,186 @@ function Dashboard({
           ],
         }
       : null;
-  const isCoachOutputState = analysisActive;
-  const handleAddBoundary = (boundary: '4' | '6') => {
-    if (!activePlayer) return;
-    updatePlayer(activePlayer.id, { boundaryEvents: [...boundaryEvents, boundary] });
+  const isCoachOutputState = analysisActive || showCoachInsights;
+  const isActivePlayerOut = activeDismissalStatus === 'OUT';
+  const applyBoundaryChange = (boundary: '4' | '6', direction: 1 | -1) => {
+    if (!activePlayer || isActivePlayerOut) return;
+    const runDelta = boundary === '4' ? 4 : 6;
+    const ballDelta = 1;
+
+    if (direction === -1) {
+      const removeIndex = boundaryEvents.lastIndexOf(boundary);
+      if (removeIndex < 0) return;
+    }
+
+    updatePlayer(activePlayer.id, (player) => {
+      const playerEvents = player.boundaryEvents || [];
+      if (direction === 1) {
+        return {
+          boundaryEvents: [...playerEvents, boundary],
+          runs: Math.max(0, (player.runs || 0) + runDelta),
+          balls: Math.max(0, (player.balls || 0) + ballDelta),
+        };
+      }
+
+      const playerRemoveIndex = playerEvents.lastIndexOf(boundary);
+      if (playerRemoveIndex < 0) return {};
+      const nextEvents = [...playerEvents];
+      nextEvents.splice(playerRemoveIndex, 1);
+      return {
+        boundaryEvents: nextEvents,
+        runs: Math.max(0, (player.runs || 0) - runDelta),
+        balls: Math.max(0, (player.balls || 0) - ballDelta),
+      };
+    });
+
+    updateMatchState((prev) => {
+      const maxBalls = totalBallsFromOvers(prev.totalOvers);
+      const nextRuns = Math.max(0, prev.runs + (direction * runDelta));
+      const nextBallsBowled = direction === 1
+        ? Math.min(maxBalls, prev.ballsBowled + ballDelta)
+        : Math.max(0, prev.ballsBowled - ballDelta);
+
+      return {
+        runs: nextRuns,
+        ballsBowled: nextBallsBowled,
+      };
+    });
   };
+
+  const handleAddBoundary = (boundary: '4' | '6') => {
+    applyBoundaryChange(boundary, 1);
+  };
+
+  const handleRemoveBoundary = (boundary: '4' | '6') => {
+    applyBoundaryChange(boundary, -1);
+  };
+
+  const setBatterDismissalStatus = (nextStatus: DismissalStatus) => {
+    if (!activePlayer) return;
+    // Flicker fix: dismissal changes stay in local React state + localStorage only (no navigation or forced remount).
+    const previousStatus = resolveDismissalStatus(activePlayer);
+    const normalizedNextStatus: DismissalStatus = nextStatus === 'OUT' ? 'OUT' : 'NOT_OUT';
+    const nextDismissalType = resolveDismissalType(normalizedNextStatus, activePlayer.dismissalType);
+    const wasOut = previousStatus === 'OUT';
+    const willBeOut = normalizedNextStatus === 'OUT';
+
+    updatePlayer(activePlayer.id, {
+      dismissalStatus: normalizedNextStatus,
+      isDismissed: willBeOut,
+      dismissalType: nextDismissalType,
+    });
+
+    if (wasOut !== willBeOut) {
+      updateMatchState((prev) => ({
+        wickets: willBeOut
+          ? Math.min(10, prev.wickets + 1)
+          : Math.max(0, prev.wickets - 1),
+      }));
+    }
+
+    persistDismissalStatusForPlayer(activePlayer.id, normalizedNextStatus, nextDismissalType);
+  };
+
+  const panelCardBaseClass =
+    'rounded-2xl border border-white/10 bg-white/[0.05] shadow-lg shadow-black/20';
+  const stepButtonBaseClass =
+    'h-9 w-9 min-h-[36px] min-w-[36px] rounded-xl border border-white/15 bg-white/5 text-slate-100 flex items-center justify-center transition-all duration-200 hover:bg-white/10 hover:brightness-110 active:scale-95 focus:outline-none focus:ring-2 focus:ring-emerald-400/40 disabled:opacity-50 disabled:cursor-not-allowed';
+  const pill =
+    "h-11 px-5 rounded-full border border-white/25 bg-white/5 text-white/90 " +
+    "hover:bg-white/10 hover:border-white/35 transition flex items-center justify-center " +
+    "focus:outline-none focus:ring-0";
+
+  const PanelCard = ({
+    children,
+    className = '',
+  }: {
+    children: React.ReactNode;
+    className?: string;
+  }) => <div className={`${panelCardBaseClass} ${className}`}>{children}</div>;
+
+  const Pill = ({
+    children,
+    tone = 'default',
+    className = '',
+  }: {
+    children: React.ReactNode;
+    tone?: 'default' | 'success' | 'warning' | 'info';
+    className?: string;
+  }) => {
+    const toneClass =
+      tone === 'success'
+        ? 'bg-emerald-500/15 border-emerald-400/35 text-emerald-200'
+        : tone === 'warning'
+          ? 'bg-amber-500/15 border-amber-400/35 text-amber-200'
+          : tone === 'info'
+            ? 'bg-cyan-500/15 border-cyan-400/35 text-cyan-200'
+            : 'bg-white/5 border-white/15 text-slate-200';
+
+    return (
+      <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold tracking-wide ${toneClass} ${className}`}>
+        {children}
+      </span>
+    );
+  };
+
+  const Stepper = ({
+    value,
+    onIncrement,
+    onDecrement,
+    decrementDisabled,
+    incrementDisabled,
+    valueClassName = 'text-3xl md:text-4xl font-bold text-white min-w-[2.25rem]',
+  }: {
+    value: number;
+    onIncrement: () => void;
+    onDecrement: () => void;
+    decrementDisabled?: boolean;
+    incrementDisabled?: boolean;
+    valueClassName?: string;
+  }) => (
+    <div className="flex items-center justify-center gap-3">
+      <button
+        type="button"
+        onClick={onDecrement}
+        disabled={decrementDisabled}
+        className={stepButtonBaseClass}
+      >
+        <Minus className="h-3.5 w-3.5" />
+      </button>
+      <div className={`tabular-nums leading-none text-center ${valueClassName}`}>{value}</div>
+      <button
+        type="button"
+        onClick={onIncrement}
+        disabled={incrementDisabled}
+        className={`${stepButtonBaseClass} border-emerald-400/30 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30 hover:border-emerald-300/50`}
+      >
+        <Plus className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+
+  const MetricCard = ({
+    label,
+    value,
+    onIncrement,
+    onDecrement,
+  }: {
+    label: string;
+    value: number;
+    onIncrement: () => void;
+    onDecrement: () => void;
+  }) => (
+    <PanelCard className="p-4 md:p-5 text-center">
+      <div className="mb-3 text-xs uppercase tracking-widest text-white/60">{label}</div>
+      <Stepper
+        value={value}
+        onIncrement={onIncrement}
+        onDecrement={onDecrement}
+        decrementDisabled={value <= 0}
+      />
+    </PanelCard>
+  );
 
   const StrainIndexCard = () => {
     console.log('StrainIndexCard rendered');
@@ -2968,7 +3432,7 @@ function Dashboard({
                 const isSelected = activePlayer?.id === player.id;
                 return (
                   <div key={player.id} className="relative group">
-                    <button
+                    <button type="button"
                       onClick={() => setActivePlayerId(player.id)}
                       className={`w-full flex items-center gap-3 p-3 rounded-xl transition-all border text-left ${
                         isSelected
@@ -2993,7 +3457,7 @@ function Dashboard({
                     </button>
                     
                     {/* Delete Button (Hover) */}
-                    <button 
+                    <button type="button" 
                       onClick={(e) => {
                         e.stopPropagation();
                         removeFromRoster(player.id);
@@ -3021,7 +3485,7 @@ function Dashboard({
 
               {!isRosterEmpty && (
                 <div className="mt-2 pt-2 border-t border-white/5">
-                  <button
+                  <button type="button"
                     onClick={onGoToBaselines}
                     disabled={isRosterFull}
                     title={isRosterFull ? `Roster is full (${MAX_ROSTER}/${MAX_ROSTER}).` : 'Open baselines to add a player.'}
@@ -3061,8 +3525,15 @@ function Dashboard({
                  <h2 className="text-3xl dashboard-main-heading-tall font-bold text-white">{activePlayer ? activePlayer.name : 'Select Player'}</h2>
               </div>
               {activePlayer && (
-                <div className="px-3 py-1 bg-slate-800 rounded border border-slate-700 text-xs font-mono text-slate-400">
-                  ID: {activePlayer.id.toUpperCase()}
+                <div className="flex flex-col items-end gap-2">
+                  <div className="px-3 py-1 bg-slate-800 rounded border border-slate-700 text-xs font-mono text-slate-400">
+                    ID: {activePlayer.id.toUpperCase()}
+                  </div>
+                  {telemetryView === 'batting' && (
+                    <span className={`inline-flex rounded-full border px-3 py-1 text-[11px] font-semibold tracking-wide ${dismissalStatusClass}`}>
+                      {dismissalStatusLabel}
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -3103,200 +3574,292 @@ function Dashboard({
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -8 }}
                     transition={{ duration: 0.2 }}
-                    className="min-h-0 flex flex-col"
+                    className="mx-auto flex min-h-0 w-full max-w-[980px] flex-col px-4 md:px-6"
                   >
-                  <div className="grid grid-cols-2 gap-4 mb-8">
-                    <div className="bg-[#162032] rounded-xl p-5 border border-white/5 text-center">
-                      <div className="text-xs font-bold uppercase mb-2 text-slate-500">Runs</div>
-                      <div className="text-5xl font-mono font-medium mb-2 text-white">{activePlayer.runs}</div>
-                      <div className="flex justify-center gap-4 mt-2">
-                        <button
-                          onClick={() => {
-                            const runDelta = Math.min(1, activePlayer.runs);
-                            updatePlayer(activePlayer.id, { runs: Math.max(0, activePlayer.runs - 1) });
-                            updateMatchState({ runs: Math.max(0, matchState.runs - runDelta) });
-                          }}
-                          className="w-8 h-8 rounded-full flex items-center justify-center border bg-slate-800 hover:bg-slate-700 text-white border-slate-600"
-                        >
-                          <Minus className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => {
-                            updatePlayer(activePlayer.id, { runs: activePlayer.runs + 1 });
-                            updateMatchState({ runs: matchState.runs + 1 });
-                          }}
-                          className="w-8 h-8 rounded-full flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20"
-                        >
-                          <Plus className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-5">
+                    <MetricCard
+                      label="Runs"
+                      value={activePlayer.runs}
+                      onIncrement={() => {
+                        updatePlayer(activePlayer.id, { runs: activePlayer.runs + 1 });
+                        updateMatchState({ runs: matchState.runs + 1 });
+                      }}
+                      onDecrement={() => {
+                        const runDelta = Math.min(1, activePlayer.runs);
+                        updatePlayer(activePlayer.id, { runs: Math.max(0, activePlayer.runs - 1) });
+                        updateMatchState({ runs: Math.max(0, matchState.runs - runDelta) });
+                      }}
+                    />
 
-                    <div className="bg-[#162032] rounded-xl p-5 border border-white/5 text-center">
-                      <div className="text-xs font-bold uppercase mb-2 text-slate-500">Balls Faced</div>
-                      <div className="text-5xl font-mono font-medium mb-2 text-white">{activePlayer.balls}</div>
-                      <div className="flex justify-center gap-4 mt-2">
-                        <button
-                          onClick={() => {
-                            const nextBalls = Math.max(0, activePlayer.balls - 1);
-                            const reducedMatchBalls = Math.max(0, ballsBowled - 1);
-                            updatePlayer(activePlayer.id, { balls: nextBalls });
-                            updateMatchState({ ballsBowled: reducedMatchBalls });
-                          }}
-                          className="w-8 h-8 rounded-full flex items-center justify-center border bg-slate-800 hover:bg-slate-700 text-white border-slate-600"
-                        >
-                          <Minus className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => {
-                            const nextBalls = activePlayer.balls + 1;
-                            const increasedMatchBalls = Math.min(totalBalls, ballsBowled + 1);
-                            updatePlayer(activePlayer.id, { balls: nextBalls });
-                            updateMatchState({ ballsBowled: increasedMatchBalls });
-                          }}
-                          className="w-8 h-8 rounded-full flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20"
-                        >
-                          <Plus className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
+                    <MetricCard
+                      label="Balls Faced"
+                      value={activePlayer.balls}
+                      onIncrement={() => {
+                        const nextBalls = activePlayer.balls + 1;
+                        const increasedMatchBalls = Math.min(totalBalls, ballsBowled + 1);
+                        updatePlayer(activePlayer.id, { balls: nextBalls });
+                        updateMatchState({ ballsBowled: increasedMatchBalls });
+                      }}
+                      onDecrement={() => {
+                        const nextBalls = Math.max(0, activePlayer.balls - 1);
+                        const reducedMatchBalls = Math.max(0, ballsBowled - 1);
+                        updatePlayer(activePlayer.id, { balls: nextBalls });
+                        updateMatchState({ ballsBowled: reducedMatchBalls });
+                      }}
+                    />
 
-                  <div className="h-px bg-gradient-to-r from-transparent via-slate-700 to-transparent my-2" />
+                    <PanelCard className="p-4 md:p-5">
+                      <div className="mb-3">
+                        <div className="flex items-center justify-between relative overflow-visible">
+                          <div className="flex items-center gap-3 relative overflow-visible">
+                            <span className="text-sm font-semibold tracking-[0.18em] uppercase text-white/85">
+                              STRIKE RATE
+                            </span>
 
-                  <div className="grid grid-cols-2 gap-x-8 gap-y-6 mt-6">
-                    <div className="bg-[#162032] p-4 rounded-lg border border-white/5">
-                      <div className="flex items-center justify-between mb-1">
-                        <label className="text-xs font-bold uppercase tracking-wide text-slate-400">Strike Rate</label>
-                        <span className="text-[10px] text-slate-500">Live</span>
-                      </div>
-                      <div className="flex items-end gap-2 mb-2">
-                        <div className={`text-4xl font-mono tabular-nums ${pressureToneClass}`}>
-                          {batsmanStrikeRate.toFixed(1)}
-                        </div>
-                        <span className="text-[10px] text-slate-500 pb-1">runs / 100 balls</span>
-                      </div>
-                      <div className="flex items-center gap-3 text-[11px]">
-                        <div className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-slate-900/40 px-2 py-1">
-                          <span className="text-slate-500">Required SR</span>
-                          <span className="font-mono tabular-nums text-slate-300">{requiredStrikeRate.toFixed(1)}</span>
-                        </div>
-                        <span className="text-slate-600">|</span>
-                        <div className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-slate-900/40 px-2 py-1">
-                          <span className="text-slate-500">Required RR</span>
-                          <span className="font-mono tabular-nums text-slate-300">{requiredRunRate.toFixed(2)}</span>
+                            <span
+                              style={{
+                                display: "inline-block",
+                                width: 8,
+                                height: 8,
+                                borderRadius: 9999,
+                                background: "#ef4444",
+                                boxShadow: "0 0 10px rgba(239,68,68,0.85)",
+                                marginLeft: 10,
+                                transform: "translateY(-1px)"
+                              }}
+                            />
+                          </div>
+                          <div className="rounded-xl border border-white/15 bg-slate-900/60 px-3 py-2">
+                            <div className="text-[10px] uppercase tracking-[0.16em] text-white/40">SR</div>
+                            <div className={`text-xl font-bold tabular-nums leading-none ${pressureToneClass}`}>
+                              {batsmanStrikeRate.toFixed(1)}
+                            </div>
+                          </div>
                         </div>
                       </div>
-                      <div className="mt-2 text-[11px] text-slate-500">
-                        Current RR: <span className="font-mono tabular-nums text-slate-300">{currentRunRate.toFixed(2)}</span>
-                        <span className="mx-2 text-slate-600">|</span>
-                        Projection: <span className="font-mono tabular-nums text-slate-300">{projectedScoreAtCurrentRR.toFixed(0)}</span>
-                        {matchState.target != null && (
-                          <>
-                            <span className="mx-2 text-slate-600">|</span>
-                            <span className={winByRuns ? 'text-emerald-400' : 'text-rose-400'}>{winByRuns ? 'On Track' : 'Behind Rate'}</span>
-                          </>
-                        )}
-                      </div>
-                    </div>
 
-                    <div className="bg-[#162032] p-4 rounded-lg border border-white/5">
-                      <label className="text-xs font-bold mb-2 block text-slate-400">Boundaries</label>
-                      <div className="space-y-2">
-                        <div className="flex items-center rounded-lg border border-white/10 bg-slate-900/40 px-3 py-2">
-                          <span className="w-12 text-xs font-semibold text-slate-300">Four</span>
-                          <span className="flex-1 text-center text-sm font-mono text-white">{foursCount}</span>
-                          <button
-                            onClick={() => handleAddBoundary('4')}
-                            aria-label="Add four boundary"
-                            disabled={!activePlayer || activePlayer.isDismissed}
-                            className="w-8 h-8 rounded-full border border-white/15 bg-slate-800/80 text-slate-200 flex items-center justify-center transition-all hover:border-emerald-400/40 hover:text-emerald-300 hover:shadow-[0_0_10px_rgba(16,185,129,0.25)] disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-                          >
-                            <Plus className="w-4 h-4" />
-                          </button>
+                      <div className="mb-3 grid grid-cols-2 gap-2">
+                        <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2">
+                          <div className="text-[10px] uppercase tracking-[0.16em] text-white/50">Required SR</div>
+                          <div className="mt-1 text-sm font-semibold tabular-nums text-white">{requiredStrikeRate.toFixed(1)}</div>
                         </div>
-                        <div className="flex items-center rounded-lg border border-white/10 bg-slate-900/40 px-3 py-2">
-                          <span className="w-12 text-xs font-semibold text-slate-300">Six</span>
-                          <span className="flex-1 text-center text-sm font-mono text-white">{sixesCount}</span>
-                          <button
-                            onClick={() => handleAddBoundary('6')}
-                            aria-label="Add six boundary"
-                            disabled={!activePlayer || activePlayer.isDismissed}
-                            className="w-8 h-8 rounded-full border border-white/15 bg-slate-800/80 text-slate-200 flex items-center justify-center transition-all hover:border-emerald-400/40 hover:text-emerald-300 hover:shadow-[0_0_10px_rgba(16,185,129,0.25)] disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-                          >
-                            <Plus className="w-4 h-4" />
-                          </button>
+                        <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2">
+                          <div className="text-[10px] uppercase tracking-[0.16em] text-white/50">Required RR</div>
+                          <div className="mt-1 text-sm font-semibold tabular-nums text-white">{requiredRunRate.toFixed(2)}</div>
                         </div>
                       </div>
-                      <p className="mt-2 text-[10px] text-slate-500">Tap Add 4 / Add 6 during scoring.</p>
-                    </div>
-                  </div>
 
-                  <div className="mt-6 bg-[#162032] p-4 rounded-lg border border-white/5">
-                    <div className="flex items-center justify-between mb-2">
-                      <label className="text-xs font-bold text-slate-400">Pressure Index (0-10)</label>
-                      <span className={`font-mono font-bold ${pressureToneClass}`}>{pressureIndex.toFixed(1)}</span>
-                    </div>
-                    <div className="h-3 bg-slate-800 rounded-full overflow-hidden border border-white/5">
-                      <motion.div
-                        initial={false}
-                        animate={{ width: `${(pressureIndex / 10) * 100}%` }}
-                        className={`h-full ${pressureBarClass}`}
-                        transition={{ duration: 0.25 }}
-                      />
-                    </div>
-                    <div className="mt-2 flex justify-between text-[10px] uppercase tracking-wide text-slate-500">
-                      <span>Low &lt;4</span>
-                      <span>Moderate 4-7</span>
-                      <span>High &gt;7</span>
-                    </div>
-                  </div>
+                      <div className="flex flex-wrap items-center gap-2 text-sm text-white/80">
+                        <span className="font-medium text-white/80">
+                          Current RR: <span className="tabular-nums text-white/95">{currentRunRate.toFixed(2)}</span>
+                        </span>
+                        <span className="h-1 w-1 rounded-full bg-white/30" />
+                        <span className="font-medium text-white/80">
+                          Projection: <span className="tabular-nums text-white/95">{projectedScoreAtCurrentRR.toFixed(0)}</span>
+                        </span>
+                        <Pill className="ml-auto" tone={chaseStatus.tone}>{chaseStatus.label}</Pill>
+                      </div>
+                    </PanelCard>
 
-                  <div className="mt-auto pt-8">
-                    <p className="text-[10px] font-bold text-slate-500 uppercase mb-3">Dismissal Controls</p>
-                    <div className="grid grid-cols-3 gap-3">
-                      <select
-                        value={activePlayer.dismissalType || 'Not Out'}
-                        onChange={(e) => updatePlayer(activePlayer.id, { dismissalType: e.target.value as Player['dismissalType'] })}
-                        className="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-3 text-xs font-bold"
-                      >
-                        <option value="Not Out">Not Out</option>
-                        <option value="Bowled">Bowled</option>
-                        <option value="Caught">Caught</option>
-                        <option value="LBW">LBW</option>
-                        <option value="Run Out">Run Out</option>
-                      </select>
-                      <button
-                        onClick={() => {
-                          const nextDismissed = !activePlayer.isDismissed;
-                          updatePlayer(activePlayer.id, { isDismissed: nextDismissed, dismissalType: nextDismissed ? (activePlayer.dismissalType || 'Caught') : 'Not Out' });
-                          updateMatchState({
-                            wickets: nextDismissed
-                              ? Math.min(10, matchState.wickets + 1)
-                              : Math.max(0, matchState.wickets - 1)
-                          });
-                        }}
-                        className={`p-3 rounded-lg transition-colors border text-xs font-bold ${activePlayer.isDismissed ? 'bg-rose-500/20 text-rose-300 border-rose-500/40' : 'bg-amber-500/10 text-amber-300 border-amber-500/30 hover:bg-amber-500/20'}`}
-                      >
-                        {activePlayer.isDismissed ? 'Mark Not Out' : 'Mark Out'}
-                      </button>
-                      <button
-                        onClick={() => {
-                          const correctedScore = Math.max(0, matchState.runs - activePlayer.runs);
-                          const correctedBalls = Math.max(0, ballsBowled - activePlayer.balls);
-                          const correctedWickets = activePlayer.isDismissed ? Math.max(0, matchState.wickets - 1) : matchState.wickets;
-                          updatePlayer(activePlayer.id, { runs: 0, balls: 0, boundaryEvents: [], isDismissed: false, dismissalType: 'Not Out' });
-                          updateMatchState({
-                            runs: correctedScore,
-                            ballsBowled: correctedBalls,
-                            wickets: correctedWickets
-                          });
-                        }}
-                        className="p-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-bold"
-                      >
-                        Reset Innings
-                      </button>
-                    </div>
+                    <PanelCard className="p-4 md:p-5">
+                      <div className="mb-3 flex items-center justify-between">
+                        <label className="text-sm font-semibold tracking-[0.18em] uppercase text-white/85">Boundaries</label>
+                        <span className="text-[10px] uppercase tracking-[0.16em] text-white/35">Tap to adjust</span>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        <div className="flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                          <div>
+                            <div className="text-sm font-medium text-white/90">Four</div>
+                            <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-white/80">4 runs</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveBoundary('4')}
+                              aria-label="Remove four boundary"
+                              disabled={foursCount <= 0 || !activePlayer || isActivePlayerOut}
+                              className={stepButtonBaseClass}
+                            >
+                              <Minus className="h-3.5 w-3.5" />
+                            </button>
+                            <div className="min-w-[2.25rem] rounded-lg border border-white/15 bg-slate-900/70 px-2 py-1 text-center text-sm font-semibold tabular-nums text-white">
+                              {foursCount}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleAddBoundary('4')}
+                              aria-label="Add four boundary"
+                              disabled={!activePlayer || isActivePlayerOut}
+                              className={`${stepButtonBaseClass} border-emerald-400/30 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30 hover:border-emerald-300/50`}
+                            >
+                              <Plus className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                          <div>
+                            <div className="text-sm font-medium text-white/90">Six</div>
+                            <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-white/80">6 runs</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveBoundary('6')}
+                              aria-label="Remove six boundary"
+                              disabled={sixesCount <= 0 || !activePlayer || isActivePlayerOut}
+                              className={stepButtonBaseClass}
+                            >
+                              <Minus className="h-3.5 w-3.5" />
+                            </button>
+                            <div className="min-w-[2.25rem] rounded-lg border border-white/15 bg-slate-900/70 px-2 py-1 text-center text-sm font-semibold tabular-nums text-white">
+                              {sixesCount}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleAddBoundary('6')}
+                              aria-label="Add six boundary"
+                              disabled={!activePlayer || isActivePlayerOut}
+                              className={`${stepButtonBaseClass} border-emerald-400/30 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30 hover:border-emerald-300/50`}
+                            >
+                              <Plus className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </PanelCard>
+
+                    <PanelCard className="p-4 md:p-5 md:col-span-2 overflow-visible">
+                      <div className="flex items-center justify-between">
+                        <div className="text-sm font-semibold text-white/90">Pressure Index</div>
+                        <div className={`text-2xl font-bold tabular-nums ${pressureToneClass}`}>
+                          {Math.max(0, Math.min(10, pressureIndex ?? 0)).toFixed(1)}
+                        </div>
+                      </div>
+                      {(() => {
+                        // use the SAME value used to display "6.2" on the right
+                        const raw = pressureIndex ?? 0;
+                        const clamped = Math.max(0, Math.min(10, raw));
+                        const pct = (clamped / 10) * 100;
+
+                        return (
+                          <div className="mt-3">
+                            {/* Rail wrapper ensures visibility above overlays */}
+                            <div className="relative z-10 overflow-visible">
+                              <div
+                                className="relative h-3 w-full rounded-full"
+                                style={{
+                                  background: "linear-gradient(90deg, #34d399 0%, #fbbf24 40%, #fb923c 65%, #ef4444 100%)",
+                                  boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.12), 0 0 18px rgba(255,255,255,0.06)",
+                                }}
+                              />
+
+                              {/* knob */}
+                              <div
+                                className="absolute top-1/2"
+                                style={{
+                                  left: `${pct}%`,
+                                  transform: "translate(-50%, -50%)",
+                                  zIndex: 20,
+                                  transition: "left 300ms ease-out",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    width: 16,
+                                    height: 16,
+                                    borderRadius: 9999,
+                                    background: "#fff7ed",
+                                    border: "1px solid rgba(255,255,255,0.55)",
+                                    boxShadow: "0 0 16px rgba(255,220,150,0.9)",
+                                    position: "relative",
+                                  }}
+                                >
+                                  <div
+                                    style={{
+                                      position: "absolute",
+                                      left: "50%",
+                                      top: "50%",
+                                      width: 6,
+                                      height: 6,
+                                      borderRadius: 9999,
+                                      transform: "translate(-50%, -50%)",
+                                      background: "rgba(251,191,36,0.95)",
+                                    }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      <div className="mt-3 flex items-center justify-between text-xs font-medium">
+                        <span className="text-emerald-300">LOW &lt;4</span>
+                        <span className="text-amber-200">MODERATE 4–7</span>
+                        <span className="text-red-300">HIGH &gt;7</span>
+                      </div>
+                    </PanelCard>
+
+                    <PanelCard className="md:col-span-2">
+                      <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.03] p-6 shadow-[0_10px_30px_rgba(0,0,0,0.35)]">
+                        <div className="flex flex-col gap-4">
+                          <div className="-mt-[10px] text-xs font-semibold tracking-[0.2em] uppercase text-white/60">
+                            Dismissal Controls
+                          </div>
+
+                          {/* Prevent click flicker: controls stay as local React updates and use explicit button types (no implicit form submit/remount). */}
+                          <div className="flex items-center justify-start gap-4">
+                            <button
+                              type="button"
+                              onClick={() => setBatterDismissalStatus('OUT')}
+                              className={`dismissal-pill ${pill}`}
+                            >
+                              Mark Out
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const correctedScore = Math.max(0, matchState.runs - activePlayer.runs);
+                                const correctedBalls = Math.max(0, ballsBowled - activePlayer.balls);
+                                const wasOut = activeDismissalStatus === 'OUT';
+                                updatePlayer(activePlayer.id, {
+                                  runs: 0,
+                                  balls: 0,
+                                  boundaryEvents: [],
+                                  dismissalStatus: 'NOT_OUT',
+                                  isDismissed: false,
+                                  dismissalType: 'Not Out',
+                                });
+                                updateMatchState((prev) => ({
+                                  runs: correctedScore,
+                                  ballsBowled: correctedBalls,
+                                  wickets: wasOut ? Math.max(0, prev.wickets - 1) : prev.wickets,
+                                }));
+                                persistDismissalStatusForPlayer(activePlayer.id, 'NOT_OUT', 'Not Out');
+                              }}
+                              className={`dismissal-pill ${pill}`}
+                            >
+                              Reset Innings
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </PanelCard>
+
+                    {showCoachInsights && (
+                      <div className="md:col-span-2 mt-6">
+                        <PressureForecastChart
+                          currentPressure={pressureIndex}
+                          requiredRunRate={requiredRunRate}
+                          currentRunRate={currentRunRate}
+                          wicketsDown={matchState.wickets}
+                          phase={matchContext.phase}
+                        />
+                      </div>
+                    )}
                   </div>
                   </motion.div>
                 ) : (
@@ -3333,7 +3896,7 @@ function Dashboard({
                           <p className="text-xs text-rose-200/70 mt-0.5">Safety thresholds exceeded. Recommend immediate substitution.</p>
                         </div>
                       </div>
-                      <button
+                      <button type="button"
                         onClick={handleRemoveActive}
                         className="w-full sm:w-auto px-4 py-2.5 bg-gradient-to-r from-rose-700 to-rose-600 hover:from-rose-600 hover:to-rose-500 text-white text-xs font-bold rounded-lg transition-all shadow-lg shadow-rose-900/30 hover:shadow-rose-900/50 flex items-center justify-center gap-2 whitespace-nowrap active:scale-95 border border-rose-500/30"
                       >
@@ -3351,14 +3914,14 @@ function Dashboard({
                           <p className="text-sm text-slate-500">Max {formatMaxOvers} overs</p>
                         )}
                         <div className="flex items-center justify-center gap-6 mt-4">
-                          <button
+                          <button type="button"
                             onClick={handleDecreaseOver}
                             disabled={activePlayer.isSub || activePlayer.isUnfit}
                             className={`w-12 h-12 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'cursor-pointer bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
                           >
                             <Minus className="w-6 h-6" />
                           </button>
-                          <button
+                          <button type="button"
                             onClick={handleAddOver}
                             disabled={isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap}
                             className={`w-12 h-12 rounded-full flex items-center justify-center shadow-lg transition-all ${isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none opacity-40' : 'cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
@@ -3481,17 +4044,17 @@ function Dashboard({
                   <div className="mt-6">
                     <p className="text-xs font-bold text-slate-500 uppercase mb-2">Quick Actions</p>
                     <div className="grid grid-cols-3 gap-3">
-                      <button onClick={handleMarkUnfit} className={`border p-4 rounded-lg transition-all flex flex-col items-center group shadow-lg ${activePlayer.isUnfit ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-emerald-900/10' : 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/30 shadow-rose-900/10'}`}>
+                      <button type="button" onClick={handleMarkUnfit} className={`border p-4 rounded-lg transition-all flex flex-col items-center group shadow-lg ${activePlayer.isUnfit ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-emerald-900/10' : 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/30 shadow-rose-900/10'}`}>
                         <Zap className="w-5 h-5 mb-0.5" />
                         <span className="text-sm font-bold">{activePlayer.isUnfit ? 'Mark Fit' : 'Mark Unfit'}</span>
                         <span className="text-[10px] opacity-70">{activePlayer.isUnfit ? 'Restore player state' : 'Force critical state'}</span>
                       </button>
-                      <button onClick={handleNewSpell} disabled={activePlayer.isUnfit} className={`p-4 rounded-lg transition-colors flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}>
+                      <button type="button" onClick={handleNewSpell} disabled={activePlayer.isUnfit} className={`p-4 rounded-lg transition-colors flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}>
                         <CheckCircle2 className="w-5 h-5 mb-0.5" />
                         <span className="text-sm font-bold">New Spell</span>
                         <span className="text-[10px] opacity-70">Reset count</span>
                       </button>
-                      <button
+                      <button type="button"
                         onClick={handleRest}
                         disabled={activePlayer.isUnfit}
                         className={`p-4 rounded-lg transition-all flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : activePlayer.isResting ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
@@ -3518,7 +4081,7 @@ function Dashboard({
               </AnimatePresence>
               ) : isRosterEmpty ? (
                 <div className="h-full w-full min-h-[420px] flex items-center justify-center">
-                  <button
+                  <button type="button"
                     onClick={onGoToBaselines}
                     className="relative group inline-flex items-center justify-center px-10 py-4 rounded-2xl text-base font-semibold tracking-wide text-white bg-[#0E1625] border border-emerald-400/40 ring-1 ring-emerald-300/35 shadow-[0_18px_70px_rgba(0,0,0,0.6)] backdrop-blur neon-breathe transition hover:scale-[1.02] hover:ring-emerald-200/60 hover:border-white/20 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-emerald-300/70"
                   >
@@ -3600,6 +4163,7 @@ function Dashboard({
                             type="button"
                             aria-label="Run Coach Agent"
                             onClick={() => {
+                              setShowCoachInsights(true);
                               primeCoachAutoScroll();
                               runAgent('auto', 'button_click');
                             }}
@@ -3748,7 +4312,7 @@ function Dashboard({
                               ))}
                             </div>
                             <p className="text-xs text-slate-300 mb-2">{routerDecision?.reason || 'Router selecting agents from current signals.'}</p>
-                            <button
+                            <button type="button"
                               onClick={() => setShowRouterSignals((v) => !v)}
                               className="text-[11px] text-slate-400 hover:text-slate-200"
                             >
@@ -3891,7 +4455,7 @@ function Dashboard({
 	                <div className="space-y-3">
 	                  {isCoachOutputState && (
 	                    <>
-	                      <button
+	                      <button type="button"
                         onClick={() => {
                           primeCoachAutoScroll();
                           runAgent('full', 'button_click');
@@ -3902,7 +4466,7 @@ function Dashboard({
                         {agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}
                       </button>
 
-                      <button
+                      <button type="button"
                         onClick={handleDismissAnalysis}
                         className="w-full py-3 rounded-lg border border-slate-700 text-slate-400 text-sm hover:text-white hover:bg-slate-800 transition-colors"
                       >
@@ -4478,7 +5042,7 @@ function Baselines({
         onMouseLeave={closeTooltip}
       >
         {label}
-        <button
+        <button type="button"
           onClick={() => toggleTooltip(field)}
           className="text-slate-500 hover:text-emerald-400 focus:outline-none transition-colors"
         >
@@ -4517,13 +5081,13 @@ function Baselines({
           <p className="text-slate-400 mt-1">Roster selection is session-based (local to this device). Baseline metrics are saved to Cosmos DB when you click Save Changes.</p>
         </div>
         <div className="flex gap-4">
-          <button
+          <button type="button"
             onClick={handleReset}
             className="flex items-center gap-2 bg-rose-700/70 hover:bg-rose-600 text-white px-4 py-2.5 rounded-lg font-bold transition-colors"
           >
             Reset Database
           </button>
-          <button
+          <button type="button"
             onClick={handleSave}
             disabled={disableSave}
             className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-bold transition-all ${
@@ -4769,7 +5333,7 @@ function Baselines({
                       </div>
                    </td>
                    <td className="px-4 py-4 text-center">
-                     <button 
+                     <button type="button" 
                        onClick={() => handleDelete(p)}
                        className="p-2 text-slate-600 hover:text-rose-500 hover:bg-rose-500/10 rounded-lg transition-colors"
                        title="Remove Player from Baseline Model"
@@ -4785,7 +5349,7 @@ function Baselines({
                {/* Add Player Row */}
                <tr>
                  <td colSpan={12} className="px-6 py-4 text-center border-t border-dashed border-white/10">
-                   <button 
+                   <button type="button" 
                      onClick={addDraftPlayer}
                      disabled={isLoadingBaselines}
                      className="flex items-center gap-2 mx-auto text-sm font-bold text-slate-500 hover:text-emerald-400 transition-colors py-4 w-full justify-center group"
