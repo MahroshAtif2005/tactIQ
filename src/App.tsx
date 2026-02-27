@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   Activity, 
   Users, 
@@ -37,21 +38,33 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse, TacticalCombinedDecision } from './types/agents';
+import {
+  FatigueAgentResponse,
+  FinalRecommendation,
+  OrchestrateResponse,
+  RiskAgentResponse,
+  TacticalAgentResponse,
+  TacticalCombinedDecision,
+} from './types/agents';
 import {
   ApiClientError,
   apiAgentFrameworkMessagesUrl,
+  apiFullAnalysisUrl,
   apiHealthUrl,
   apiOrchestrateUrl,
   checkHealth,
   deleteBaseline,
+  getBaselineByPlayerId,
   getBaselinesWithMeta,
   postAgentFrameworkOrchestrate,
+  postFullCombinedAnalysis,
   postOrchestrate,
+  postTacticalAgent,
   resetBaselines,
   saveBaselines,
 } from './lib/apiClient';
 import { getRosterIds, removeFromRosterSession, ROSTER_STORAGE_KEY, setBaselineDraftCache, setRosterIds } from './lib/rosterStorage';
+import { buildMatchContext, summarizeMatchContext } from './lib/buildMatchContext';
 import { Baseline, BaselineRole } from './types/baseline';
 import {
   clamp,
@@ -69,8 +82,11 @@ import {
 // --- Types ---
 
 type Page = 'landing' | 'setup' | 'dashboard' | 'baselines';
+type TeamMode = 'BATTING' | 'BOWLING';
+type RunMode = 'auto' | 'full';
 
 interface MatchContext {
+  matchMode: TeamMode;
   format: string;
   phase: string;
   pitch: string;
@@ -100,6 +116,7 @@ interface Player {
   consecutiveOvers: number; // Legacy compatibility field; no longer user-controlled.
   lastRestOvers?: number;
   fatigue: number; // 0-10
+  strainIndex?: number;
   hrRecovery: 'Good' | 'Moderate' | 'Poor';
   injuryRisk: 'Low' | 'Medium' | 'High' | 'Critical';
   noBallRisk: 'Low' | 'Medium' | 'High';
@@ -181,21 +198,84 @@ interface AiAnalysis {
   recommendation: string;
 }
 
+type AgentFeedState = 'IDLE' | 'RUNNING' | 'SUCCESS' | 'SKIPPED' | 'ERROR';
+type AgentKey = 'fatigue' | 'risk' | 'tactical';
+
 interface AgentFeedStatus {
-  fatigue: 'idle' | 'loading' | 'done' | 'error';
-  risk: 'idle' | 'loading' | 'done' | 'error';
-  tactical: 'idle' | 'loading' | 'done' | 'error';
+  fatigue: AgentFeedState;
+  risk: AgentFeedState;
+  tactical: AgentFeedState;
 }
 
 interface OrchestrateMetaView {
   mode: 'auto' | 'full';
   executedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
   usedFallbackAgents: Array<'fatigue' | 'risk' | 'tactical'>;
+  routerFallbackMessage?: string;
+  traceId?: string;
+  source?: 'azure' | 'mock';
+  azureRequestId?: string;
+  timingsMs?: {
+    total?: number;
+    router?: number;
+    azureCall?: number;
+  };
+  agentStatuses?: Partial<Record<'fatigue' | 'risk' | 'tactical', string>>;
+}
+
+interface SuggestedBowlerRecommendation {
+  bowlerId: string;
+  bowlerName: string;
+  reason?: string;
+}
+
+interface RunCoachAgentResult {
+  response: OrchestrateResponse;
+  suggestedBowler: SuggestedBowlerRecommendation | null;
 }
 
 interface RouterDecisionView {
-  intent: 'fatigue_check' | 'risk_check' | 'substitution' | 'full';
-  selectedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
+  intent:
+    | 'SUBSTITUTION'
+    | 'BOWLING_NEXT'
+    | 'BATTING_NEXT'
+    | 'BOTH_NEXT'
+    | 'SAFETY_ALERT'
+    | 'GENERAL'
+    | 'fatigue_check'
+    | 'risk_check'
+    | 'substitution'
+    | 'full'
+    | 'InjuryPrevention'
+    | 'PressureControl'
+    | 'TacticalAttack'
+    | 'General'
+    | string;
+  agentsToRun?: Array<'RISK' | 'TACTICAL' | 'FATIGUE'>;
+  selectedAgents?: Array<'fatigue' | 'risk' | 'tactical'>;
+  signalSummaryBullets?: string[];
+  rationale?: string;
+  rulesFired: string[];
+  inputsUsed: {
+    activePlayerId?: string;
+    active: {
+      fatigueIndex?: number;
+      strainIndex?: number;
+      injuryRisk?: string;
+      noBallRisk?: string;
+    };
+    match: {
+      matchMode?: string;
+      format?: string;
+      phase?: string;
+      overs?: number;
+      balls?: number;
+      scoreRuns?: number;
+      wickets?: number;
+      targetRuns?: number;
+      intensity?: string;
+    };
+  };
   reason: string;
   signals: Record<string, unknown>;
 }
@@ -506,6 +586,36 @@ const normalizeRole = (role: Player['role']): Role => {
   if (role === 'Fast Bowler' || role === 'Spinner' || role === 'All-rounder') return role;
   return 'All-rounder';
 };
+const isBowlingRole = (role: Player['role']): boolean =>
+  role === 'Bowler' || role === 'Fast Bowler' || role === 'Spinner';
+const isBattingRole = (role: Player['role']): boolean =>
+  role === 'Batsman' || role === 'All-rounder';
+const toBooleanFlag = (value: unknown): boolean => {
+  if (value === true) return true;
+  if (value === false || value === undefined || value === null) return false;
+  const token = String(value).trim().toLowerCase();
+  return token === 'true' || token === '1' || token === 'yes';
+};
+const isEligibleForMode = (player: Player, mode: TeamMode): boolean => {
+  const roleAllowsBowling = isBowlingRole(player.role) || player.role === 'All-rounder';
+  const roleAllowsBatting = isBattingRole(player.role);
+  const capability = player as unknown as Record<string, unknown>;
+  const canBowl = toBooleanFlag(capability.canBowl);
+  const canBat = toBooleanFlag(capability.canBat);
+  if (mode === 'BOWLING') {
+    return roleAllowsBowling && (canBowl || roleAllowsBowling);
+  }
+  return roleAllowsBatting && (canBat || roleAllowsBatting);
+};
+const deriveFocusRoleFromPlayer = (
+  player: Player | null | undefined,
+  teamMode: TeamMode
+): 'BOWLER' | 'BATTER' => {
+  if (!player) return teamMode === 'BOWLING' ? 'BOWLER' : 'BATTER';
+  if (isBowlingRole(player.role)) return 'BOWLER';
+  if (player.role === 'All-rounder') return teamMode === 'BOWLING' ? 'BOWLER' : 'BATTER';
+  return 'BATTER';
+};
 
 const totalBallsFromOvers = (overs: number): number => {
   return Math.max(0, Math.floor(overs)) * 6;
@@ -654,6 +764,8 @@ const orderBaselinesForDisplay = (rows: Baseline[]): Baseline[] => {
 const MAX_ROSTER = 11;
 const BASELINES_CHANGED_EVENT = 'tactiq-baselines-changed';
 const BATTER_DISMISSAL_STORAGE_KEY = 'tactiq_batter_dismissal_v1';
+const MATCH_MODE_STORAGE_KEY = 'tactiq_match_mode_v1';
+const ACTIVE_PLAYER_STORAGE_KEY = 'tactiq_active_player_v1';
 
 interface DismissalSessionEntry {
   status: DismissalStatus;
@@ -755,6 +867,219 @@ const hydrateDismissalStateFromSession = (players: Player[]): Player[] => {
       dismissalType: entry.dismissalType,
     });
   });
+};
+
+const normalizeMatchMode = (value: unknown): MatchContext['matchMode'] | null => {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === 'BAT' || normalized === 'BATTING') return 'BATTING';
+  if (normalized === 'BOWL' || normalized === 'BOWLING') return 'BOWLING';
+  return null;
+};
+
+const readStoredMatchMode = (): MatchContext['matchMode'] | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    return normalizeMatchMode(window.localStorage.getItem(MATCH_MODE_STORAGE_KEY));
+  } catch {
+    return null;
+  }
+};
+
+const writeStoredMatchMode = (mode: MatchContext['matchMode']): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(MATCH_MODE_STORAGE_KEY, mode);
+  } catch {
+    // Ignore storage write failures.
+  }
+};
+
+const readStoredActivePlayerId = (): string => {
+  if (typeof window === 'undefined') return '';
+  try {
+    return normalizeBaselineId(window.localStorage.getItem(ACTIVE_PLAYER_STORAGE_KEY) || '');
+  } catch {
+    return '';
+  }
+};
+
+const writeStoredActivePlayerId = (playerId: string): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    const normalizedId = normalizeBaselineId(playerId);
+    if (!normalizedId) {
+      window.localStorage.removeItem(ACTIVE_PLAYER_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(ACTIVE_PLAYER_STORAGE_KEY, normalizedId);
+  } catch {
+    // Ignore storage write failures.
+  }
+};
+
+const toRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+
+const AGENT_KEYS: AgentKey[] = ['fatigue', 'risk', 'tactical'];
+
+const getDefaultAgentFeedStatus = (): AgentFeedStatus => ({
+  fatigue: 'IDLE',
+  risk: 'IDLE',
+  tactical: 'IDLE',
+});
+
+const toAgentKey = (value: unknown): AgentKey | null => {
+  const token = String(value || '').trim().toLowerCase();
+  if (token === 'fatigue' || token === 'risk' || token === 'tactical') return token as AgentKey;
+  if (token === 'fatigueagent') return 'fatigue';
+  if (token === 'riskagent') return 'risk';
+  if (token === 'tacticalagent') return 'tactical';
+  return null;
+};
+
+const toSuggestedBowlerRecommendation = (
+  bowlerId: unknown,
+  bowlerName: unknown,
+  reason?: unknown
+): SuggestedBowlerRecommendation | null => {
+  const id = String(bowlerId || '').trim();
+  const name = String(bowlerName || '').trim();
+  if (!id || !name) return null;
+  const normalizedReason = String(reason || '').trim();
+  return {
+    bowlerId: id,
+    bowlerName: name,
+    ...(normalizedReason ? { reason: normalizedReason } : {}),
+  };
+};
+
+const resolveSuggestionPlayer = (
+  suggestion: SuggestedBowlerRecommendation,
+  rosterPlayers: Player[]
+): Player | null => {
+  const byId = rosterPlayers.find((player) => baselineKey(player.id) === baselineKey(suggestion.bowlerId));
+  if (byId && byId.inRoster !== false) return byId;
+  const byName = rosterPlayers.find((player) => baselineKey(player.name) === baselineKey(suggestion.bowlerName));
+  if (byName && byName.inRoster !== false) return byName;
+  return null;
+};
+
+const normalizeSuggestedBowler = (
+  result: OrchestrateResponse,
+  rosterPlayers: Player[] = [],
+  activePlayerId?: string,
+  mode: TeamMode = 'BOWLING'
+): SuggestedBowlerRecommendation | null => {
+  const toModeEligibleSuggestion = (candidate: SuggestedBowlerRecommendation | null): SuggestedBowlerRecommendation | null => {
+    if (!candidate) return null;
+    if (rosterPlayers.length === 0) return candidate;
+    const resolved = resolveSuggestionPlayer(candidate, rosterPlayers);
+    if (!resolved) return null;
+    return isEligibleForMode(resolved, mode) ? candidate : null;
+  };
+
+  const directRecommendation = toModeEligibleSuggestion(
+    result.recommendation?.bowlerId && result.recommendation.bowlerName
+      ? {
+          bowlerId: String(result.recommendation.bowlerId),
+          bowlerName: String(result.recommendation.bowlerName),
+          reason: typeof result.recommendation.reason === 'string' ? result.recommendation.reason : undefined,
+        }
+      : null
+  );
+  if (directRecommendation) return directRecommendation;
+
+  const suggestedRotationRecommendation = toModeEligibleSuggestion(
+    result.suggestedRotation?.playerId && result.suggestedRotation.name
+      ? {
+          bowlerId: String(result.suggestedRotation.playerId),
+          bowlerName: String(result.suggestedRotation.name),
+          reason: typeof result.suggestedRotation.rationale === 'string' ? result.suggestedRotation.rationale : undefined,
+        }
+      : null
+  );
+  if (suggestedRotationRecommendation) return suggestedRotationRecommendation;
+
+  const modeFinalCandidate = mode === 'BATTING'
+    ? result.finalRecommendation?.nextSafeBatter
+    : result.finalRecommendation?.nextSafeBowler;
+  const finalRecommendationCandidate = toModeEligibleSuggestion(
+    modeFinalCandidate?.playerId && modeFinalCandidate?.name
+      ? {
+          bowlerId: String(modeFinalCandidate.playerId),
+          bowlerName: String(modeFinalCandidate.name),
+          reason: typeof modeFinalCandidate.reason === 'string' ? modeFinalCandidate.reason : undefined,
+        }
+      : null
+  );
+  if (finalRecommendationCandidate) return finalRecommendationCandidate;
+
+  const tacticalRecord = toRecord(result.tactical as unknown);
+  const tacticalSuggestedSub = toRecord(tacticalRecord.suggestedSubstitution);
+  const tacticalSuggested = toModeEligibleSuggestion(toSuggestedBowlerRecommendation(
+    tacticalSuggestedSub.playerId ?? tacticalSuggestedSub.bowlerId,
+    tacticalSuggestedSub.name ?? tacticalSuggestedSub.bowlerName,
+    tacticalSuggestedSub.reason ?? tacticalSuggestedSub.rationale
+  ));
+  if (tacticalSuggested) return tacticalSuggested;
+
+  const tacticalAgentRecord = toRecord((result as unknown as Record<string, unknown>).tacticalAgent);
+  const tacticalAgentRecommendation = toRecord(tacticalAgentRecord.recommendation);
+  const tacticalAgentSuggested = toModeEligibleSuggestion(toSuggestedBowlerRecommendation(
+    tacticalAgentRecommendation.playerId ?? tacticalAgentRecommendation.bowlerId,
+    tacticalAgentRecommendation.name ?? tacticalAgentRecommendation.bowlerName,
+    tacticalAgentRecommendation.reason ?? tacticalAgentRecommendation.rationale
+  ));
+  if (tacticalAgentSuggested) return tacticalAgentSuggested;
+
+  const tacticalOutputRecord = toRecord(toRecord(result.agentOutputs as unknown).tactical);
+  const tacticalOutputSuggestedSub = toRecord(tacticalOutputRecord.suggestedSubstitution);
+  const tacticalOutputSuggested = toModeEligibleSuggestion(toSuggestedBowlerRecommendation(
+    tacticalOutputSuggestedSub.playerId ?? tacticalOutputSuggestedSub.bowlerId,
+    tacticalOutputSuggestedSub.name ?? tacticalOutputSuggestedSub.bowlerName,
+    tacticalOutputSuggestedSub.reason ?? tacticalOutputSuggestedSub.rationale
+  ));
+  if (tacticalOutputSuggested) return tacticalOutputSuggested;
+
+  const activeIdKey = baselineKey(activePlayerId || '');
+  const modeRoster = rosterPlayers.filter(
+    (player) =>
+      player.inRoster !== false &&
+      isEligibleForMode(player, mode) &&
+      baselineKey(player.id) !== activeIdKey
+  );
+  const textFragments = [
+    result.finalRecommendation?.statement,
+    result.finalRecommendation?.nextSafeBowler?.reason,
+    result.finalRecommendation?.nextSafeBatter?.reason,
+    result.finalDecision?.rationale,
+    result.finalDecision?.immediateAction,
+    ...(result.finalDecision?.suggestedAdjustments || []),
+    result.combinedDecision?.rationale,
+    result.combinedDecision?.immediateAction,
+    ...(result.combinedDecision?.suggestedAdjustments || []),
+    result.tactical?.rationale,
+    result.tactical?.immediateAction,
+    ...(result.tactical?.suggestedAdjustments || []),
+    String(toRecord((result as unknown as Record<string, unknown>).output).text || ''),
+  ]
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .map((entry) => entry.toLowerCase());
+  const textBlob = textFragments.join(' ');
+  if (textBlob) {
+    const mentionedPlayer = [...modeRoster]
+      .sort((a, b) => b.name.length - a.name.length)
+      .find((player) => textBlob.includes(player.name.toLowerCase()));
+    if (mentionedPlayer) {
+      return {
+        bowlerId: mentionedPlayer.id,
+        bowlerName: mentionedPlayer.name,
+        reason: 'Inferred from coach response text.',
+      };
+    }
+  }
+
+  return null;
 };
 
 const resolveRosterIdsFromBaselines = (candidateIds: string[], baselines: Baseline[]): string[] => {
@@ -907,10 +1232,15 @@ const normalizeApiFailureBody = (body?: string): string | null => {
 
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    const traceId =
+      typeof parsed.traceId === 'string' && parsed.traceId.trim().length > 0
+        ? parsed.traceId.trim()
+        : null;
     const candidate = [parsed.message, parsed.error, parsed.detail].find(
       (value): value is string => typeof value === 'string' && value.trim().length > 0
     );
-    if (candidate) return candidate.trim();
+    if (candidate) return traceId ? `${candidate.trim()} (traceId: ${traceId})` : candidate.trim();
+    if (traceId) return `Request failed (traceId: ${traceId})`;
   } catch {
     // Keep plain-text body fallback.
   }
@@ -935,7 +1265,9 @@ const toAgentFailureDetail = (error: unknown, fallbackUrl: string): AgentFailure
       message = 'Health endpoint not found (/health). Check proxy/routes.';
       hint = 'Ensure /health (or /api/health) exists and Vite proxy forwards requests to the backend.';
     } else if (typeof error.status === 'number' && error.status >= 500) {
-      message = `Backend error (${error.status}). Check API logs.`;
+      if (!/traceid:/i.test(message)) {
+        message = `Backend error (${error.status}). Check API logs.`;
+      }
       hint = 'Server responded with an internal error.';
     }
 
@@ -965,9 +1297,11 @@ const RECOVERY_RATE_BY_HRR: Record<RecoveryLevel, number> = {
 
 export default function App() {
   const useAgentFramework = String(import.meta.env.VITE_USE_AGENT_FRAMEWORK || '').trim().toLowerCase() === 'true';
+  const initialStoredMatchMode = useMemo(() => readStoredMatchMode(), []);
   const [showSplash, setShowSplash] = useState(true);
   const [page, setPage] = useState<Page>('landing');
   const [matchContext, setMatchContext] = useState<MatchContext>({
+    matchMode: initialStoredMatchMode ?? 'BOWLING',
     format: 'T20',
     phase: 'Powerplay',
     pitch: 'Medium',
@@ -981,17 +1315,21 @@ export default function App() {
     wickets: 3
   });
   const [players, setPlayers] = useState<Player[]>([]);
-  const [activePlayerId, setActivePlayerId] = useState<string>('');
+  const [activePlayerId, setActivePlayerId] = useState<string>(() => readStoredActivePlayerId());
   const [agentState, setAgentState] = useState<'idle' | 'thinking' | 'done' | 'offline' | 'invalid'>('idle');
+  const [runMode, setRunMode] = useState<RunMode>('auto');
   const [agentWarning, setAgentWarning] = useState<string | null>(null);
   const [agentFailure, setAgentFailure] = useState<AgentFailureDetail | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AiAnalysis | null>(null);
   const [riskAnalysis, setRiskAnalysis] = useState<AiAnalysis | null>(null);
   const [tacticalAnalysis, setTacticalAnalysis] = useState<TacticalAgentResponse | null>(null);
+  const [strategicAnalysis, setStrategicAnalysis] = useState<OrchestrateResponse['strategicAnalysis'] | null>(null);
+  const [combinedAnalysis, setCombinedAnalysis] = useState<OrchestrateResponse['strategicAnalysis'] | null>(null);
   const [combinedDecision, setCombinedDecision] = useState<TacticalCombinedDecision | null>(null);
+  const [finalRecommendation, setFinalRecommendation] = useState<FinalRecommendation | null>(null);
   const [orchestrateMeta, setOrchestrateMeta] = useState<OrchestrateMetaView | null>(null);
   const [routerDecision, setRouterDecision] = useState<RouterDecisionView | null>(null);
-  const [agentFeedStatus, setAgentFeedStatus] = useState<AgentFeedStatus>({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
+  const [agentFeedStatus, setAgentFeedStatus] = useState<AgentFeedStatus>(() => getDefaultAgentFeedStatus());
   const [analysisActive, setAnalysisActive] = useState(false);
   const [analysisRequested, setAnalysisRequested] = useState(false);
   const [recoveryMode, setRecoveryMode] = useState<RecoveryMode>('auto');
@@ -1005,15 +1343,33 @@ export default function App() {
   const rosterLoadRequestIdRef = useRef(0);
   const rosterInitializedRef = useRef(false);
   const matchRosterIdsRef = useRef<string[]>([]);
+  const teamModeLockedRef = useRef(Boolean(initialStoredMatchMode));
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
   const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previousActivePlayerIdRef = useRef<string | null>(null);
+  const baselineCacheRef = useRef<Map<string, Baseline>>(new Map());
 
   useEffect(() => {
     matchRosterIdsRef.current = matchRosterIds;
   }, [matchRosterIds]);
+
+  useEffect(() => {
+    if (teamModeLockedRef.current) return;
+    const selected = players.find((player) => player.id === activePlayerId);
+    if (!selected) return;
+    const inferredMatchMode: MatchContext['matchMode'] = isBowlingRole(selected.role) ? 'BOWLING' : 'BATTING';
+    setMatchContext((prev) => (prev.matchMode === inferredMatchMode ? prev : { ...prev, matchMode: inferredMatchMode }));
+  }, [players, activePlayerId]);
+
+  useEffect(() => {
+    writeStoredMatchMode(matchContext.matchMode);
+  }, [matchContext.matchMode]);
+
+  useEffect(() => {
+    writeStoredActivePlayerId(activePlayerId);
+  }, [activePlayerId]);
 
   useEffect(() => {
     const applyBaselinesToRoster = (rows: Baseline[], reason: 'mount' | 'event') => {
@@ -1107,6 +1463,52 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const next = new Map(baselineCacheRef.current);
+    workingBaselines.forEach((row) => {
+      const normalized = normalizeBaselineRecord(row);
+      const idKey = baselineKey(normalizeBaselineId(normalized.id || normalized.playerId || normalized.name));
+      const nameKey = baselineKey(normalized.name);
+      if (idKey) next.set(idKey, normalized);
+      if (nameKey) next.set(nameKey, normalized);
+    });
+    baselineCacheRef.current = next;
+  }, [workingBaselines]);
+
+  const getBaselineForPlayer = useCallback(async (playerId: string, signal?: AbortSignal): Promise<Baseline | null> => {
+    const normalizedId = normalizeBaselineId(playerId);
+    if (!normalizedId) return null;
+    const cacheKey = baselineKey(normalizedId);
+    const cached = baselineCacheRef.current.get(cacheKey);
+    if (cached) return cached;
+
+    const local = workingBaselines.find((row) => {
+      const rowIdKey = baselineKey(normalizeBaselineId(row.id || row.playerId || row.name));
+      const rowNameKey = baselineKey(row.name);
+      return rowIdKey === cacheKey || rowNameKey === cacheKey;
+    });
+    if (local) {
+      const normalized = normalizeBaselineRecord(local);
+      baselineCacheRef.current.set(cacheKey, normalized);
+      baselineCacheRef.current.set(baselineKey(normalized.name), normalized);
+      return normalized;
+    }
+
+    try {
+      const fetched = await getBaselineByPlayerId(normalizedId, signal);
+      if (!fetched) return null;
+      const normalized = normalizeBaselineRecord(fetched);
+      baselineCacheRef.current.set(cacheKey, normalized);
+      baselineCacheRef.current.set(baselineKey(normalized.name), normalized);
+      return normalized;
+    } catch (error) {
+      if (import.meta.env.DEV) {
+        console.warn('[analysis] baseline lookup failed', { playerId: normalizedId, error });
+      }
+      return null;
+    }
+  }, [workingBaselines]);
+
   const selectedPlayer = players.find((p) => p.id === activePlayerId) ?? null;
   const normalizedPhase = normalizePhase(matchContext.phase);
   const activeDerived = React.useMemo(() => {
@@ -1190,6 +1592,7 @@ export default function App() {
       maxOvers: activeDerived.maxOvers,
       quotaComplete: Boolean(activeDerived.quotaComplete),
       fatigueIndex: activeDerived.fatigue,
+      strainIndex: Math.max(0, Math.min(10, safeNum(activeDerived.strainIndex, 0))),
       injuryRisk,
       noBallRisk,
       heartRateRecovery: String(activeDerived.hrRecovery || 'Moderate'),
@@ -1197,6 +1600,7 @@ export default function App() {
       sleepHours: activeDerived.sleepHrs,
       recoveryMinutes: activeDerived.recoveryMin,
       matchContext: {
+        matchMode: matchContext.matchMode,
         format: matchContext.format || 'T20',
         phase: normalizedPhase,
         over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
@@ -1503,21 +1907,6 @@ export default function App() {
     }));
   };
 
-  const handleNewSpell = () => {
-    if (!activePlayer) return;
-    if (activePlayer.isUnfit) return;
-    // Compatibility marker for legacy spell tracking fields.
-    updatePlayer(activePlayer.id, {
-      lastRestOvers: activePlayer.overs,
-      isResting: false,
-      restStartMs: undefined,
-      restElapsedSec: 0,
-      recoveryElapsed: 0,
-      isManuallyUnfit: false,
-      isInjured: false,
-    });
-  };
-
   const handleRest = () => {
     if (!activePlayer) return;
     if (activePlayer.isUnfit) return;
@@ -1680,32 +2069,39 @@ export default function App() {
 
   const runAgent = async (
     mode: 'auto' | 'full' = 'auto',
-    reason: 'button_click' | 'non_button' = 'non_button'
-  ) => {
-    const orchestrateRequestUrl = useAgentFramework ? apiAgentFrameworkMessagesUrl : apiOrchestrateUrl;
+    reason: 'button_click' | 'non_button' = 'non_button',
+    options?: {
+      teamMode?: TeamMode;
+      focusRole?: 'BOWLER' | 'BATTER';
+      strainIndex?: number;
+    }
+  ): Promise<RunCoachAgentResult | null> => {
+    const orchestrateRequestUrl =
+      mode === 'full' ? apiFullAnalysisUrl : useAgentFramework ? apiAgentFrameworkMessagesUrl : apiOrchestrateUrl;
     const frameworkMode = mode === 'full' ? 'all' : 'route';
 
     if (reason !== 'button_click') {
       if (import.meta.env.DEV) {
         console.warn('Coach analysis blocked', { reason });
       }
-      return;
+      return null;
     }
     if (import.meta.env.DEV) {
       console.log('Coach analysis triggered', { reason: 'button_click' });
     }
-    if (agentState === 'thinking') return;
+    setRunMode(mode);
+    if (agentState === 'thinking') return null;
     if (!currentTelemetry) {
       setAgentWarning(null);
       setAgentFailure({
         status: 'network',
-        url: apiOrchestrateUrl,
+        url: orchestrateRequestUrl,
         message: 'No active player telemetry available for analysis.',
         hint: null,
       });
       setAgentState('invalid');
       setAnalysisActive(false);
-      return;
+      return null;
     }
     setAnalysisRequested(true);
     setAnalysisActive(false);
@@ -1718,15 +2114,18 @@ export default function App() {
     setAiAnalysis(null);
     setRiskAnalysis(null);
     setTacticalAnalysis(null);
+    setStrategicAnalysis(null);
+    setCombinedAnalysis(null);
     setCombinedDecision(null);
+    setFinalRecommendation(null);
     setOrchestrateMeta(null);
     setRouterDecision(null);
-    setAgentFeedStatus({ fatigue: 'loading', risk: 'idle', tactical: 'loading' });
+    setAgentFeedStatus({ fatigue: 'RUNNING', risk: 'RUNNING', tactical: 'RUNNING' });
     setAgentWarning(null);
     setAgentFailure(null);
     setAgentState('thinking');
 
-    const requestMode: 'auto' | 'route' = mode === 'auto' ? 'auto' : 'route';
+    const requestMode: 'auto' | 'full' = mode === 'full' ? 'full' : 'auto';
     const maxOvers = Math.max(1, safeNum(currentTelemetry.maxOvers, getMaxOvers(matchContext.format)));
     const oversBowled = clampOversBowled(safeNum(currentTelemetry.oversBowled, 0), maxOvers);
     const oversRemaining = computeOversRemaining(oversBowled, maxOvers);
@@ -1745,6 +2144,12 @@ export default function App() {
     const isUnfit = Boolean(activePlayer?.isUnfit);
     const injury = isUnfit || injuryLabel === 'HIGH' || injuryLabel === 'CRITICAL';
     const noBallRisk: 'LOW' | 'MEDIUM' | 'HIGH' = noBallRiskLabel === 'HIGH' ? 'HIGH' : noBallRiskLabel === 'LOW' ? 'LOW' : 'MEDIUM';
+    const teamMode = options?.teamMode || matchContext.matchMode;
+    const focusRole = options?.focusRole || deriveFocusRoleFromPlayer(activePlayer, teamMode);
+    const strainIndex = Math.max(
+      0,
+      Math.min(10, safeNum(options?.strainIndex, safeNum(currentTelemetry.strainIndex, safeNum(activePlayer?.strainIndex, 0))))
+    );
     const totalBalls = totalBallsFromOvers(matchState.totalOvers);
     const ballsBowled = Math.min(totalBalls, Math.max(0, matchState.ballsBowled));
     const ballsRemaining = Math.max(0, totalBalls - ballsBowled);
@@ -1770,20 +2175,92 @@ export default function App() {
         return workload.oversRemaining > 0;
       })
       .map((p) => p.name);
-    const selectedPlayerBaseline = activePlayer ? baselineFromPlayer(activePlayer) : null;
-    const text = `${currentTelemetry.playerName} overs ${oversBowled}/${maxOvers} (remaining ${oversRemaining}), fatigue ${fatigue.toFixed(1)}/10, injury risk ${injuryLabel}, no-ball risk ${noBallRiskLabel}, ${quotaComplete ? 'quota completed for format' : 'quota available'}, ${isUnfit ? 'marked unfit' : 'currently fit'}.`;
+    const localSelectedBaseline = activePlayer ? baselineFromPlayer(activePlayer) : null;
+    const selectedPlayerBaseline =
+      await getBaselineForPlayer(activePlayer?.id || currentTelemetry.playerId, controller.signal) || localSelectedBaseline;
+    const baselineSleepHours = selectedPlayerBaseline
+      ? safeNum(selectedPlayerBaseline.sleepHoursToday ?? selectedPlayerBaseline.sleep, safeNum(currentTelemetry.sleepHours, 7))
+      : safeNum(currentTelemetry.sleepHours, 7);
+    const baselineRecoveryMinutes = selectedPlayerBaseline
+      ? safeNum(selectedPlayerBaseline.recoveryMinutes ?? selectedPlayerBaseline.recovery, safeNum(currentTelemetry.recoveryMinutes, 45))
+      : safeNum(currentTelemetry.recoveryMinutes, 45);
+    const baselineFatigueLimit = selectedPlayerBaseline
+      ? safeNum(selectedPlayerBaseline.fatigueLimit, safeNum(currentTelemetry.fatigueLimit, 6))
+      : safeNum(currentTelemetry.fatigueLimit, 6);
+    const baselineControl = selectedPlayerBaseline
+      ? safeNum(selectedPlayerBaseline.controlBaseline ?? selectedPlayerBaseline.control, safeNum(activePlayer?.controlBaseline, 78))
+      : safeNum(activePlayer?.controlBaseline, 78);
+    const baselineSpeed = selectedPlayerBaseline
+      ? safeNum(selectedPlayerBaseline.speed, safeNum(activePlayer?.speed, 7))
+      : safeNum(activePlayer?.speed, 7);
+    const baselinePower = selectedPlayerBaseline
+      ? safeNum(selectedPlayerBaseline.power, safeNum(activePlayer?.power, 6))
+      : safeNum(activePlayer?.power, 6);
+    const baselineSummaryText = selectedPlayerBaseline
+      ? `baseline sleep ${baselineSleepHours.toFixed(1)}h, recovery ${Math.round(baselineRecoveryMinutes)}m, fatigue limit ${baselineFatigueLimit.toFixed(1)}.`
+      : 'baseline not available, using live telemetry only.';
+    const text = `${currentTelemetry.playerName} overs ${oversBowled}/${maxOvers} (remaining ${oversRemaining}), fatigue ${fatigue.toFixed(1)}/10, strain ${strainIndex.toFixed(1)}/10, injury risk ${injuryLabel}, no-ball risk ${noBallRiskLabel}, ${quotaComplete ? 'quota completed for format' : 'quota available'}, ${isUnfit ? 'marked unfit' : 'currently fit'}, ${baselineSummaryText}`;
+    const baselinesForContext = (() => {
+      if (!selectedPlayerBaseline) return workingBaselines;
+      const normalized = normalizeBaselineRecord(selectedPlayerBaseline);
+      const selectedKey = baselineKey(normalizeBaselineId(normalized.id || normalized.playerId || normalized.name));
+      let found = false;
+      const merged = workingBaselines.map((row) => {
+        const rowKey = baselineKey(normalizeBaselineId(row.id || row.playerId || row.name));
+        if (rowKey !== selectedKey) return row;
+        found = true;
+        return normalizeBaselineRecord({
+          ...row,
+          ...normalized,
+          id: normalizeBaselineId(normalized.id || normalized.playerId || normalized.name),
+          playerId: normalizeBaselineId(normalized.playerId || normalized.id || normalized.name),
+        });
+      });
+      return found ? merged : [...merged, normalized];
+    })();
+    const fullMatchContext = buildMatchContext({
+      matchContext,
+      matchState,
+      players,
+      baselines: baselinesForContext,
+      activePlayerId: activePlayer?.id,
+      autoRouting: mode === 'auto',
+    });
+    const contextSummary = summarizeMatchContext(fullMatchContext);
+    if (contextSummary.rosterCount <= 0) {
+      setAgentFeedStatus(getDefaultAgentFeedStatus());
+      setAgentWarning(null);
+      setAgentFailure({
+        status: 'network',
+        url: orchestrateRequestUrl,
+        message: 'Cannot run analysis: roster is empty in FullMatchContext.',
+        hint: 'Add players to roster and try again.',
+      });
+      setAgentState('invalid');
+      setAnalysisActive(false);
+      return null;
+    }
     const payload = {
+      context: fullMatchContext,
+      teamMode,
+      focusRole,
+      userAction: 'RUN_COACH',
       text,
       mode: requestMode,
       signals: {
         injury,
         isUnfit,
         fatigue,
+        strainIndex,
         noBallRisk,
         oversBowled,
         oversRemaining,
         maxOvers,
         quotaComplete,
+        baselineAvailable: Boolean(selectedPlayerBaseline),
+        baselineSleepHours: baselineSleepHours,
+        baselineRecoveryMinutes: baselineRecoveryMinutes,
+        baselineFatigueLimit: baselineFatigueLimit,
         intensity: matchContext.pitch || 'Medium',
       },
       telemetry: {
@@ -1791,6 +2268,7 @@ export default function App() {
         playerName: currentTelemetry.playerName,
         role: currentTelemetry.role,
         fatigueIndex: fatigue,
+        strainIndex,
         heartRateRecovery: currentTelemetry.heartRateRecovery,
         oversBowled,
         oversRemaining,
@@ -1799,24 +2277,47 @@ export default function App() {
         consecutiveOvers: 0,
         injuryRisk: injuryLabel,
         noBallRisk,
-        fatigueLimit: currentTelemetry.fatigueLimit,
-        sleepHours: currentTelemetry.sleepHours,
-        recoveryMinutes: currentTelemetry.recoveryMinutes,
+        fatigueLimit: baselineFatigueLimit,
+        sleepHours: baselineSleepHours,
+        recoveryMinutes: baselineRecoveryMinutes,
         isUnfit,
       },
+      baseline: selectedPlayerBaseline
+        ? {
+            playerId: normalizeBaselineId(selectedPlayerBaseline.playerId || selectedPlayerBaseline.id || selectedPlayerBaseline.name),
+            name: selectedPlayerBaseline.name,
+            role: selectedPlayerBaseline.role,
+            sleepHours: baselineSleepHours,
+            recoveryMinutes: baselineRecoveryMinutes,
+            fatigueLimit: baselineFatigueLimit,
+            control: baselineControl,
+            speed: baselineSpeed,
+            power: baselinePower,
+          }
+        : null,
       matchContext: {
-        format: currentTelemetry.matchContext.format,
+        teamMode,
+        matchMode: matchContext.matchMode,
+        format: matchContext.format,
+        matchFormat: matchContext.format,
         phase: normalizedPhase,
         requiredRunRate: Number(requiredRunRate.toFixed(2)),
         currentRunRate: Number(currentRunRate.toFixed(2)),
         wicketsInHand,
         oversRemaining: inningsOversRemaining,
         over: safeNum(Number(formatOverStr(matchState.ballsBowled)), 0),
-        intensity: currentTelemetry.matchContext.intensity,
+        overs: Number((ballsBowled / 6).toFixed(1)),
+        ballsBowled,
+        intensity: matchContext.pitch || currentTelemetry.matchContext.intensity,
+        weather: matchContext.weather,
         conditions: matchContext.weather,
         target: typeof matchState.target === 'number' ? matchState.target : undefined,
+        targetRuns: typeof matchState.target === 'number' ? matchState.target : undefined,
         score: matchState.runs,
+        scoreRuns: matchState.runs,
+        wickets: matchState.wickets,
         balls: ballsRemaining,
+        ballsRemaining,
       },
       players: {
         striker: batsmen[0]?.name || 'Striker',
@@ -1828,15 +2329,41 @@ export default function App() {
     };
     if (import.meta.env.DEV) {
       console.log('[agent] calling', orchestrateRequestUrl, { useAgentFramework, mode: frameworkMode });
-      console.log('Orchestrate payload', payload);
+      console.log('[orchestrate] contextSummary', contextSummary);
+      if (String(import.meta.env.VITE_DEBUG_CONTEXT || '').trim().toLowerCase() === 'true') {
+        console.log('[orchestrate] fullContext', fullMatchContext);
+      }
     }
 
-    try {
-      await checkHealth(controller.signal);
-      const result: OrchestrateResponse = useAgentFramework
-        ? await postAgentFrameworkOrchestrate(payload, frameworkMode, controller.signal)
-        : await postOrchestrate(payload, controller.signal);
-      if (requestId !== fatigueRequestSeq.current) return;
+    const logCoachAnalysisFailure = (
+      tag: 'COACH_ANALYSIS_ROUTER_FAILED' | 'COACH_ANALYSIS_AGENT_FAILED',
+      error: unknown,
+      url: string
+    ) => {
+      if (!import.meta.env.DEV) return;
+      if (error instanceof ApiClientError) {
+        const responsePreview = typeof error.body === 'string'
+          ? error.body.replace(/\s+/g, ' ').slice(0, 200)
+          : '';
+        console.error(tag, {
+          url,
+          status: error.status ?? error.kind,
+          message: error.message,
+          responsePreview,
+        });
+        return;
+      }
+      console.error(tag, {
+        url,
+        status: 'unknown',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    };
+
+    const applyCoachResult = (
+      result: OrchestrateResponse,
+      options?: { extraWarning?: string }
+    ): RunCoachAgentResult => {
       const fatigueMapped = result.fatigue ? buildAiAnalysis(result.fatigue, 'fatigue') : null;
       const riskMapped = result.risk ? buildAiAnalysis(result.risk, 'risk') : null;
       const tacticalMapped = result.tactical || null;
@@ -1844,46 +2371,301 @@ export default function App() {
       setAiAnalysis(fatigueMapped);
       setRiskAnalysis(riskMapped);
       setTacticalAnalysis(tacticalMapped);
+      setStrategicAnalysis(mode === 'auto' ? (result.strategicAnalysis || null) : null);
+      setCombinedAnalysis(mode === 'full' ? (result.strategicAnalysis || null) : null);
       setCombinedDecision((result.finalDecision || result.combinedDecision) || null);
+      setFinalRecommendation(result.finalRecommendation || null);
       setOrchestrateMeta({
         mode: result.meta.mode,
         executedAgents: result.meta.executedAgents,
         usedFallbackAgents: result.meta.usedFallbackAgents || [],
+        routerFallbackMessage: typeof result.meta.routerFallbackMessage === 'string' ? result.meta.routerFallbackMessage : undefined,
+        traceId: result.traceId || result.responseHeaders?.traceId,
+        source: result.source || result.responseHeaders?.source,
+        azureRequestId: result.azureRequestId,
+        timingsMs: result.timingsMs,
+        agentStatuses: {
+          fatigue: result.agents?.fatigue?.status,
+          risk: result.agents?.risk?.status,
+          tactical: result.agents?.tactical?.status,
+        },
       });
-      setRouterDecision(result.routerDecision || null);
+      setRouterDecision(mode === 'auto' ? (result.routerDecision || null) : null);
 
-      const fatigueErrored = result.errors.some((e) => e.agent === 'fatigue');
-      const riskErrored = result.errors.some((e) => e.agent === 'risk');
-      const tacticalErrored = result.errors.some((e) => e.agent === 'tactical');
+      const selectedAgentSet = new Set<AgentKey>(mode === 'full' ? AGENT_KEYS : []);
+      if (mode === 'auto') {
+        if (Array.isArray(result.routerDecision?.selectedAgents)) {
+          result.routerDecision.selectedAgents.forEach((agent) => {
+            const key = toAgentKey(agent);
+            if (key) selectedAgentSet.add(key);
+          });
+        }
+        if (Array.isArray(result.routerDecision?.agentsToRun)) {
+          result.routerDecision.agentsToRun.forEach((agent) => {
+            const key = toAgentKey(agent);
+            if (key) selectedAgentSet.add(key);
+          });
+        }
+      }
+      if (Array.isArray(result.meta.executedAgents)) {
+        result.meta.executedAgents.forEach((agent) => {
+          const key = toAgentKey(agent);
+          if (key) selectedAgentSet.add(key);
+        });
+      }
+      if (selectedAgentSet.size === 0) {
+        selectedAgentSet.add('tactical');
+      }
+      selectedAgentSet.add('tactical');
+
+      const outputRecord = toRecord((result as unknown as Record<string, unknown>).outputs);
+      const hasAgentOutput = (agent: AgentKey): boolean => {
+        const mappedOutput =
+          agent === 'fatigue'
+            ? Boolean(fatigueMapped || result.fatigue)
+            : agent === 'risk'
+              ? Boolean(riskMapped || result.risk)
+              : Boolean(tacticalMapped || result.tactical);
+        if (mappedOutput) return true;
+        const output = toRecord(outputRecord[agent]);
+        if (output.ok === true) return true;
+        const data = toRecord(output.data);
+        return Object.keys(data).length > 0;
+      };
+      const normalizeAgentStatusToken = (value: unknown): string => String(value || '').trim().toUpperCase();
+      const deriveFeedStatus = (agent: AgentKey): AgentFeedState => {
+        if (!selectedAgentSet.has(agent)) return 'SKIPPED';
+        const serverStatus = normalizeAgentStatusToken(result.agents?.[agent]?.status);
+        const errored = result.errors.some((entry) => entry.agent === agent);
+        if (hasAgentOutput(agent) || serverStatus === 'OK' || serverStatus === 'FALLBACK' || serverStatus === 'SUCCESS') {
+          return 'SUCCESS';
+        }
+        if (errored || serverStatus === 'ERROR') return 'ERROR';
+        return 'ERROR';
+      };
       setAgentFeedStatus({
-        fatigue: result.meta.executedAgents.includes('fatigue')
-          ? (fatigueMapped ? 'done' : fatigueErrored ? 'error' : 'idle')
-          : 'idle',
-        risk: result.meta.executedAgents.includes('risk')
-          ? (riskMapped ? 'done' : riskErrored ? 'error' : 'idle')
-          : 'idle',
-        tactical: result.meta.executedAgents.includes('tactical')
-          ? (tacticalMapped ? 'done' : tacticalErrored ? 'error' : 'idle')
-          : 'idle',
+        fatigue: deriveFeedStatus('fatigue'),
+        risk: deriveFeedStatus('risk'),
+        tactical: deriveFeedStatus('tactical'),
       });
 
       const visibleErrors = result.errors.filter((e) => !(e.agent === 'tactical' && tacticalMapped));
-      setAgentWarning(visibleErrors.length > 0 ? visibleErrors.map((e) => `${e.agent}: ${e.message}`).join(' | ') : null);
+      const fallbackNotice = typeof result.meta.routerFallbackMessage === 'string' ? result.meta.routerFallbackMessage : null;
+      const errorNotice = visibleErrors.length > 0 ? visibleErrors.map((e) => `${e.agent}: ${e.message}`).join(' | ') : null;
+      const responseWarnings = Array.isArray(result.warnings)
+        ? result.warnings.map((entry) => String(entry || '').trim()).filter(Boolean).join(' | ')
+        : null;
+      const warning = [fallbackNotice, responseWarnings, errorNotice, options?.extraWarning].filter(Boolean).join(' | ') || null;
+      const hasAnyAgentOutput =
+        hasAgentOutput('fatigue') || hasAgentOutput('risk') || hasAgentOutput('tactical');
+      setAgentWarning(warning);
       setAgentFailure(null);
-      setAgentState(result.errors.length > 0 && !fatigueMapped && !riskMapped && !tacticalMapped ? 'offline' : 'done');
-      setAnalysisActive(true);
+      setAgentState(result.errors.length > 0 && !hasAnyAgentOutput ? 'offline' : 'done');
+      setAnalysisActive(Boolean(hasAnyAgentOutput || result.strategicAnalysis || result.combinedDecision));
+      return {
+        response: result,
+        suggestedBowler: normalizeSuggestedBowler(result, players, activePlayer?.id, teamMode),
+      };
+    };
+
+    const buildAutoTacticalFallbackResponse = (
+      tactical: TacticalAgentResponse,
+      fallbackMessage: string
+    ): OrchestrateResponse => {
+      const immediateAction = String(tactical.immediateAction || 'Apply tactical control and reassess after one over.');
+      const rationale = String(tactical.rationale || fallbackMessage);
+      const tacticalAdjustments = Array.isArray(tactical.suggestedAdjustments)
+        ? tactical.suggestedAdjustments.map((entry) => String(entry)).filter(Boolean)
+        : [];
+      const alternatives = tacticalAdjustments.length > 0
+        ? tacticalAdjustments.slice(0, 3)
+        : ['Re-run analysis once router connectivity stabilizes.'];
+      const signals = Array.isArray(tactical.keySignalsUsed)
+        ? tactical.keySignalsUsed.map((entry) => String(entry)).filter(Boolean).slice(0, 7)
+        : [];
+      const combinedDecision: TacticalCombinedDecision = {
+        immediateAction,
+        ...(tactical.substitutionAdvice
+          ? { substitutionAdvice: tactical.substitutionAdvice }
+          : {}),
+        suggestedAdjustments: [
+          ...tacticalAdjustments,
+          'Some signals unavailable; showing best available guidance.',
+        ].slice(0, 4),
+        confidence: Number.isFinite(Number(tactical.confidence)) ? Number(tactical.confidence) : 0.62,
+        rationale,
+      };
+
+      return {
+        tactical,
+        strategicAnalysis: {
+          signals,
+          fatigueAnalysis: 'Fatigue analysis unavailable in this run. Re-run for full workload diagnostics.',
+          injuryRiskAnalysis: 'Risk analysis unavailable in this run. Tactical guidance is based on best available context.',
+          tacticalRecommendation: {
+            nextAction: immediateAction,
+            why: rationale,
+            ifIgnored: tacticalAdjustments[0] || 'Execution risk may increase if current plan is left unchanged.',
+            alternatives,
+          },
+        },
+        finalDecision: combinedDecision,
+        combinedDecision,
+        errors: [
+          { agent: 'fatigue', message: 'Skipped due tactical fallback' },
+          { agent: 'risk', message: 'Skipped due tactical fallback' },
+        ],
+        routerDecision: {
+          intent: 'General',
+          agentsToRun: ['TACTICAL'],
+          selectedAgents: ['tactical'],
+          signalSummaryBullets: signals,
+          rationale: fallbackMessage,
+          rulesFired: ['routerFallback:tacticalOnly'],
+          inputsUsed: {
+            activePlayerId: String(payload.telemetry?.playerId || ''),
+            active: {
+              fatigueIndex: safeNum(payload.telemetry?.fatigueIndex, 0),
+              strainIndex: safeNum(payload.telemetry?.strainIndex, 0),
+              injuryRisk: String(payload.telemetry?.injuryRisk || ''),
+              noBallRisk: String(payload.telemetry?.noBallRisk || ''),
+            },
+            match: {
+              matchMode: String(payload.matchContext?.matchMode || payload.matchContext?.teamMode || ''),
+              format: String(payload.matchContext?.format || ''),
+              phase: String(payload.matchContext?.phase || ''),
+              overs: safeNum(payload.matchContext?.overs, 0),
+              balls: safeNum(payload.matchContext?.balls, 0),
+              scoreRuns: safeNum(payload.matchContext?.score, 0),
+              wickets: safeNum(payload.matchContext?.wickets, 0),
+              targetRuns: safeNum(payload.matchContext?.target, 0),
+              intensity: String(payload.matchContext?.intensity || ''),
+            },
+          },
+          reason: fallbackMessage,
+          signals: {
+            fatigueIndex: safeNum(payload.telemetry?.fatigueIndex, 0),
+            strainIndex: safeNum(payload.telemetry?.strainIndex, 0),
+            noBallRisk: String(payload.telemetry?.noBallRisk || ''),
+            injuryRisk: String(payload.telemetry?.injuryRisk || ''),
+          },
+        },
+        meta: {
+          requestId: `coach-auto-fallback-${Date.now()}`,
+          mode: 'auto',
+          executedAgents: ['tactical'],
+          modelRouting: {
+            fatigueModel: 'skipped:fallback',
+            riskModel: 'skipped:fallback',
+            tacticalModel: 'direct-tactical-fallback',
+            fallbacksUsed: ['router-unavailable', 'direct-tactical-fallback'],
+          },
+          usedFallbackAgents: ['tactical'],
+          routerFallbackMessage: fallbackMessage,
+          timingsMs: { total: 0, tactical: 0 },
+        },
+      };
+    };
+
+    try {
+      try {
+        await checkHealth(controller.signal);
+      } catch (healthError) {
+        if (import.meta.env.DEV) {
+          console.warn('COACH_ANALYSIS_HEALTH_CHECK_FAILED', healthError);
+        }
+      }
+
+      if (mode === 'full') {
+        const fullResult = await postFullCombinedAnalysis(payload, controller.signal);
+        if (requestId !== fatigueRequestSeq.current) return null;
+        return applyCoachResult(fullResult);
+      }
+
+      const autoFallbackMessage = 'Routing: rules-based (safe fallback)';
+      let autoResult: OrchestrateResponse | null = null;
+
+      try {
+        autoResult = useAgentFramework
+          ? await postAgentFrameworkOrchestrate(payload, frameworkMode, controller.signal)
+          : await postOrchestrate(payload, controller.signal);
+      } catch (primaryAutoError) {
+        logCoachAnalysisFailure('COACH_ANALYSIS_ROUTER_FAILED', primaryAutoError, orchestrateRequestUrl);
+
+        if (useAgentFramework) {
+          try {
+            autoResult = await postOrchestrate({ ...payload, mode: 'auto' }, controller.signal);
+          } catch (orchestrateFallbackError) {
+            logCoachAnalysisFailure('COACH_ANALYSIS_ROUTER_FAILED', orchestrateFallbackError, apiOrchestrateUrl);
+          }
+        }
+
+        if (!autoResult) {
+          try {
+            const tacticalResult = await postTacticalAgent(
+              {
+                requestId: `coach-auto-tactical-${Date.now()}`,
+                intent: payload.intent,
+                teamMode: payload.teamMode,
+                focusRole: payload.focusRole,
+                telemetry: payload.telemetry,
+                matchContext: payload.matchContext,
+                players: payload.players,
+                context: payload.context,
+              },
+              controller.signal
+            );
+            autoResult = buildAutoTacticalFallbackResponse(tacticalResult, autoFallbackMessage);
+          } catch (tacticalFallbackError) {
+            logCoachAnalysisFailure('COACH_ANALYSIS_AGENT_FAILED', tacticalFallbackError, orchestrateRequestUrl);
+            throw tacticalFallbackError;
+          }
+        }
+      }
+
+      if (!autoResult) {
+        throw new Error('Coach analysis did not return a result.');
+      }
+      const tacticalRan = Array.isArray(autoResult.meta?.executedAgents) && autoResult.meta.executedAgents.includes('tactical');
+      const hasUsableAutoOutput = Boolean(autoResult.tactical || autoResult.strategicAnalysis || autoResult.combinedDecision);
+      if (!tacticalRan || !hasUsableAutoOutput) {
+        try {
+          const tacticalResult = await postTacticalAgent(
+            {
+              requestId: `coach-auto-tactical-${Date.now()}`,
+              intent: payload.intent,
+              teamMode: payload.teamMode,
+              focusRole: payload.focusRole,
+              telemetry: payload.telemetry,
+              matchContext: payload.matchContext,
+              players: payload.players,
+              context: payload.context,
+            },
+            controller.signal
+          );
+          autoResult = buildAutoTacticalFallbackResponse(tacticalResult, autoFallbackMessage);
+        } catch (tacticalFallbackError) {
+          logCoachAnalysisFailure('COACH_ANALYSIS_AGENT_FAILED', tacticalFallbackError, orchestrateRequestUrl);
+          throw tacticalFallbackError;
+        }
+      }
+      if (requestId !== fatigueRequestSeq.current) return null;
+      return applyCoachResult(autoResult, {
+        extraWarning: autoResult.meta.routerFallbackMessage ? undefined : (autoResult.errors.length > 0 ? 'Some signals unavailable — showing best available guidance.' : undefined),
+      });
     } catch (error) {
-      if ((error as Error)?.name === 'AbortError') return;
-      if (requestId !== fatigueRequestSeq.current) return;
+      if ((error as Error)?.name === 'AbortError') return null;
+      if (requestId !== fatigueRequestSeq.current) return null;
       setAgentFeedStatus((prev) => ({
-        fatigue: prev.fatigue === 'loading' ? 'error' : prev.fatigue,
-        risk: prev.risk === 'loading' ? 'error' : prev.risk,
-        tactical: prev.tactical === 'loading' ? 'error' : prev.tactical,
+        fatigue: prev.fatigue === 'RUNNING' ? 'ERROR' : prev.fatigue,
+        risk: prev.risk === 'RUNNING' ? 'ERROR' : prev.risk,
+        tactical: prev.tactical === 'RUNNING' ? 'ERROR' : prev.tactical,
       }));
       setAgentWarning(null);
       setAgentFailure(toAgentFailureDetail(error, orchestrateRequestUrl));
       setAgentState('offline');
       setAnalysisActive(false);
+      return null;
     }
   };
 
@@ -1894,10 +2676,13 @@ export default function App() {
       setAiAnalysis(null);
       setRiskAnalysis(null);
       setTacticalAnalysis(null);
+      setStrategicAnalysis(null);
+      setCombinedAnalysis(null);
       setCombinedDecision(null);
+      setFinalRecommendation(null);
       setOrchestrateMeta(null);
       setRouterDecision(null);
-      setAgentFeedStatus({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
+      setAgentFeedStatus(getDefaultAgentFeedStatus());
       setAgentWarning(null);
       setAgentFailure(null);
       setAgentState('idle');
@@ -1919,10 +2704,14 @@ export default function App() {
     setAiAnalysis(null);
     setRiskAnalysis(null);
     setTacticalAnalysis(null);
+    setStrategicAnalysis(null);
+    setCombinedAnalysis(null);
     setCombinedDecision(null);
+    setFinalRecommendation(null);
     setOrchestrateMeta(null);
     setRouterDecision(null);
-    setAgentFeedStatus({ fatigue: 'idle', risk: 'idle', tactical: 'idle' });
+    setRunMode('auto');
+    setAgentFeedStatus(getDefaultAgentFeedStatus());
   };
 
   const navigateTo = (p: Page) => {
@@ -2160,6 +2949,12 @@ export default function App() {
             <Dashboard 
               key="dashboard"
               matchContext={matchContext}
+              runMode={runMode}
+              teamMode={matchContext.matchMode}
+              setTeamMode={(mode) => {
+                teamModeLockedRef.current = true;
+                setMatchContext((prev) => ({ ...prev, matchMode: mode }));
+              }}
               matchState={matchState}
               players={players}
               activePlayer={activePlayer}
@@ -2174,7 +2969,10 @@ export default function App() {
               aiAnalysis={aiAnalysis}
               riskAnalysis={riskAnalysis}
               tacticalAnalysis={tacticalAnalysis}
+              strategicAnalysis={strategicAnalysis}
+              combinedAnalysis={combinedAnalysis}
               combinedDecision={combinedDecision}
+              finalRecommendation={finalRecommendation}
               orchestrateMeta={orchestrateMeta}
               routerDecision={routerDecision}
               agentFeedStatus={agentFeedStatus}
@@ -2183,7 +2981,6 @@ export default function App() {
               onDismissAnalysis={dismissAnalysis}
               handleAddOver={handleAddOver}
               handleDecreaseOver={handleDecreaseOver}
-              handleNewSpell={handleNewSpell}
               handleRest={handleRest}
               handleMarkUnfit={handleMarkUnfit}
               recoveryMode={recoveryMode}
@@ -2331,7 +3128,7 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
   onNext: () => void,
   onBack: () => void 
 }) {
-  const handleChange = (key: keyof MatchContext, value: string) => {
+  const handleChange = <K extends keyof MatchContext>(key: K, value: MatchContext[K]) => {
     setContext({ ...context, [key]: value });
   };
 
@@ -2749,6 +3546,9 @@ function PressureForecastChart({
 
 interface DashboardProps {
   matchContext: MatchContext;
+  runMode: RunMode;
+  teamMode: TeamMode;
+  setTeamMode: (mode: TeamMode) => void;
   matchState: MatchState;
   players: Player[];
   activePlayer: (Player & { status: StatusLevel; loadRatio: number; maxOvers: number; oversRemaining: number }) | null;
@@ -2761,18 +3561,24 @@ interface DashboardProps {
   aiAnalysis: AiAnalysis | null;
   riskAnalysis: AiAnalysis | null;
   tacticalAnalysis: TacticalAgentResponse | null;
+  strategicAnalysis: OrchestrateResponse['strategicAnalysis'] | null;
+  combinedAnalysis: OrchestrateResponse['strategicAnalysis'] | null;
   combinedDecision: TacticalCombinedDecision | null;
+  finalRecommendation: FinalRecommendation | null;
   orchestrateMeta: OrchestrateMetaView | null;
   routerDecision: RouterDecisionView | null;
   agentFeedStatus: AgentFeedStatus;
   agentWarning: string | null;
   agentFailure: AgentFailureDetail | null;
   analysisActive: boolean;
-  runAgent: (mode?: 'auto' | 'full', reason?: 'button_click' | 'non_button') => Promise<void>;
+  runAgent: (
+    mode?: 'auto' | 'full',
+    reason?: 'button_click' | 'non_button',
+    options?: { teamMode?: TeamMode; focusRole?: 'BOWLER' | 'BATTER'; strainIndex?: number }
+  ) => Promise<RunCoachAgentResult | null>;
   onDismissAnalysis: () => void;
   handleAddOver: () => void;
   handleDecreaseOver: () => void;
-  handleNewSpell: () => void;
   handleRest: () => void;
   handleMarkUnfit: () => void;
   recoveryMode: RecoveryMode;
@@ -2785,9 +3591,287 @@ interface DashboardProps {
   onBack: () => void;
 }
 
+interface ConfirmSwitchOverlayProps {
+  open: boolean;
+  suggestion: SuggestedBowlerRecommendation | null;
+  onSwitch: () => void;
+  onCancel: () => void;
+}
+
+function ConfirmSwitchOverlay({ open, suggestion, onSwitch, onCancel }: ConfirmSwitchOverlayProps) {
+  useEffect(() => {
+    if (!open) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [onCancel, open]);
+
+  if (!open || !suggestion || typeof document === 'undefined') return null;
+
+  return createPortal(
+    <div
+      role="presentation"
+      onClick={onCancel}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.35)',
+        backdropFilter: 'blur(4px)',
+        WebkitBackdropFilter: 'blur(4px)',
+        zIndex: 9999,
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-switch-title"
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          position: 'fixed',
+          left: '50%',
+          bottom: '24px',
+          transform: 'translateX(-50%)',
+          width: 'min(520px, calc(100vw - 32px))',
+          background: 'rgba(15,23,42,0.95)',
+          border: '1px solid rgba(148,163,184,0.15)',
+          borderRadius: '14px',
+          padding: '16px',
+          boxShadow: '0 20px 50px rgba(2,6,23,0.45)',
+          color: '#E2E8F0',
+          zIndex: 10000,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+          <div
+            style={{
+              width: '36px',
+              height: '36px',
+              borderRadius: '999px',
+              background: 'rgba(16,185,129,0.12)',
+              border: '1px solid rgba(16,185,129,0.25)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+            }}
+          >
+            <PlayCircle style={{ width: '16px', height: '16px', color: '#6EE7B7' }} />
+          </div>
+          <h3
+            id="confirm-switch-title"
+            style={{
+              margin: 0,
+              fontSize: '15px',
+              lineHeight: 1.35,
+              fontWeight: 700,
+              color: '#F8FAFC',
+            }}
+          >
+            Coach suggests switching to: {suggestion.bowlerName}
+          </h3>
+        </div>
+        {suggestion.reason && (
+          <p
+            style={{
+              margin: '0 0 14px',
+              fontSize: '12px',
+              lineHeight: 1.4,
+              color: '#94A3B8',
+            }}
+          >
+            {suggestion.reason}
+          </p>
+        )}
+        <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+          <button
+            type="button"
+            onClick={onCancel}
+            style={{
+              border: '1px solid rgba(148,163,184,0.25)',
+              background: 'rgba(30,41,59,0.7)',
+              color: '#CBD5E1',
+              borderRadius: '10px',
+              padding: '10px 14px',
+              fontSize: '13px',
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onSwitch}
+            style={{
+              border: '1px solid rgba(16,185,129,0.45)',
+              background: '#059669',
+              color: '#ECFDF5',
+              borderRadius: '10px',
+              padding: '10px 14px',
+              fontSize: '13px',
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            Switch
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+interface MatchModeGuardOverlayProps {
+  open: boolean;
+  onSwitch: () => void;
+  onCancel: () => void;
+}
+
+function MatchModeGuardOverlay({ open, onSwitch, onCancel }: MatchModeGuardOverlayProps) {
+  useEffect(() => {
+    if (!open) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [onCancel, open]);
+
+  if (!open || typeof document === 'undefined') return null;
+
+  return createPortal(
+    <div
+      role="presentation"
+      onClick={onCancel}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.45)',
+        backdropFilter: 'blur(6px)',
+        WebkitBackdropFilter: 'blur(6px)',
+        zIndex: 9999,
+        pointerEvents: 'auto',
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="match-mode-guard-title"
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          position: 'fixed',
+          left: '50%',
+          top: '50%',
+          transform: 'translate(-50%, -50%)',
+          width: 'min(520px, calc(100vw - 32px))',
+          background: 'rgba(15,23,42,0.96)',
+          border: '1px solid rgba(148,163,184,0.16)',
+          borderRadius: '16px',
+          padding: '18px 18px 16px',
+          boxShadow: '0 20px 60px rgba(0,0,0,0.45)',
+          color: '#E2E8F0',
+          pointerEvents: 'auto',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+          <div
+            style={{
+              width: '40px',
+              height: '40px',
+              borderRadius: '999px',
+              background: 'rgba(245,158,11,0.12)',
+              border: '1px solid rgba(245,158,11,0.28)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+            }}
+          >
+            <AlertTriangle style={{ width: '18px', height: '18px', color: '#FBBF24' }} />
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <h3
+              id="match-mode-guard-title"
+              style={{
+                margin: 0,
+                fontSize: '18px',
+                fontWeight: 700,
+                lineHeight: 1.25,
+                color: '#F8FAFC',
+              }}
+            >
+              Batting actions locked
+            </h3>
+            <p
+              style={{
+                margin: '8px 0 0',
+                fontSize: '13px',
+                lineHeight: 1.45,
+                color: '#94A3B8',
+              }}
+            >
+              Batting actions are locked while match state is Bowling. Switch match state to Batting to continue.
+            </p>
+          </div>
+        </div>
+        <div
+          style={{
+            marginTop: '16px',
+            display: 'flex',
+            gap: '10px',
+            justifyContent: 'flex-end',
+          }}
+        >
+          <button
+            type="button"
+            onClick={onCancel}
+            style={{
+              minWidth: '112px',
+              padding: '10px 14px',
+              borderRadius: '10px',
+              border: '1px solid rgba(148,163,184,0.25)',
+              background: 'rgba(30,41,59,0.8)',
+              color: '#CBD5E1',
+              fontSize: '13px',
+              fontWeight: 700,
+              cursor: 'pointer',
+              transition: 'background-color 140ms ease, border-color 140ms ease, color 140ms ease',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onSwitch}
+            style={{
+              minWidth: '148px',
+              padding: '10px 14px',
+              borderRadius: '10px',
+              border: '1px solid rgba(16,185,129,0.5)',
+              background: 'linear-gradient(135deg, #047857 0%, #10B981 100%)',
+              color: '#ECFDF5',
+              fontSize: '13px',
+              fontWeight: 700,
+              cursor: 'pointer',
+              boxShadow: '0 10px 22px rgba(6,95,70,0.35)',
+              transition: 'filter 140ms ease, transform 140ms ease',
+            }}
+          >
+            Switch to Batting
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 function Dashboard({
-  matchContext, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, deleteRosterPlayer, movePlayerToSub,
-  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleNewSpell, handleRest, handleMarkUnfit,
+  matchContext, runMode, teamMode, setTeamMode, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, deleteRosterPlayer, movePlayerToSub,
+  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedDecision, finalRecommendation, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleRest, handleMarkUnfit,
   recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, isLoadingRosterPlayers, rosterMutationError, onGoToBaselines, onBack
 }: DashboardProps) {
   const [arTelemetryView, setArTelemetryView] = useState<'batting' | 'bowling'>('batting');
@@ -2798,9 +3882,32 @@ function Dashboard({
   const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
   const [showCoachInsights, setShowCoachInsights] = useState(false);
   const [showRouterSignals, setShowRouterSignals] = useState(false);
+  const [showRawTelemetry, setShowRawTelemetry] = useState(false);
+  const [briefCopied, setBriefCopied] = useState(false);
+  const [showMatchModeGuard, setShowMatchModeGuard] = useState(false);
+  const [inningsLockNotice, setInningsLockNotice] = useState<string | null>(null);
+  const [showRotateBowlerConfirm, setShowRotateBowlerConfirm] = useState(false);
+  const [rotateBowlerSuggestion, setRotateBowlerSuggestion] = useState<SuggestedBowlerRecommendation | null>(null);
+  const [rotateBowlerNotice, setRotateBowlerNotice] = useState<string | null>(null);
+  const [pressureStateByPlayer, setPressureStateByPlayer] = useState<{ playerId: string; base: number; eventDelta: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const pendingMatchModeActionRef = useRef<(() => void) | null>(null);
+  const pressureDebugRef = useRef<{
+    playerId: string;
+    runs: number;
+    ballsFaced: number;
+    pressure: number;
+  } | null>(null);
+  const pressureEventSnapshotRef = useRef<{
+    playerId: string;
+    runs: number;
+    ballsFaced: number;
+    fours: number;
+    sixes: number;
+  } | null>(null);
+  const lastValidPressureRef = useRef<{ playerId: string; value: number } | null>(null);
 
   useEffect(() => {
     setSubstitutionRecommendation(null);
@@ -2814,12 +3921,18 @@ function Dashboard({
   }, [activePlayer?.id, activePlayer?.role]);
 
   useEffect(() => {
-    setStrainIndex(0);
-  }, [activePlayer?.id]);
+    if (!activePlayer) {
+      setStrainIndex(0);
+      return;
+    }
+    setStrainIndex(Math.max(0, Math.min(5, safeNum(activePlayer.strainIndex, 0))));
+  }, [activePlayer?.id, activePlayer?.strainIndex]);
 
   useEffect(() => {
     // Keep coach expansion local to the currently selected player.
     setShowCoachInsights(false);
+    setShowRotateBowlerConfirm(false);
+    setRotateBowlerSuggestion(null);
   }, [activePlayer?.id]);
 
   const rosterPlayers = players.filter((p: Player) => p.inRoster !== false);
@@ -2864,10 +3977,17 @@ function Dashboard({
       ? arTelemetryView
       : 'bowling';
   const isBatsmanActive = telemetryView === 'batting';
+  const focusRole: 'BOWLER' | 'BATTER' = telemetryView === 'bowling' ? 'BOWLER' : 'BATTER';
 
+  const isUnlimitedInningsFormat = String(matchContext.format || '').trim().toUpperCase() === 'TEST';
   const totalBalls = totalBallsFromOvers(matchState.totalOvers);
-  const ballsBowled = Math.min(totalBalls, Math.max(0, matchState.ballsBowled));
+  const ballsBowled = isUnlimitedInningsFormat
+    ? Math.max(0, matchState.ballsBowled)
+    : Math.min(totalBalls, Math.max(0, matchState.ballsBowled));
   const ballsRemaining = Math.max(totalBalls - ballsBowled, 0);
+  // Shared innings cap for setup + batting controls.
+  const isInningsFinished = !isUnlimitedInningsFormat && ballsBowled >= totalBalls;
+  const inningsComplete = isInningsFinished;
   const formatMaxOvers = activePlayer?.maxOvers ?? getMaxOvers(matchContext.format);
   const hasFormatCap = formatMaxOvers < 999;
   const atOversCap = Boolean(activePlayer && activePlayer.overs >= formatMaxOvers);
@@ -2903,16 +4023,44 @@ function Dashboard({
     : strainTone === 'moderate'
       ? 'border-amber-400/35 shadow-[0_0_22px_rgba(251,191,36,0.14)]'
       : 'border-emerald-500/30 shadow-[0_0_20px_rgba(16,185,129,0.12)]';
-  const applyStrainDelta = (delta: number) => {
-    setStrainIndex((prev) => Math.max(0, Math.min(5, prev + delta)));
+  const computeStrainFatigueDelta = (baseDelta: number, currentFatigue: number, oversBowled: number): number => {
+    const oversMultiplier = 1 + Math.max(0, oversBowled) * 0.08;
+    const diminishingReturns = Math.max(0.25, 1 - currentFatigue / 12);
+    return baseDelta * oversMultiplier * diminishingReturns;
+  };
+  const applyStrainDelta = (strainDelta: number, baseFatigueDelta: number) => {
+    if (!activePlayer) return;
+    setStrainIndex((prev) => Math.max(0, Math.min(5, prev + strainDelta)));
+    // Keep fatigue source-of-truth on player state so telemetry + AI read the same updated value.
+    updatePlayer(activePlayer.id, (player) => {
+      const currentFatigue = clamp(safeNum(player.fatigue, 2.5), 0, 10);
+      const oversBowled = Math.max(0, safeNum(player.overs, 0));
+      const fatigueDelta = computeStrainFatigueDelta(baseFatigueDelta, currentFatigue, oversBowled);
+      return {
+        strainIndex: Math.max(0, Math.min(5, safeNum(player.strainIndex, 0) + strainDelta)),
+        fatigue: clamp(currentFatigue + fatigueDelta, 0, 10),
+      };
+    });
+  };
+  const handleResetStrain = () => {
+    if (!activePlayer) {
+      setStrainIndex(0);
+      return;
+    }
+    setStrainIndex(0);
+    updatePlayer(activePlayer.id, { strainIndex: 0 });
   };
   const overStr = formatOverStr(ballsBowled);
   const oversFaced = ballsBowled / 6;
   const currentRunRate = ballsBowled > 0 ? matchState.runs / oversFaced : 0;
   const runsNeeded = matchState.target != null ? Math.max(matchState.target - matchState.runs, 0) : 0;
-  const requiredRunRate = matchState.target != null && ballsRemaining > 0 ? (runsNeeded / ballsRemaining) * 6 : 0;
-  const requiredStrikeRate = matchState.target != null && ballsRemaining > 0 ? (runsNeeded / ballsRemaining) * 100 : 0;
+  const safeBallsRemaining = Math.max(1, ballsRemaining);
+  // Keep denominator >= 1 so chase pressure never collapses to zero on the final-ball transition.
+  const requiredRunRate = matchState.target != null ? (runsNeeded / safeBallsRemaining) * 6 : 0;
+  const requiredStrikeRate = matchState.target != null ? (runsNeeded / safeBallsRemaining) * 100 : 0;
   const projectedScoreAtCurrentRR = matchState.runs + (currentRunRate * (ballsRemaining / 6));
+  const behindRuns = matchState.target != null ? Math.max(0, matchState.target - projectedScoreAtCurrentRR) : 0;
+  const ballsFaced = Math.max(0, activePlayer?.balls ?? 0);
   const chaseStatus =
     matchState.target == null
       ? { label: 'On Track', tone: 'success' as const }
@@ -2931,29 +4079,76 @@ function Dashboard({
     : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300';
 
   const srGap = Math.max(0, requiredStrikeRate - batsmanStrikeRate);
-  const phaseMultiplier = matchContext.phase === 'Death' ? 1.2 : matchContext.phase === 'Middle' ? 1.0 : 0.9;
+  const rrGap = Math.max(0, requiredRunRate - currentRunRate);
+  const ballsUsedRatio = totalBalls > 0 ? ballsBowled / totalBalls : 0;
+  const blend = (from: number, to: number, t: number) => from + ((to - from) * t);
+  const endgame = clamp((30 - ballsRemaining) / 30, 0, 1);
+  const rrStressRaw = clamp(rrGap / 6, 0, 1);
+  const rrStress = blend(rrStressRaw * 0.45, rrStressRaw, endgame);
+  const neededRuns = matchState.target != null ? Math.max(matchState.target - matchState.runs, 0) : 0;
+  const neededRPO = matchState.target != null ? (neededRuns / Math.max(1, ballsRemaining)) * 6 : 0;
+  const difficultyRaw = matchState.target != null ? clamp((neededRPO - 8) / 8, 0, 1) : 0;
+  const difficulty = blend(difficultyRaw * 0.5, difficultyRaw, endgame);
+  const srStressRaw = clamp(srGap / 80, 0, 1);
+  const srStress = blend(srStressRaw * 0.35, srStressRaw * 0.7, endgame);
+  const behindRunsDenominator = matchState.target != null ? Math.max(12, matchState.target * 0.2) : 18;
+  const behindStressRaw = clamp(behindRuns / behindRunsDenominator, 0, 1);
+  const behindStress = blend(behindStressRaw * 0.4, behindStressRaw * 0.9, endgame);
+  const ballsStressRaw = clamp(ballsUsedRatio, 0, 1);
+  const ballsStress = blend(ballsStressRaw * 0.18, ballsStressRaw * 0.55, endgame);
+  const wicketStress = clamp(matchState.wickets / 10, 0, 1);
+  const phaseStress = matchContext.phase === 'Death' ? 0.65 : matchContext.phase === 'Middle' ? 0.4 : 0.25;
+  const pressureTightness = clamp(rrGap / 6, 0, 1);
+  const pressureReliefScale = 1 + (0.5 * pressureTightness);
+  const pressureStepUpCap = 0.35;
+  const pressureStepDownCap = 0.8;
+  const pressureBaseFloor = 2.0;
+  const pressureTarget = clamp(
+    pressureBaseFloor
+      + (4.0 * rrStress)
+      + (2.5 * difficulty)
+      + (1.5 * wicketStress)
+      + (1.1 * srStress)
+      + (1.0 * behindStress)
+      + (0.7 * ballsStress)
+      + (0.4 * phaseStress),
+    0,
+    10
+  );
   const pressureDrivers = [
     {
+      key: 'rr_gap',
+      score: (2.9 * rrStress) + (0.8 * difficulty),
+      reason: `RR gap ${rrGap.toFixed(2)} (${currentRunRate.toFixed(2)} vs ${requiredRunRate.toFixed(2)})`,
+      recommendation: 'Lift scoring intent over the next two balls to close the run-rate gap.'
+    },
+    {
       key: 'sr_gap',
-      score: Math.min(4.5, srGap / 12),
+      score: 1.1 * srStress,
       reason: `SR gap ${srGap.toFixed(1)} (${batsmanStrikeRate.toFixed(1)} vs ${requiredStrikeRate.toFixed(1)})`,
       recommendation: 'Rotate strike early in the over and avoid back-to-back dot balls.'
     },
     {
       key: 'balls_left',
-      score: Math.min(3.0, Math.max(0, 1 - (ballsRemaining / Math.max(1, totalBalls))) * 3.0),
+      score: (0.7 * ballsStress) + (0.35 * endgame),
       reason: `${ballsRemaining} balls left from ${totalBalls}`,
       recommendation: 'Pre-plan two scoring zones and commit to high-percentage placement.'
     },
     {
+      key: 'behind_runs',
+      score: (1.0 * behindStress) + (1.2 * difficulty),
+      reason: `${behindRuns.toFixed(1)} runs behind projection`,
+      recommendation: 'Recover the chase curve with low-risk boundaries and quick twos.'
+    },
+    {
       key: 'wickets',
-      score: Math.min(2.5, Math.max(0, matchState.wickets - 2) * 0.42),
+      score: 1.5 * wicketStress,
       reason: `${matchState.wickets} wickets down`,
       recommendation: 'Reduce aerial risk and preserve wicket value for the back end.'
     },
     {
       key: 'phase',
-      score: matchContext.phase === 'Death' ? 1.2 : matchContext.phase === 'Middle' ? 0.7 : 0.4,
+      score: 0.4 * phaseStress,
       reason: `${matchContext.phase} phase`,
       recommendation: matchContext.phase === 'Death'
         ? 'Target straighter boundary options against yorker-heavy plans.'
@@ -2961,10 +4156,18 @@ function Dashboard({
     }
   ];
 
-  const pressureIndex = Math.max(
-    0,
-    Math.min(10, pressureDrivers.reduce((sum, driver) => sum + driver.score, 0) * phaseMultiplier)
-  );
+  const computedPressureRaw = pressureTarget;
+  const targetBasePressure = clamp(computedPressureRaw, 0, 10);
+  const pressureStateForPlayer = activePlayer && pressureStateByPlayer?.playerId === activePlayer.id
+    ? pressureStateByPlayer
+    : null;
+  const basePressure = pressureStateForPlayer?.base ?? targetBasePressure;
+  const eventPressureDelta = pressureStateForPlayer?.eventDelta ?? 0;
+  const computedPressureIndex = clamp(basePressure + eventPressureDelta, 0, 10);
+  const lastValidPressureForPlayer = activePlayer && lastValidPressureRef.current?.playerId === activePlayer.id
+    ? lastValidPressureRef.current.value
+    : computedPressureIndex;
+  const pressureIndex = inningsComplete ? lastValidPressureForPlayer : computedPressureIndex;
   const isPressureCritical = pressureIndex > 7;
   const isStrikeRateBehind = batsmanStrikeRate < requiredStrikeRate;
   const showBatsmanAiAlert = isBatsmanActive && (isPressureCritical || isStrikeRateBehind);
@@ -2977,6 +4180,10 @@ function Dashboard({
   }
   const tacticalAlertTitle = primaryDriver === 'sr_gap'
     ? 'Scoring Tempo Gap Detected'
+    : primaryDriver === 'rr_gap'
+      ? 'Run-Rate Gap Expanding'
+      : primaryDriver === 'behind_runs'
+        ? 'Chase Projection Slipping'
     : primaryDriver === 'balls_left'
       ? 'Time Pressure Increasing'
       : primaryDriver === 'wickets'
@@ -2986,68 +4193,576 @@ function Dashboard({
           : 'Run-Rate Tempo Behind Requirement';
   const tacticalAlertText = primaryDriver === 'sr_gap'
     ? 'Current scoring speed is below chase requirement; stabilize tempo without gifting high-risk chances.'
+    : primaryDriver === 'rr_gap'
+      ? 'Required run-rate has climbed above current scoring pace; reduce dot-ball streaks immediately.'
+      : primaryDriver === 'behind_runs'
+        ? 'Projected finish is behind target; recover with high-percentage scoring options.'
     : primaryDriver === 'balls_left'
       ? 'Ball inventory is shrinking quickly; prioritize strike rotation and boundary setup patterns.'
       : primaryDriver === 'wickets'
         ? 'Wickets in hand are limited, so expected-value shot selection is now critical.'
         : 'Pressure is building from multiple signals; adjust intent and shot map proactively.';
-  const alertWhyLine = `Why this alert: SR gap ${srGap.toFixed(1)}, balls left ${ballsRemaining}, wickets ${matchState.wickets}, phase ${matchContext.phase}.`;
+  const alertWhyLine = `Why this alert: RR gap ${rrGap.toFixed(2)}, SR gap ${srGap.toFixed(1)}, behind ${behindRuns.toFixed(1)}, balls left ${ballsRemaining}.`;
   const pressureToneClass = pressureIndex > 7 ? 'text-rose-400' : pressureIndex >= 4 ? 'text-amber-300' : 'text-emerald-400';
   const boundaryEvents = activePlayer?.boundaryEvents || [];
   const foursCount = boundaryEvents.filter((event) => event === '4').length;
   const sixesCount = boundaryEvents.filter((event) => event === '6').length;
-  const selectedAgents = routerDecision?.selectedAgents || orchestrateMeta?.executedAgents || [];
-  const selectedAgentSet = new Set(selectedAgents);
-  const agentBorderColor: Record<'fatigue' | 'risk' | 'tactical', string> = {
-    fatigue: 'rgb(96, 165, 250)',
-    risk: 'rgb(74, 222, 128)',
-    tactical: 'rgb(252, 211, 77)',
-  };
-  const toStatusLabel = (status: 'idle' | 'loading' | 'done' | 'error', isSelected: boolean, isFallback?: boolean): 'OK' | 'RUNNING' | 'SKIPPED' | 'FALLBACK' | 'ERROR' => {
-    if (!isSelected && orchestrateMeta?.mode === 'auto') return 'SKIPPED';
-    if (status === 'loading') return 'RUNNING';
-    if (status === 'error') return isFallback ? 'FALLBACK' : 'ERROR';
-    if (status === 'done') return isFallback ? 'FALLBACK' : 'OK';
-    return isSelected ? 'RUNNING' : 'SKIPPED';
-  };
-  const finalDecision = combinedDecision
-    ? {
-        severity: aiAnalysis?.severity || riskAnalysis?.severity || 'LOW',
-        action: combinedDecision.immediateAction,
-        reasons: [
-          combinedDecision.rationale,
-          combinedDecision.suggestedAdjustments[0] || 'No additional adjustment suggested.',
-        ],
-      }
-    : aiAnalysis && riskAnalysis
-      ? {
-          severity: aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
-            ? 'CRITICAL'
-            : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
-              ? 'HIGH'
-              : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
-                ? 'MED'
-                : 'LOW',
-          action:
-            aiAnalysis.severity === 'CRITICAL' || riskAnalysis.severity === 'CRITICAL'
-              ? 'Immediate substitution advised. Remove from active workload quota now.'
-              : aiAnalysis.severity === 'HIGH' || riskAnalysis.severity === 'HIGH'
-                ? 'Rotate bowler for next over.'
-                : aiAnalysis.severity === 'MED' || riskAnalysis.severity === 'MED'
-                  ? 'No immediate change; manage remaining quota and monitor trend.'
-                  : 'No change, continue and monitor trend.',
-          reasons: [
-            aiAnalysis.headline,
-            riskAnalysis.headline,
-          ],
+
+  useEffect(() => {
+    if (!isBatsmanActive || !activePlayer) {
+      setPressureStateByPlayer(null);
+      pressureEventSnapshotRef.current = null;
+      return;
+    }
+    if (inningsComplete || !Number.isFinite(targetBasePressure)) return;
+
+    const runsScored = Math.max(0, activePlayer.runs || 0);
+    const currentSnapshot = {
+      playerId: activePlayer.id,
+      runs: runsScored,
+      ballsFaced,
+      fours: foursCount,
+      sixes: sixesCount,
+    };
+
+    setPressureStateByPlayer((prev) => {
+      const prevBase = prev?.playerId === activePlayer.id ? prev.base : targetBasePressure;
+      const prevEventDelta = prev?.playerId === activePlayer.id ? prev.eventDelta : 0;
+      const alphaBase = 0.18;
+      const decay = 0.85;
+      const nextBase = clamp(prevBase + ((targetBasePressure - prevBase) * alphaBase), 0, 10);
+      let nextEventDelta = prevEventDelta;
+
+      const previousSnapshot = pressureEventSnapshotRef.current;
+      if (previousSnapshot && previousSnapshot.playerId === activePlayer.id) {
+        const dRuns = runsScored - previousSnapshot.runs;
+        const dBalls = ballsFaced - previousSnapshot.ballsFaced;
+        const dFours = foursCount - previousSnapshot.fours;
+        const dSixes = sixesCount - previousSnapshot.sixes;
+
+        if (dBalls > 0) {
+          nextEventDelta *= decay;
         }
-      : null;
+
+        if (dFours > 0) {
+          nextEventDelta -= 0.5 * pressureReliefScale * dFours;
+        }
+        if (dSixes > 0) {
+          nextEventDelta -= 0.8 * pressureReliefScale * dSixes;
+        }
+
+        const boundaryRunsAdded = Math.max(0, dFours) * 4 + Math.max(0, dSixes) * 6;
+        const nonBoundaryRunsAdded = Math.max(0, dRuns - boundaryRunsAdded);
+        if (nonBoundaryRunsAdded > 0) {
+          nextEventDelta -= 0.05 * nonBoundaryRunsAdded;
+        }
+        if (dBalls > 0 && dRuns <= 0) {
+          nextEventDelta += 0.1 * dBalls;
+        }
+      }
+
+      nextEventDelta = clamp(nextEventDelta, -3.5, 2.5);
+      const prevPressure = clamp(prevBase + prevEventDelta, 0, 10);
+      const rawNextPressure = clamp(nextBase + nextEventDelta, 0, 10);
+      const pressureDelta = clamp(rawNextPressure - prevPressure, -pressureStepDownCap, pressureStepUpCap);
+      const nextPressure = clamp(prevPressure + pressureDelta, 0, 10);
+      nextEventDelta = clamp(nextPressure - nextBase, -3.5, 2.5);
+      const nextState = { playerId: activePlayer.id, base: nextBase, eventDelta: nextEventDelta };
+      if (
+        prev?.playerId === nextState.playerId
+        && Math.abs(prev.base - nextState.base) < 0.001
+        && Math.abs(prev.eventDelta - nextState.eventDelta) < 0.001
+      ) {
+        return prev;
+      }
+      return nextState;
+    });
+    pressureEventSnapshotRef.current = currentSnapshot;
+  }, [isBatsmanActive, activePlayer?.id, activePlayer?.runs, ballsFaced, foursCount, sixesCount, inningsComplete, targetBasePressure, pressureReliefScale, pressureStepDownCap, pressureStepUpCap]);
+
+  useEffect(() => {
+    if (!isBatsmanActive || !activePlayer) return;
+    if (inningsComplete) return;
+    if (!Number.isFinite(pressureIndex)) return;
+    lastValidPressureRef.current = {
+      playerId: activePlayer.id,
+      value: pressureIndex,
+    };
+  }, [isBatsmanActive, activePlayer?.id, inningsComplete, pressureIndex]);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    if (telemetryView !== 'batting' || !activePlayer) {
+      pressureDebugRef.current = null;
+      return;
+    }
+
+    const runsScored = Math.max(0, activePlayer.runs || 0);
+    const safePressureRaw = Number.isFinite(computedPressureRaw) ? computedPressureRaw : 0;
+    const safePressureClamped = Number.isFinite(pressureIndex) ? pressureIndex : 0;
+    const requiredRRSafe = Number.isFinite(requiredRunRate) ? requiredRunRate : 0;
+    const requiredSRSafe = Number.isFinite(requiredStrikeRate) ? requiredStrikeRate : 0;
+
+    console.debug('[pressure:calc]', {
+      playerId: activePlayer.id,
+      ballsFaced,
+      runs: runsScored,
+      overs: formatOverStr(ballsBowled),
+      target: matchState.target ?? null,
+      wickets: matchState.wickets,
+      inningsComplete,
+      requiredRR: Number(requiredRRSafe.toFixed(2)),
+      requiredSR: Number(requiredSRSafe.toFixed(1)),
+      deltaBehind: Number(behindRuns.toFixed(1)),
+      endgame: Number(endgame.toFixed(3)),
+      rrStress: Number(rrStress.toFixed(3)),
+      difficulty: Number(difficulty.toFixed(3)),
+      neededRPO: Number(neededRPO.toFixed(2)),
+      reliefScale: Number(pressureReliefScale.toFixed(3)),
+      stepCaps: { up: pressureStepUpCap, down: pressureStepDownCap },
+      targetBasePressure: Number(targetBasePressure.toFixed(3)),
+      basePressure: Number(basePressure.toFixed(3)),
+      eventDelta: Number(eventPressureDelta.toFixed(3)),
+      computedPressureRaw: Number(safePressureRaw.toFixed(3)),
+      computedPressureClamped: Number(Math.max(0, Math.min(10, pressureIndex)).toFixed(3)),
+      pressureShown: Number(safePressureClamped.toFixed(3)),
+    });
+
+    const previous = pressureDebugRef.current;
+    if (previous && previous.playerId === activePlayer.id) {
+      const isChase = typeof matchState.target === 'number' && matchState.target > 0;
+      const isDotBallStep = isChase && ballsFaced === previous.ballsFaced + 1 && runsScored === previous.runs;
+
+      // Sanity guard: in a chase, consuming one more ball without adding runs should not reduce pressure.
+      if (isDotBallStep && safePressureClamped + 0.05 < previous.pressure) {
+        console.warn('[pressure:sanity] Dot-ball progression reduced pressure unexpectedly.', {
+          previousPressure: Number(previous.pressure.toFixed(3)),
+          nextPressure: Number(safePressureClamped.toFixed(3)),
+          previousBalls: previous.ballsFaced,
+          nextBalls: ballsFaced,
+          runs: runsScored,
+        });
+      }
+    }
+
+    pressureDebugRef.current = {
+      playerId: activePlayer.id,
+      runs: runsScored,
+      ballsFaced,
+      pressure: safePressureClamped,
+    };
+  }, [
+    activePlayer?.id,
+    activePlayer?.runs,
+    activePlayer?.balls,
+    telemetryView,
+    ballsBowled,
+    matchState.target,
+    matchState.wickets,
+    behindRuns,
+    inningsComplete,
+    computedPressureIndex,
+    pressureIndex,
+    computedPressureRaw,
+    targetBasePressure,
+    basePressure,
+    eventPressureDelta,
+    endgame,
+    rrStress,
+    difficulty,
+    neededRPO,
+    pressureReliefScale,
+    pressureStepUpCap,
+    pressureStepDownCap,
+    requiredRunRate,
+    requiredStrikeRate,
+  ]);
+
+  const routerDecisionForView = runMode === 'auto' ? routerDecision : null;
+  const routerSelectedAgents =
+    (routerDecisionForView?.selectedAgents && routerDecisionForView.selectedAgents.length > 0
+      ? routerDecisionForView.selectedAgents
+      : (routerDecisionForView?.agentsToRun || []).map((agent) => {
+          if (agent === 'RISK') return 'risk';
+          if (agent === 'FATIGUE') return 'fatigue';
+          return 'tactical';
+        })) as Array<'fatigue' | 'risk' | 'tactical'>;
+  const statusSelectedAgents = AGENT_KEYS.filter((agent) => {
+    const status = agentFeedStatus[agent];
+    return status !== 'IDLE' && status !== 'SKIPPED';
+  });
+  const selectedAgents = Array.from(
+    new Set<('fatigue' | 'risk' | 'tactical')>([
+      ...(runMode === 'full' ? AGENT_KEYS : []),
+      ...routerSelectedAgents,
+      ...(orchestrateMeta?.executedAgents || []),
+      ...statusSelectedAgents,
+    ])
+  );
+  const selectedAgentSet = new Set(selectedAgents);
   const isCoachOutputState = analysisActive || showCoachInsights;
+  const isFullAnalysis = runMode === 'full';
+  const activeStrategicAnalysis = isFullAnalysis ? combinedAnalysis : strategicAnalysis;
+  const analysisBadgeLabel = isFullAnalysis ? 'FULL ANALYSIS' : 'AUTO ROUTING';
+  const hasAnyAnalysis = Boolean(
+    activeStrategicAnalysis || finalRecommendation || combinedDecision || tacticalAnalysis || aiAnalysis || riskAnalysis
+  );
+  const hasTacticalGuidance = Boolean(
+    activeStrategicAnalysis?.tacticalRecommendation?.nextAction ||
+    tacticalAnalysis?.immediateAction ||
+    combinedDecision?.immediateAction
+  );
+  const showAnalysisFailureCard = Boolean(agentFailure && !hasAnyAnalysis && !hasTacticalGuidance);
+  const showAnalysisFailureInline = Boolean(agentFailure && hasAnyAnalysis);
+  const showAnalysisSkeleton = agentState === 'thinking' && !hasAnyAnalysis;
+  const agentStatusRows: Array<{ agent: AgentKey; label: string; state: AgentFeedState; detail: string }> = [
+    { agent: 'fatigue', label: 'Fatigue Agent', state: agentFeedStatus.fatigue, detail: '' },
+    { agent: 'risk', label: 'Risk Agent', state: agentFeedStatus.risk, detail: '' },
+    { agent: 'tactical', label: 'Tactical Agent', state: agentFeedStatus.tactical, detail: '' },
+  ].map((entry) => {
+    let detail = 'Waiting to run';
+    if (entry.state === 'RUNNING') detail = 'Running...';
+    if (entry.state === 'SUCCESS') detail = 'Output ready';
+    if (entry.state === 'SKIPPED') detail = 'Skipped by router';
+    if (entry.state === 'ERROR') detail = 'No output';
+    return { ...entry, detail };
+  });
+  const advancedSignalRecord = routerDecisionForView?.signals || {};
+  const advancedFatigueSignal = safeNum(advancedSignalRecord.fatigueIndex ?? aiAnalysis?.fatigueIndex ?? activePlayer?.fatigue, Number.NaN);
+  const advancedStrainSignal = safeNum(advancedSignalRecord.strainIndex ?? activePlayer?.strainIndex, Number.NaN);
+  const advancedOversSignal = safeNum(advancedSignalRecord.oversBowled ?? activePlayer?.overs, Number.NaN);
+  const advancedNoBallSignal = String(advancedSignalRecord.noBallRisk || riskAnalysis?.noBallRisk || '').toUpperCase();
+  const advancedInjurySignal = String(advancedSignalRecord.injuryRisk || riskAnalysis?.injuryRisk || '').toUpperCase();
+  const advancedPressureSignal = safeNum(advancedSignalRecord.pressureIndex, Number.NaN);
+  const advancedRecentEvents = toRecord(advancedSignalRecord.recentEvents);
+  const advancedLastBall = String(advancedSignalRecord.lastBall || advancedRecentEvents.lastBall || '').toUpperCase();
+  const noBallTrendUp =
+    advancedSignalRecord.noBallTrendUp === true ||
+    String(advancedSignalRecord.noBallTrend || '').toUpperCase() === 'UP' ||
+    String(advancedSignalRecord.noBallSignal || '').toLowerCase() === 'true';
+  const recentNoBallEvent = advancedLastBall === 'NOBALL' || advancedLastBall === 'WIDE';
+  const noBallControlSignalPresent =
+    advancedNoBallSignal === 'HIGH' ||
+    advancedNoBallSignal === 'MEDIUM' ||
+    advancedNoBallSignal === 'MED' ||
+    noBallTrendUp ||
+    recentNoBallEvent;
+  const strongestIntentLabel = (() => {
+    if (
+      advancedInjurySignal === 'HIGH' ||
+      advancedInjurySignal === 'CRITICAL' ||
+      (Number.isFinite(advancedFatigueSignal) && advancedFatigueSignal >= 6) ||
+      (Number.isFinite(advancedStrainSignal) && advancedStrainSignal >= 6)
+    ) {
+      return 'Injury Prevention';
+    }
+    if (noBallControlSignalPresent || (Number.isFinite(advancedPressureSignal) && advancedPressureSignal >= 6.5)) {
+      return 'Maintain Spell Control';
+    }
+    return 'Attack Wicket';
+  })();
+  const routerIntentLabel = (() => {
+    if (isFullAnalysis) return 'All Agents Forced';
+    const token = String(routerDecisionForView?.intent || '').trim().toUpperCase();
+    if (token === 'INJURYPREVENTION' || token === 'SUBSTITUTION' || token === 'RISK_CHECK') return 'Injury Prevention';
+    if (token === 'PRESSURECONTROL' || token === 'SAFETY_ALERT') {
+      return noBallControlSignalPresent ? 'Control No-Balls' : strongestIntentLabel;
+    }
+    if (token === 'TACTICALATTACK') return 'Attack Wicket';
+    if (token === 'GENERAL') return strongestIntentLabel;
+    if (token === 'BOWLING_NEXT') return 'Bowling Rotation';
+    if (token === 'BATTING_NEXT') return 'Batting Continuity';
+    if (token === 'BOTH_NEXT') return 'Dual Scenario Planning';
+    if (token === 'FATIGUE_CHECK') return 'Fatigue Management';
+    return strongestIntentLabel;
+  })();
+  const matchSignalBullets = (() => {
+    const sanitizeSignals = (items: string[]): string[] =>
+      items
+        .map((entry) => String(entry).trim())
+        .filter(Boolean)
+        .filter((entry) => !/(unterminated|string|invalid json|trace:|source:\s*unknown|error|failed)/i.test(entry))
+        .slice(0, 7);
+
+    if (Array.isArray(activeStrategicAnalysis?.signals) && activeStrategicAnalysis.signals.length > 0) {
+      return sanitizeSignals(activeStrategicAnalysis.signals);
+    }
+    if (Array.isArray(routerDecisionForView?.signalSummaryBullets) && routerDecisionForView.signalSummaryBullets.length > 0) {
+      return sanitizeSignals(routerDecisionForView.signalSummaryBullets);
+    }
+    if (Array.isArray((tacticalAnalysis as unknown as Record<string, unknown>)?.signalSummaryBullets)) {
+      return sanitizeSignals(
+        ((tacticalAnalysis as unknown as Record<string, unknown>).signalSummaryBullets as unknown[])
+          .map((entry) => String(entry))
+      );
+    }
+    const bullets: string[] = [];
+    const signalRecord = routerDecisionForView?.signals || {};
+    const fatigueSignal = safeNum(
+      signalRecord.fatigueIndex ?? aiAnalysis?.fatigueIndex ?? activePlayer?.fatigue,
+      Number.NaN
+    );
+    const strainSignal = safeNum(signalRecord.strainIndex ?? activePlayer?.strainIndex, Number.NaN);
+    const noBallSignal = String(signalRecord.noBallRisk || riskAnalysis?.noBallRisk || '').toUpperCase();
+    const injurySignal = String(signalRecord.injuryRisk || riskAnalysis?.injuryRisk || '').toUpperCase();
+    const hrrSignal = String(signalRecord.heartRateRecovery || activePlayer?.hrRecovery || '').toLowerCase();
+    const sleepSignal = safeNum(signalRecord.sleepHours ?? activePlayer?.sleepHours, Number.NaN);
+    const oversSignal = safeNum(signalRecord.oversBowled ?? activePlayer?.overs, Number.NaN);
+    const phaseSignal = String(routerDecisionForView?.inputsUsed?.match?.phase || matchContext.phase || '').toLowerCase();
+
+    if (Number.isFinite(fatigueSignal) && fatigueSignal >= 6.8) {
+      bullets.push('Fatigue is approaching a high-load zone and needs immediate workload control.');
+    } else if (Number.isFinite(fatigueSignal) && fatigueSignal >= 5) {
+      bullets.push('Fatigue is trending upward and should be managed over the next over.');
+    }
+    if (Number.isFinite(strainSignal) && strainSignal >= 6) {
+      bullets.push('Strain is elevated and points to reduced movement quality.');
+    } else if (Number.isFinite(strainSignal) && strainSignal >= 4) {
+      bullets.push('Strain is rising and should be monitored before extending the spell.');
+    }
+    if (injurySignal === 'HIGH' || injurySignal === 'CRITICAL') {
+      bullets.push('Injury exposure is elevated if the current workload pattern continues.');
+    }
+    if (noBallSignal === 'HIGH') {
+      bullets.push('No-ball risk is elevated under current pressure and rhythm.');
+    }
+    if (hrrSignal.includes('poor') || hrrSignal.includes('slow')) {
+      bullets.push('Recovery response is lagging, suggesting incomplete reset between efforts.');
+    }
+    if (Number.isFinite(sleepSignal) && sleepSignal > 0 && sleepSignal < 6) {
+      bullets.push('Sleep is below baseline, reducing recovery margin for this phase.');
+    }
+    if (Number.isFinite(oversSignal) && oversSignal >= 3) {
+      bullets.push('Recent workload volume is high for this spell.');
+    }
+    if (phaseSignal === 'death') {
+      bullets.push('Death-overs pressure is amplifying execution and injury risk trade-offs.');
+    }
+    if (bullets.length === 0 && routerDecisionForView) {
+      bullets.push('Signal profile is stable; tactical selection focuses on control and continuity.');
+    }
+    return sanitizeSignals(Array.from(new Set(bullets)));
+  })();
+  const fatigueSectionVisible = Boolean(isFullAnalysis || selectedAgentSet.has('fatigue') || aiAnalysis);
+  const likelyInjuries = finalRecommendation?.ifContinues?.likelyInjuries || [];
+  const riskSectionVisible = Boolean(
+    isFullAnalysis || selectedAgentSet.has('risk') || riskAnalysis || likelyInjuries.length > 0
+  );
+  const fatigueTrendLabel: 'Up' | 'Down' | 'Stable' = activePlayer?.isResting
+    ? 'Down'
+    : aiAnalysis?.severity === 'HIGH' || aiAnalysis?.severity === 'CRITICAL'
+      ? 'Up'
+      : 'Stable';
+  const tacticalNextAction =
+    activeStrategicAnalysis?.tacticalRecommendation?.nextAction ||
+    combinedDecision?.immediateAction ||
+    tacticalAnalysis?.immediateAction ||
+    finalRecommendation?.title ||
+    'Reassess tactical control and apply the safest immediate adjustment.';
+  const tacticalWhy =
+    activeStrategicAnalysis?.tacticalRecommendation?.why ||
+    combinedDecision?.rationale ||
+    tacticalAnalysis?.rationale ||
+    finalRecommendation?.statement ||
+    'Current match signals indicate tactical adjustment will preserve control and reduce risk.';
+  const tacticalIfIgnored =
+    activeStrategicAnalysis?.tacticalRecommendation?.ifIgnored ||
+    finalRecommendation?.ifContinues?.riskSummary ||
+    riskAnalysis?.recommendation ||
+    'Risk is likely to compound across the next phase if the current plan remains unchanged.';
+  const tacticalAlternative =
+    activeStrategicAnalysis?.tacticalRecommendation?.alternatives?.[0] ||
+    combinedDecision?.suggestedAdjustments?.[0] ||
+    tacticalAnalysis?.suggestedAdjustments?.[0] ||
+    'Use a lower-intensity over plan and review live signals again immediately after.';
+  const fatigueShouldRun =
+    (Number.isFinite(advancedFatigueSignal) && advancedFatigueSignal >= 6) ||
+    (Number.isFinite(advancedStrainSignal) && advancedStrainSignal >= 5.5) ||
+    (Number.isFinite(advancedOversSignal) && advancedOversSignal >= 3);
+  const riskShouldRun =
+    noBallControlSignalPresent ||
+    (Number.isFinite(advancedPressureSignal) && advancedPressureSignal >= 6.5) ||
+    (Number.isFinite(advancedFatigueSignal) && advancedFatigueSignal >= 6) ||
+    advancedInjurySignal === 'HIGH' ||
+    advancedInjurySignal === 'CRITICAL';
+  const agentDecisionRows: Array<{ agent: 'fatigue' | 'risk' | 'tactical'; selected: boolean; why: string }> = [
+    {
+      agent: 'risk',
+      selected: selectedAgentSet.has('risk'),
+      why: selectedAgentSet.has('risk')
+        ? noBallControlSignalPresent
+          ? 'No-ball pressure/control signals are elevated.'
+          : advancedInjurySignal === 'HIGH' || advancedInjurySignal === 'CRITICAL'
+            ? 'Injury exposure signals require preventive risk analysis.'
+            : 'Risk trend is relevant for the current phase.'
+        : riskShouldRun && riskAnalysis
+          ? 'Risk was recently analyzed this over; existing result was reused.'
+          : 'Immediate risk escalation signals were not dominant this run.',
+    },
+    {
+      agent: 'tactical',
+      selected: true,
+      why: 'Tactical agent always runs to produce a coach-facing action plan.',
+    },
+    {
+      agent: 'fatigue',
+      selected: selectedAgentSet.has('fatigue'),
+      why: selectedAgentSet.has('fatigue')
+        ? 'Workload and strain profile warrants fatigue oversight.'
+        : fatigueShouldRun && aiAnalysis
+          ? 'Fatigue was recently analyzed this over; existing result was reused.'
+          : 'Fatigue signals stayed below escalation thresholds this run.',
+    },
+  ];
+  const formatTelemetryValue = (key: string, value: unknown): string => {
+    const lowerKey = key.toLowerCase();
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const rounded = Math.round(value * 10) / 10;
+      if (lowerKey.includes('percent') || lowerKey.includes('confidence')) {
+        const clampedPercent = Math.max(0, Math.min(100, rounded));
+        return `${clampedPercent.toFixed(1)}%`;
+      }
+      if (lowerKey.includes('overs') || lowerKey === 'over') {
+        return rounded.toFixed(1);
+      }
+      return rounded.toFixed(1);
+    }
+    if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+    if (Array.isArray(value)) return value.map((entry) => String(entry)).join(', ');
+    if (value && typeof value === 'object') {
+      return JSON.stringify(value, (_key, nestedValue) =>
+        typeof nestedValue === 'number' && Number.isFinite(nestedValue)
+          ? Math.round(nestedValue * 10) / 10
+          : nestedValue
+      );
+    }
+    return String(value);
+  };
+  const rawSignalEntries = Object.entries(routerDecisionForView?.signals || {})
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => ({
+      key,
+      value: formatTelemetryValue(key, value),
+    }));
+  const recommendationTeamMode: TeamMode = (() => {
+    const token = String(routerDecisionForView?.inputsUsed?.match?.matchMode || teamMode || '').trim().toUpperCase();
+    return token === 'BAT' || token === 'BATTING' ? 'BATTING' : 'BOWLING';
+  })();
+  const modeScopedAlternative =
+    recommendationTeamMode === 'BOWLING'
+      ? finalRecommendation?.nextSafeBowler?.name
+        ? `${tacticalAlternative} Alternative bowler: ${finalRecommendation.nextSafeBowler.name}.`
+        : tacticalAlternative
+      : finalRecommendation?.nextSafeBatter?.name
+        ? `${tacticalAlternative} Alternative batter: ${finalRecommendation.nextSafeBatter.name}.`
+        : tacticalAlternative;
+  const briefingText = [
+    'AI Strategic Analysis',
+    '',
+    'Detected Match Signals:',
+    ...(matchSignalBullets.length > 0 ? matchSignalBullets.map((item) => `- ${item}`) : ['- Signals were limited in this run.']),
+    '',
+    'Fatigue Analysis:',
+    activeStrategicAnalysis?.fatigueAnalysis || aiAnalysis?.headline || aiAnalysis?.recommendation || 'Fatigue trend reviewed.',
+    '',
+    'Injury Risk Analysis:',
+    activeStrategicAnalysis?.injuryRiskAnalysis || riskAnalysis?.headline || riskAnalysis?.recommendation || 'Injury risk trend reviewed.',
+    '',
+    'Tactical Recommendation:',
+    `Next Action: ${activeStrategicAnalysis?.tacticalRecommendation?.nextAction || tacticalNextAction}`,
+    `Why: ${activeStrategicAnalysis?.tacticalRecommendation?.why || tacticalWhy}`,
+    `If Ignored: ${activeStrategicAnalysis?.tacticalRecommendation?.ifIgnored || tacticalIfIgnored}`,
+    ...((activeStrategicAnalysis?.tacticalRecommendation?.alternatives || [modeScopedAlternative]).slice(0, 3).map((alt, index) => `Alternative ${index + 1}: ${alt}`)),
+    ...(activeStrategicAnalysis?.coachNote ? ['', `Coach Note: ${activeStrategicAnalysis.coachNote}`] : []),
+  ].join('\n');
+  const handleCopyBriefing = useCallback(async () => {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(briefingText);
+        setBriefCopied(true);
+        window.setTimeout(() => setBriefCopied(false), 1500);
+      }
+    } catch {
+      // Copy failures should not block analysis flow.
+    }
+  }, [briefingText]);
+  const matchMode = teamMode;
+  const isBatting = matchMode === 'BATTING';
+  const isBowling = matchMode === 'BOWLING';
+  const selectedModeStyle: React.CSSProperties = {
+    backgroundColor: 'rgba(245, 158, 11, 0.16)',
+    borderColor: 'rgba(245, 158, 11, 0.55)',
+    boxShadow: '0 0 0 1px rgba(245, 158, 11, 0.35), 0 10px 30px rgba(245, 158, 11, 0.08)',
+    color: 'rgba(253, 230, 138, 0.95)',
+    transition: 'all 200ms ease',
+  };
+  const unselectedModeStyle: React.CSSProperties = {
+    backgroundColor: 'transparent',
+    borderColor: 'rgba(148, 163, 184, 0.18)',
+    boxShadow: 'none',
+    color: 'rgba(148, 163, 184, 0.7)',
+    transition: 'all 200ms ease',
+  };
   const isActivePlayerOut = activeDismissalStatus === 'OUT';
+  const showInningsFinishedNotice = useCallback(() => {
+    setInningsLockNotice('Overs finished. Innings complete.');
+  }, []);
+  useEffect(() => {
+    if (!inningsLockNotice) return;
+    const timeoutId = window.setTimeout(() => setInningsLockNotice(null), 1800);
+    return () => window.clearTimeout(timeoutId);
+  }, [inningsLockNotice]);
+  useEffect(() => {
+    if (!rotateBowlerNotice) return;
+    const timeoutId = window.setTimeout(() => setRotateBowlerNotice(null), 2200);
+    return () => window.clearTimeout(timeoutId);
+  }, [rotateBowlerNotice]);
+  const handleScore = (runValue: number, ballDirection: 1 | -1 = 1) => {
+    if (!activePlayer || isActivePlayerOut) return;
+
+    const direction: 1 | -1 = runValue < 0 ? -1 : ballDirection;
+    const normalizedRuns = Math.max(0, Math.floor(Math.abs(runValue)));
+    const runDelta = direction === -1
+      ? Math.min(normalizedRuns, Math.max(0, activePlayer.runs || 0))
+      : normalizedRuns;
+    const ballDelta = 1;
+
+    if (direction === -1 && Math.max(0, activePlayer.balls || 0) <= 0) return;
+    if (direction === 1 && isInningsFinished) {
+      showInningsFinishedNotice();
+      return;
+    }
+
+    updatePlayer(activePlayer.id, (player) => ({
+      runs: direction === -1
+        ? Math.max(0, (player.runs || 0) - runDelta)
+        : Math.max(0, (player.runs || 0) + runDelta),
+      balls: direction === -1
+        ? Math.max(0, (player.balls || 0) - ballDelta)
+        : Math.max(0, (player.balls || 0) + ballDelta),
+    }));
+
+    updateMatchState((prev) => {
+      const maxBalls = totalBallsFromOvers(prev.totalOvers);
+      return {
+        runs: direction === -1
+          ? Math.max(0, prev.runs - runDelta)
+          : Math.max(0, prev.runs + runDelta),
+        ballsBowled: direction === -1
+          ? Math.max(0, prev.ballsBowled - ballDelta)
+          : isUnlimitedInningsFormat
+            ? Math.max(0, prev.ballsBowled + ballDelta)
+            : Math.min(maxBalls, prev.ballsBowled + ballDelta),
+      };
+    });
+  };
   const applyBoundaryChange = (boundary: '4' | '6', direction: 1 | -1) => {
     if (!activePlayer || isActivePlayerOut) return;
+    if (direction === 1 && isInningsFinished) {
+      showInningsFinishedNotice();
+      return;
+    }
     const runDelta = boundary === '4' ? 4 : 6;
-    const ballDelta = 1;
 
     if (direction === -1) {
       const removeIndex = boundaryEvents.lastIndexOf(boundary);
@@ -3059,8 +4774,6 @@ function Dashboard({
       if (direction === 1) {
         return {
           boundaryEvents: [...playerEvents, boundary],
-          runs: Math.max(0, (player.runs || 0) + runDelta),
-          balls: Math.max(0, (player.balls || 0) + ballDelta),
         };
       }
 
@@ -3070,23 +4783,9 @@ function Dashboard({
       nextEvents.splice(playerRemoveIndex, 1);
       return {
         boundaryEvents: nextEvents,
-        runs: Math.max(0, (player.runs || 0) - runDelta),
-        balls: Math.max(0, (player.balls || 0) - ballDelta),
       };
     });
-
-    updateMatchState((prev) => {
-      const maxBalls = totalBallsFromOvers(prev.totalOvers);
-      const nextRuns = Math.max(0, prev.runs + (direction * runDelta));
-      const nextBallsBowled = direction === 1
-        ? Math.min(maxBalls, prev.ballsBowled + ballDelta)
-        : Math.max(0, prev.ballsBowled - ballDelta);
-
-      return {
-        runs: nextRuns,
-        ballsBowled: nextBallsBowled,
-      };
-    });
+    handleScore(direction === 1 ? runDelta : -runDelta);
   };
 
   const handleAddBoundary = (boundary: '4' | '6') => {
@@ -3206,11 +4905,13 @@ function Dashboard({
     value,
     onIncrement,
     onDecrement,
+    incrementDisabled,
   }: {
     label: string;
     value: number;
     onIncrement: () => void;
     onDecrement: () => void;
+    incrementDisabled?: boolean;
   }) => (
     <PanelCard className="p-4 md:p-5 text-center">
       <div className="mb-3 text-xs uppercase tracking-widest text-white/60">{label}</div>
@@ -3219,9 +4920,89 @@ function Dashboard({
         onIncrement={onIncrement}
         onDecrement={onDecrement}
         decrementDisabled={value <= 0}
+        incrementDisabled={incrementDisabled}
       />
     </PanelCard>
   );
+
+  const RosterDeleteButton = ({
+    playerName,
+    disabled,
+    onDelete,
+  }: {
+    playerName: string;
+    disabled?: boolean;
+    onDelete: () => void;
+  }) => {
+    const [isHoveringDelete, setIsHoveringDelete] = useState(false);
+    const [isPressingDelete, setIsPressingDelete] = useState(false);
+    const isInteractive = !disabled;
+    const backgroundColor = isPressingDelete
+      ? 'rgba(220, 38, 38, 0.25)'
+      : isHoveringDelete
+        ? 'rgba(220, 38, 38, 0.15)'
+        : 'transparent';
+    const iconColor = isPressingDelete
+      ? '#fecaca'
+      : isHoveringDelete
+        ? '#ef4444'
+        : '#94a3b8';
+    const ringColor = isPressingDelete
+      ? 'rgba(239, 68, 68, 0.45)'
+      : isHoveringDelete
+        ? 'rgba(239, 68, 68, 0.3)'
+        : 'rgba(148, 163, 184, 0.22)';
+
+    return (
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!isInteractive) return;
+          onDelete();
+        }}
+        onMouseEnter={() => {
+          if (!isInteractive) return;
+          setIsHoveringDelete(true);
+        }}
+        onMouseLeave={() => {
+          setIsHoveringDelete(false);
+          setIsPressingDelete(false);
+        }}
+        onMouseDown={() => {
+          if (!isInteractive) return;
+          setIsPressingDelete(true);
+        }}
+        onMouseUp={() => setIsPressingDelete(false)}
+        onBlur={() => setIsPressingDelete(false)}
+        aria-label={`Remove ${playerName} from roster`}
+        style={{
+          position: 'absolute',
+          right: 8,
+          top: '50%',
+          transform: `translateY(-50%) scale(${isHoveringDelete ? 1.05 : 1})`,
+          zIndex: 20,
+          width: 36,
+          height: 36,
+          borderRadius: 8,
+          border: 'none',
+          backgroundColor,
+          color: iconColor,
+          cursor: isInteractive ? 'pointer' : 'not-allowed',
+          transition: 'all 0.2s ease',
+          boxShadow: `0 0 0 1px ${ringColor}${isHoveringDelete ? ', 0 0 12px rgba(239,68,68,0.4)' : ''}`,
+          opacity: isInteractive ? 1 : 0.4,
+          pointerEvents: 'auto',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <Trash2 size={16} />
+      </button>
+    );
+  };
 
   const StrainIndexCard = () => {
     console.log('StrainIndexCard rendered');
@@ -3270,7 +5051,7 @@ function Dashboard({
           <div className="mt-3 grid w-full grid-cols-3 gap-4">
             <button
               type="button"
-              onClick={() => applyStrainDelta(1)}
+              onClick={() => applyStrainDelta(1, 0.3)}
               disabled={isStrainMax}
               className={`${strainButtonBase} bg-emerald-500/10 border border-emerald-400/30 text-emerald-200 hover:bg-emerald-500/20 hover:border-emerald-400/60 hover:shadow-[0_0_18px_rgba(16,185,129,0.25)] focus-visible:ring-emerald-400/45`}
             >
@@ -3278,7 +5059,7 @@ function Dashboard({
             </button>
             <button
               type="button"
-              onClick={() => applyStrainDelta(2)}
+              onClick={() => applyStrainDelta(2, 0.8)}
               disabled={isStrainMax}
               className={`${strainButtonBase} bg-emerald-500/15 border border-emerald-400/40 text-white hover:bg-emerald-500/25 hover:shadow-[0_0_22px_rgba(16,185,129,0.35)] focus-visible:ring-emerald-400/45`}
             >
@@ -3286,7 +5067,7 @@ function Dashboard({
             </button>
             <button
               type="button"
-              onClick={() => setStrainIndex(0)}
+              onClick={handleResetStrain}
               className={`${strainButtonBase} bg-rose-500/10 border border-rose-400/30 text-rose-200 hover:bg-rose-500/20 hover:border-rose-400/60 hover:shadow-[0_0_18px_rgba(244,63,94,0.25)] focus-visible:ring-rose-400/35`}
             >
               Reset
@@ -3320,12 +5101,217 @@ function Dashboard({
     });
   };
 
+  const closeMatchModeGuard = useCallback(() => {
+    pendingMatchModeActionRef.current = null;
+    setShowMatchModeGuard(false);
+  }, []);
+
+  const requireMatchMode = useCallback(
+    (requiredMode: TeamMode, onAllowed: () => void) => {
+      if (teamMode === requiredMode) {
+        onAllowed();
+        return true;
+      }
+      pendingMatchModeActionRef.current = onAllowed;
+      setShowMatchModeGuard(true);
+      return false;
+    },
+    [teamMode]
+  );
+
+  const runBattingGuardedAction = useCallback(
+    (onAllowed: () => void) => {
+      requireMatchMode('BATTING', onAllowed);
+    },
+    [requireMatchMode]
+  );
+
+  const handleSwitchToBattingAndContinue = useCallback(() => {
+    const pendingAction = pendingMatchModeActionRef.current;
+    pendingMatchModeActionRef.current = null;
+    setShowMatchModeGuard(false);
+    setTeamMode('BATTING');
+    if (pendingAction) {
+      requestAnimationFrame(() => pendingAction());
+    }
+  }, [setTeamMode]);
+
+  const runCoachAgentAuto = useCallback(
+    async (modeOverride?: TeamMode) => {
+      setShowCoachInsights(true);
+      primeCoachAutoScroll();
+      return runAgent('auto', 'button_click', {
+        teamMode: modeOverride || teamMode,
+        focusRole,
+        strainIndex: clampedStrainIndex,
+      });
+    },
+    [clampedStrainIndex, focusRole, primeCoachAutoScroll, runAgent, teamMode]
+  );
+
+  const runCoachWithFallback = useCallback(async (): Promise<{ recommendation: SuggestedBowlerRecommendation | null; raw?: OrchestrateResponse }> => {
+    if (import.meta.env.DEV) {
+      console.log('[rotate-bowler] click');
+    }
+
+    const routeResult = await runCoachAgentAuto('BOWLING');
+    const routeSuggestion =
+      routeResult?.suggestedBowler
+      || (routeResult?.response ? normalizeSuggestedBowler(routeResult.response, players, activePlayer?.id, 'BOWLING') : null);
+    if (routeResult?.response && routeSuggestion) {
+      return { recommendation: routeSuggestion, raw: routeResult.response };
+    }
+
+    if (import.meta.env.DEV) {
+      console.log('[rotate-bowler] falling back to full analysis');
+    }
+
+    const fullResult = await runAgent('full', 'button_click', {
+      teamMode: 'BOWLING',
+      focusRole: 'BOWLER',
+      strainIndex: clampedStrainIndex,
+    });
+    const fullSuggestion =
+      fullResult?.suggestedBowler
+      || (fullResult?.response ? normalizeSuggestedBowler(fullResult.response, players, activePlayer?.id, 'BOWLING') : null);
+    if (fullResult?.response && fullSuggestion) {
+      return { recommendation: fullSuggestion, raw: fullResult.response };
+    }
+
+    return { recommendation: null, raw: fullResult?.response || routeResult?.response };
+  }, [activePlayer?.id, clampedStrainIndex, players, runAgent, runCoachAgentAuto]);
+
+  const closeRotateBowlerConfirm = useCallback(() => {
+    setShowRotateBowlerConfirm(false);
+    setRotateBowlerSuggestion(null);
+  }, []);
+
+  const handleSwitchToSuggestedBowler = useCallback(() => {
+    if (!rotateBowlerSuggestion) return;
+    const suggestedIdKey = baselineKey(rotateBowlerSuggestion.bowlerId);
+    const suggestedNameKey = baselineKey(rotateBowlerSuggestion.bowlerName);
+    const resolvedPlayer =
+      players.find((player) => baselineKey(player.id) === suggestedIdKey)
+      || players.find((player) => baselineKey(player.name) === suggestedNameKey);
+    const suggestedPlayer = resolvedPlayer && resolvedPlayer.inRoster !== false ? resolvedPlayer : null;
+
+    if (!suggestedPlayer) {
+      setRotateBowlerNotice('Suggested bowler not found in roster.');
+      closeRotateBowlerConfirm();
+      return;
+    }
+
+    if (activePlayer && baselineKey(activePlayer.id) === baselineKey(suggestedPlayer.id)) {
+      setRotateBowlerNotice('Already selected.');
+      closeRotateBowlerConfirm();
+      return;
+    }
+
+    setTeamMode('BOWLING');
+    setActivePlayerId(suggestedPlayer.id);
+    setRotateBowlerNotice(`Switched to ${suggestedPlayer.name}.`);
+    closeRotateBowlerConfirm();
+  }, [activePlayer, closeRotateBowlerConfirm, players, rotateBowlerSuggestion, setActivePlayerId, setTeamMode]);
+
+  const handleRotateBowler = useCallback(async () => {
+    setRotateBowlerNotice(null);
+    const rotationPool = players.filter(
+      (player) => player.inRoster !== false && isEligibleForMode(player, 'BOWLING')
+    );
+    if (rotationPool.length < 2) {
+      setRotateBowlerSuggestion(null);
+      setShowRotateBowlerConfirm(false);
+      setRotateBowlerNotice('No eligible replacement available for current mode.');
+      return;
+    }
+
+    const coachResult = await runCoachWithFallback();
+    let suggestion = coachResult.recommendation;
+    if (suggestion) {
+      const resolved = resolveSuggestionPlayer(suggestion, players);
+      if (!resolved || !isEligibleForMode(resolved, 'BOWLING')) {
+        suggestion = null;
+      }
+    }
+
+    if (!suggestion) {
+      const activeIdKey = baselineKey(activePlayer?.id || '');
+      const fallbackCandidate = [...rotationPool]
+        .filter((player) => baselineKey(player.id) !== activeIdKey)
+        .sort((a, b) => {
+          const fatigueDiff = safeNum(a.fatigue, 10) - safeNum(b.fatigue, 10);
+          if (fatigueDiff !== 0) return fatigueDiff;
+          const oversDiff = safeNum(a.overs, 999) - safeNum(b.overs, 999);
+          if (oversDiff !== 0) return oversDiff;
+          return a.name.localeCompare(b.name);
+        })[0];
+
+      if (fallbackCandidate) {
+        suggestion = {
+          bowlerId: fallbackCandidate.id,
+          bowlerName: fallbackCandidate.name,
+          reason: 'Fallback selection (router had no suggestion)',
+        };
+      }
+
+      if (!coachResult.raw) {
+        setRotateBowlerNotice('Coach analysis failed — check API response.');
+      }
+    }
+
+    if (!suggestion) {
+      setRotateBowlerSuggestion(null);
+      setShowRotateBowlerConfirm(false);
+      setRotateBowlerNotice('No eligible replacement available for current mode.');
+      return;
+    }
+
+    setRotateBowlerSuggestion(suggestion);
+    setShowRotateBowlerConfirm(true);
+  }, [activePlayer?.id, players, runCoachWithFallback]);
+
+  const handleRunCoachAuto = useCallback(() => {
+    const execute = (modeOverride?: TeamMode) => {
+      void runCoachAgentAuto(modeOverride);
+    };
+
+    if (focusRole === 'BATTER') {
+      runBattingGuardedAction(() => execute('BATTING'));
+      return;
+    }
+
+    execute();
+  }, [focusRole, runBattingGuardedAction, runCoachAgentAuto]);
+
+  const handleRunCoachFull = useCallback((event?: React.MouseEvent<HTMLButtonElement>) => {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    const execute = (modeOverride?: TeamMode) => {
+      setShowCoachInsights(true);
+      primeCoachAutoScroll();
+      void runAgent('full', 'button_click', {
+        teamMode: modeOverride || teamMode,
+        focusRole,
+        strainIndex: clampedStrainIndex,
+      });
+    };
+
+    if (focusRole === 'BATTER') {
+      runBattingGuardedAction(() => execute('BATTING'));
+      return;
+    }
+
+    execute();
+  }, [clampedStrainIndex, focusRole, primeCoachAutoScroll, runAgent, runBattingGuardedAction, teamMode]);
+
   // Auto-follow new analysis output while user is near the bottom.
   useEffect(() => {
     if (!isCoachOutputState) return;
     if (!stickToBottomRef.current) return;
     scrollCoachOutputToBottom('smooth');
-  }, [agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, combinedDecision, orchestrateMeta, agentWarning, substitutionRecommendation, isCoachOutputState]);
+  }, [agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedDecision, finalRecommendation, orchestrateMeta, agentWarning, substitutionRecommendation, isCoachOutputState]);
 
   return (
     <motion.div 
@@ -3380,10 +5366,13 @@ function Dashboard({
              <input
                type="number"
                min={0}
-               max={totalBalls}
+               max={isUnlimitedInningsFormat ? undefined : totalBalls}
                step="1"
                value={ballsBowled}
-               onChange={(e) => updateMatchState({ ballsBowled: Math.min(totalBalls, Math.max(0, Number(e.target.value) || 0)) })}
+               onChange={(e) => {
+                 const nextBalls = Math.max(0, Number(e.target.value) || 0);
+                 updateMatchState({ ballsBowled: isUnlimitedInningsFormat ? nextBalls : Math.min(totalBalls, nextBalls) });
+               }}
                className="w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                aria-label="Balls bowled"
              />
@@ -3401,6 +5390,37 @@ function Dashboard({
                className="w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-rose-300 focus:outline-none focus:ring-2 focus:ring-rose-500/40"
                aria-label="Target runs"
              />
+           </span>
+           <span className="ml-auto flex items-center gap-2">
+             MODE
+             <span
+               role="tablist"
+               aria-label="Match mode"
+               className="inline-flex items-center rounded-full border border-white/10 bg-slate-900/45 p-1"
+             >
+               <button
+                 type="button"
+                 role="tab"
+                 aria-selected={isBatting}
+                 aria-pressed={isBatting}
+                 onClick={() => setTeamMode('BATTING')}
+                 className="rounded-full border px-3 py-1 text-[10px] font-bold"
+                 style={isBatting ? selectedModeStyle : unselectedModeStyle}
+               >
+                 BATTING
+               </button>
+               <button
+                 type="button"
+                 role="tab"
+                 aria-selected={isBowling}
+                 aria-pressed={isBowling}
+                 onClick={() => setTeamMode('BOWLING')}
+                 className="rounded-full border px-3 py-1 text-[10px] font-bold"
+                 style={isBowling ? selectedModeStyle : unselectedModeStyle}
+               >
+                 BOWLING
+               </button>
+             </span>
            </span>
         </div>
       </div>
@@ -3456,18 +5476,11 @@ function Dashboard({
                       </div>
                     </button>
                     
-                    {/* Delete Button (Hover) */}
-                    <button type="button" 
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        removeFromRoster(player.id);
-                      }}
+                    <RosterDeleteButton
+                      playerName={player.name}
                       disabled={!player.id}
-                      className="absolute right-2 top-1/2 z-20 -translate-y-1/2 p-2 rounded-lg bg-rose-500/20 text-rose-400 opacity-70 group-hover:opacity-100 transition-all hover:bg-rose-500 hover:text-white cursor-pointer shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
-                      aria-label={`Remove ${player.name} from roster`}
-                    >
-                      <Trash2 className="w-5 h-5" />
-                    </button>
+                      onDelete={() => removeFromRoster(player.id)}
+                    />
                   </div>
                 );
               }) : isLoadingRosterPlayers ? (
@@ -3576,36 +5589,26 @@ function Dashboard({
                     transition={{ duration: 0.2 }}
                     className="mx-auto flex min-h-0 w-full max-w-[980px] flex-col px-4 md:px-6"
                   >
+                  {(isInningsFinished || inningsLockNotice) && (
+                    <div className="mb-3 rounded-lg border border-amber-300/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-200">
+                      {inningsLockNotice || 'Overs finished. Innings complete.'}
+                    </div>
+                  )}
                   <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-5">
                     <MetricCard
                       label="Runs"
                       value={activePlayer.runs}
-                      onIncrement={() => {
-                        updatePlayer(activePlayer.id, { runs: activePlayer.runs + 1 });
-                        updateMatchState({ runs: matchState.runs + 1 });
-                      }}
-                      onDecrement={() => {
-                        const runDelta = Math.min(1, activePlayer.runs);
-                        updatePlayer(activePlayer.id, { runs: Math.max(0, activePlayer.runs - 1) });
-                        updateMatchState({ runs: Math.max(0, matchState.runs - runDelta) });
-                      }}
+                      onIncrement={() => runBattingGuardedAction(() => handleScore(1))}
+                      onDecrement={() => runBattingGuardedAction(() => handleScore(-1))}
+                      incrementDisabled={isInningsFinished || !activePlayer || isActivePlayerOut}
                     />
 
                     <MetricCard
                       label="Balls Faced"
                       value={activePlayer.balls}
-                      onIncrement={() => {
-                        const nextBalls = activePlayer.balls + 1;
-                        const increasedMatchBalls = Math.min(totalBalls, ballsBowled + 1);
-                        updatePlayer(activePlayer.id, { balls: nextBalls });
-                        updateMatchState({ ballsBowled: increasedMatchBalls });
-                      }}
-                      onDecrement={() => {
-                        const nextBalls = Math.max(0, activePlayer.balls - 1);
-                        const reducedMatchBalls = Math.max(0, ballsBowled - 1);
-                        updatePlayer(activePlayer.id, { balls: nextBalls });
-                        updateMatchState({ ballsBowled: reducedMatchBalls });
-                      }}
+                      onIncrement={() => runBattingGuardedAction(() => handleScore(0))}
+                      onDecrement={() => runBattingGuardedAction(() => handleScore(0, -1))}
+                      incrementDisabled={isInningsFinished || !activePlayer || isActivePlayerOut}
                     />
 
                     <PanelCard className="p-4 md:p-5">
@@ -3676,7 +5679,7 @@ function Dashboard({
                           <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              onClick={() => handleRemoveBoundary('4')}
+                              onClick={() => runBattingGuardedAction(() => handleRemoveBoundary('4'))}
                               aria-label="Remove four boundary"
                               disabled={foursCount <= 0 || !activePlayer || isActivePlayerOut}
                               className={stepButtonBaseClass}
@@ -3688,9 +5691,9 @@ function Dashboard({
                             </div>
                             <button
                               type="button"
-                              onClick={() => handleAddBoundary('4')}
+                              onClick={() => runBattingGuardedAction(() => handleAddBoundary('4'))}
                               aria-label="Add four boundary"
-                              disabled={!activePlayer || isActivePlayerOut}
+                              disabled={!activePlayer || isActivePlayerOut || isInningsFinished}
                               className={`${stepButtonBaseClass} border-emerald-400/30 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30 hover:border-emerald-300/50`}
                             >
                               <Plus className="h-3.5 w-3.5" />
@@ -3706,7 +5709,7 @@ function Dashboard({
                           <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              onClick={() => handleRemoveBoundary('6')}
+                              onClick={() => runBattingGuardedAction(() => handleRemoveBoundary('6'))}
                               aria-label="Remove six boundary"
                               disabled={sixesCount <= 0 || !activePlayer || isActivePlayerOut}
                               className={stepButtonBaseClass}
@@ -3718,9 +5721,9 @@ function Dashboard({
                             </div>
                             <button
                               type="button"
-                              onClick={() => handleAddBoundary('6')}
+                              onClick={() => runBattingGuardedAction(() => handleAddBoundary('6'))}
                               aria-label="Add six boundary"
-                              disabled={!activePlayer || isActivePlayerOut}
+                              disabled={!activePlayer || isActivePlayerOut || isInningsFinished}
                               className={`${stepButtonBaseClass} border-emerald-400/30 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30 hover:border-emerald-300/50`}
                             >
                               <Plus className="h-3.5 w-3.5" />
@@ -3732,7 +5735,14 @@ function Dashboard({
 
                     <PanelCard className="p-4 md:p-5 md:col-span-2 overflow-visible">
                       <div className="flex items-center justify-between">
-                        <div className="text-sm font-semibold text-white/90">Pressure Index</div>
+                        <div className="flex items-center gap-2">
+                          <div className="text-sm font-semibold text-white/90">Pressure Index</div>
+                          {inningsComplete && (
+                            <span className="inline-flex rounded-full border border-amber-300/35 bg-amber-500/12 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-amber-200">
+                              Overs finished
+                            </span>
+                          )}
+                        </div>
                         <div className={`text-2xl font-bold tabular-nums ${pressureToneClass}`}>
                           {Math.max(0, Math.min(10, pressureIndex ?? 0)).toFixed(1)}
                         </div>
@@ -3813,7 +5823,7 @@ function Dashboard({
                           <div className="flex items-center justify-start gap-4">
                             <button
                               type="button"
-                              onClick={() => setBatterDismissalStatus('OUT')}
+                              onClick={() => runBattingGuardedAction(() => setBatterDismissalStatus('OUT'))}
                               className={`dismissal-pill ${pill}`}
                             >
                               Mark Out
@@ -3821,7 +5831,7 @@ function Dashboard({
 
                             <button
                               type="button"
-                              onClick={() => {
+                              onClick={() => runBattingGuardedAction(() => {
                                 const correctedScore = Math.max(0, matchState.runs - activePlayer.runs);
                                 const correctedBalls = Math.max(0, ballsBowled - activePlayer.balls);
                                 const wasOut = activeDismissalStatus === 'OUT';
@@ -3839,7 +5849,7 @@ function Dashboard({
                                   wickets: wasOut ? Math.max(0, prev.wickets - 1) : prev.wickets,
                                 }));
                                 persistDismissalStatusForPlayer(activePlayer.id, 'NOT_OUT', 'Not Out');
-                              }}
+                              })}
                               className={`dismissal-pill ${pill}`}
                             >
                               Reset Innings
@@ -4049,10 +6059,19 @@ function Dashboard({
                         <span className="text-sm font-bold">{activePlayer.isUnfit ? 'Mark Fit' : 'Mark Unfit'}</span>
                         <span className="text-[10px] opacity-70">{activePlayer.isUnfit ? 'Restore player state' : 'Force critical state'}</span>
                       </button>
-                      <button type="button" onClick={handleNewSpell} disabled={activePlayer.isUnfit} className={`p-4 rounded-lg transition-colors flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}>
+                      <button
+                        type="button"
+                        onClick={handleRotateBowler}
+                        disabled={activePlayer.isUnfit || agentState === 'thinking'}
+                        className={`p-4 rounded-lg transition-colors flex flex-col items-center border ${
+                          activePlayer.isUnfit || agentState === 'thinking'
+                            ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed'
+                            : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+                        }`}
+                      >
                         <CheckCircle2 className="w-5 h-5 mb-0.5" />
-                        <span className="text-sm font-bold">New Spell</span>
-                        <span className="text-[10px] opacity-70">Reset count</span>
+                        <span className="text-sm font-bold">Rotate Bowler</span>
+                        <span className="text-[10px] opacity-70">Coach suggestion</span>
                       </button>
                       <button type="button"
                         onClick={handleRest}
@@ -4064,6 +6083,9 @@ function Dashboard({
                         <span className="text-[10px] opacity-70">{activePlayer.isResting ? 'Click to Resume' : 'Start Recovery'}</span>
                       </button>
                     </div>
+                    {rotateBowlerNotice && (
+                      <p className="mt-2 text-[11px] text-amber-300">{rotateBowlerNotice}</p>
+                    )}
                   </div>
 
                   {analysisActive && (
@@ -4161,19 +6183,15 @@ function Dashboard({
                         <div className="w-full mt-6">
                           <button
                             type="button"
-                            aria-label="Run Coach Agent"
-                            onClick={() => {
-                              setShowCoachInsights(true);
-                              primeCoachAutoScroll();
-                              runAgent('auto', 'button_click');
-                            }}
+                            aria-label="Run Coach Analysis"
+                            onClick={handleRunCoachAuto}
                             onMouseEnter={() => setIsRunCoachHovered(true)}
                             onMouseLeave={() => setIsRunCoachHovered(false)}
                             disabled={agentState === 'thinking'}
                             className="w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white shadow-[0_12px_40px_rgba(99,102,241,0.30)] hover:scale-[1.02] hover:shadow-[0_14px_50px_rgba(30,41,59,0.65)] active:scale-[0.99] transition-all duration-300 ease-out cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0F172A] disabled:opacity-70 disabled:cursor-not-allowed"
                             style={{ backgroundColor: isRunCoachHovered ? '#4C1D95' : '#7C3AED' }}
                           >
-                            <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                            <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Analysis
                           </button>
                         </div>
                         {agentFailure && (
@@ -4225,7 +6243,7 @@ function Dashboard({
                       >
                         <div className="space-y-5">
                         <div className="rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
-                          {agentState === 'thinking' ? 'Analyzing...' : 'Analysis Output'}
+                          {agentState === 'thinking' ? 'Analyzing...' : 'AI Strategic Analysis'}
                         </div>
                         {agentWarning && (
                           <div className="w-full">
@@ -4291,128 +6309,290 @@ function Dashboard({
                             </div>
                           </motion.div>
                         )}
-                        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full text-left pr-1 space-y-5">
+                        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full text-left pr-1 space-y-4">
                           <div className="p-4 rounded-xl border border-indigo-400/35 bg-[#162032]">
-                            <div className="flex items-center justify-between">
-                              <h4 className="text-sm font-bold text-white">Tactical Coach AI</h4>
-                              <span className="text-[10px] px-2 py-0.5 rounded border border-indigo-400/40 text-indigo-200 bg-indigo-500/10">
-                                {orchestrateMeta?.mode === 'full' ? 'FULL COMBINED' : 'AUTO ROUTING'}
-                              </span>
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <h4 className="text-sm font-bold text-white">AI Match Intelligence</h4>
+                                <p className="text-[11px] text-slate-400 mt-0.5">Real-time tactical decision support</p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] px-2 py-0.5 rounded border border-indigo-400/40 text-indigo-200 bg-indigo-500/10 whitespace-nowrap">
+                                  {analysisBadgeLabel}
+                                </span>
+                                {hasAnyAnalysis && (
+                                  <button
+                                    type="button"
+                                    onClick={handleCopyBriefing}
+                                    className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200 bg-slate-800 hover:bg-slate-700 transition-colors"
+                                  >
+                                    {briefCopied ? 'Copied' : 'Copy Briefing'}
+                                  </button>
+                                )}
+                              </div>
                             </div>
-                            <p className="text-[11px] text-slate-400 mt-1">Router intent: {routerDecision?.intent || 'monitor'}</p>
                           </div>
 
+                          {showAnalysisFailureInline && (
+                            <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
+                              <p className="text-[11px] text-amber-100">
+                                Some signals were unavailable; showing best available guidance.
+                              </p>
+                            </div>
+                          )}
+
                           <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
-                            <p className="text-xs font-bold text-slate-200 mb-2">Model Router</p>
-                            <div className="flex flex-wrap gap-1.5 mb-2">
-                              {(routerDecision?.selectedAgents || orchestrateMeta?.executedAgents || []).map((agent) => (
-                                <span key={agent} className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200 bg-slate-800">
-                                  {agent.toUpperCase()}
-                                </span>
+                            <p className="text-xs font-bold text-slate-200 mb-2">Agent Execution</p>
+                            <div className="space-y-2">
+                              {agentStatusRows.map((row) => (
+                                <div key={`agent-status-${row.agent}`} className="rounded-lg border border-slate-700/80 bg-slate-900/30 px-3 py-2">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[11px] font-semibold text-slate-200">{row.label}</span>
+                                    <span
+                                      className={`text-[10px] px-2 py-0.5 rounded border ${
+                                        row.state === 'SUCCESS'
+                                          ? 'border-emerald-500/35 text-emerald-200 bg-emerald-500/10'
+                                          : row.state === 'RUNNING'
+                                            ? 'border-indigo-500/35 text-indigo-200 bg-indigo-500/10'
+                                            : row.state === 'ERROR'
+                                              ? 'border-rose-500/35 text-rose-200 bg-rose-500/10'
+                                              : row.state === 'SKIPPED'
+                                                ? 'border-slate-600 text-slate-300 bg-slate-800/60'
+                                                : 'border-slate-700 text-slate-400 bg-slate-900/60'
+                                      }`}
+                                    >
+                                      {row.state}
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 flex items-center justify-between gap-2">
+                                    <p className="text-[11px] text-slate-400">{row.detail}</p>
+                                    {row.state === 'ERROR' && (
+                                      <button
+                                        type="button"
+                                        onClick={handleRunCoachAuto}
+                                        disabled={agentState === 'thinking'}
+                                        className="text-[10px] px-2 py-0.5 rounded border border-rose-400/45 text-rose-200 hover:text-white hover:bg-rose-500/20 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                                      >
+                                        Retry
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
                               ))}
                             </div>
-                            <p className="text-xs text-slate-300 mb-2">{routerDecision?.reason || 'Router selecting agents from current signals.'}</p>
-                            <button type="button"
-                              onClick={() => setShowRouterSignals((v) => !v)}
-                              className="text-[11px] text-slate-400 hover:text-slate-200"
+                          </div>
+
+                          {showAnalysisSkeleton ? (
+                            <div className="space-y-3">
+                              {[0, 1, 2, 3].map((idx) => (
+                                <div key={`analysis-skeleton-${idx}`} className="rounded-xl border border-slate-700 bg-[#162032] p-4 animate-pulse">
+                                  <div className="h-3 w-32 rounded bg-slate-700/70 mb-3" />
+                                  <div className="h-2.5 w-full rounded bg-slate-700/50 mb-2" />
+                                  <div className="h-2.5 w-10/12 rounded bg-slate-700/50" />
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <>
+                              {matchSignalBullets.length > 0 && (
+                                <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
+                                  <p className="text-xs font-bold text-slate-200 mb-2">Detected Match Signals</p>
+                                  <ul className="space-y-1.5">
+                                    {matchSignalBullets.map((signal, index) => (
+                                      <li key={`${signal}-${index}`} className="text-xs text-slate-300 leading-relaxed">• {signal}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              {fatigueSectionVisible && (
+                                <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
+                                  <div className="flex items-center justify-between mb-2">
+                                    <p className="text-xs font-bold text-slate-200">Fatigue Analysis</p>
+                                    <span className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800">
+                                      Trend: {fatigueTrendLabel}
+                                    </span>
+                                  </div>
+                                  <p className="text-xs text-slate-300 leading-relaxed">
+                                    {activeStrategicAnalysis?.fatigueAnalysis || aiAnalysis?.headline || 'Fatigue model reviewed workload and recovery balance for this phase.'}
+                                  </p>
+                                  <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
+                                    {aiAnalysis?.explanation || 'The current spell and recovery profile suggest monitoring exertion before extending intensity.'}
+                                  </p>
+                                  <ul className="space-y-1.5 mt-3">
+                                    {[aiAnalysis?.recommendation, ...(aiAnalysis?.signals || []).slice(0, 3)]
+                                      .filter((item): item is string => Boolean(item && item.trim()))
+                                      .slice(0, 4)
+                                      .map((item, idx) => (
+                                        <li key={`fatigue-point-${idx}`} className="text-[11px] text-slate-300">• {item}</li>
+                                      ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              {riskSectionVisible && (
+                                <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
+                                  <p className="text-xs font-bold text-slate-200 mb-2">Injury Risk Analysis</p>
+                                  <p className="text-xs text-slate-300 leading-relaxed">
+                                    {activeStrategicAnalysis?.injuryRiskAnalysis || (riskAnalysis?.headline || 'Risk profile indicates workload-linked injury exposure should be managed proactively.')}
+                                  </p>
+                                  {likelyInjuries.length > 0 && (
+                                    <p className="text-[11px] text-slate-300 mt-2 leading-relaxed">
+                                      Likely injury types: {likelyInjuries.slice(0, 3).map((injury) => injury.type).join(', ')}.
+                                    </p>
+                                  )}
+                                  <ul className="space-y-1.5 mt-3">
+                                    {[
+                                      likelyInjuries[0]?.reason ? `How it can occur: ${likelyInjuries[0].reason}` : null,
+                                      riskAnalysis?.recommendation ? `Why AI flagged this: ${riskAnalysis.recommendation}` : null,
+                                      ...(riskAnalysis?.signals || []).slice(0, 2).map((signal) => `Supporting signal: ${signal}`),
+                                    ]
+                                      .filter((item): item is string => Boolean(item && item.trim()))
+                                      .slice(0, 4)
+                                      .map((item, idx) => (
+                                        <li key={`risk-point-${idx}`} className="text-[11px] text-slate-300">• {item}</li>
+                                      ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              {hasAnyAnalysis && (
+                                <div className="p-5 rounded-xl border border-indigo-400/35 bg-gradient-to-b from-indigo-500/12 to-[#162032] border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]">
+                                  <p className="text-[11px] font-bold uppercase tracking-wide text-indigo-100 mb-2">Tactical Recommendation</p>
+                                  <div className="space-y-3">
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Next Action</p>
+                                      <p className="text-sm text-white mt-1">{tacticalNextAction}</p>
+                                    </div>
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Why</p>
+                                      <p className="text-xs text-slate-300 mt-1 leading-relaxed">{activeStrategicAnalysis?.tacticalRecommendation?.why || tacticalWhy}</p>
+                                    </div>
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">If Ignored</p>
+                                      <p className="text-xs text-slate-300 mt-1 leading-relaxed">{activeStrategicAnalysis?.tacticalRecommendation?.ifIgnored || tacticalIfIgnored}</p>
+                                    </div>
+                                    <div>
+                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Alternative</p>
+                                      <p className="text-xs text-slate-300 mt-1 leading-relaxed">{activeStrategicAnalysis?.tacticalRecommendation?.alternatives?.[0] || modeScopedAlternative}</p>
+                                    </div>
+                                    {activeStrategicAnalysis?.coachNote && (
+                                      <div>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Coach Note</p>
+                                        <p className="text-xs text-indigo-100/90 mt-1 leading-relaxed">{activeStrategicAnalysis.coachNote}</p>
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {showAnalysisFailureCard && (
+                            <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-3">
+                              <p className="text-xs text-rose-100">Analysis is temporarily unavailable. Please retry.</p>
+                              <button
+                                type="button"
+                                onClick={isFullAnalysis ? () => handleRunCoachFull() : handleRunCoachAuto}
+                                className="mt-2 text-[11px] px-2.5 py-1 rounded border border-rose-400/45 text-rose-200 hover:text-white hover:bg-rose-500/20 transition-colors"
+                              >
+                                Retry Analysis
+                              </button>
+                            </div>
+                          )}
+
+                          <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setShowRouterSignals((prev) => {
+                                  const next = !prev;
+                                  if (!next) setShowRawTelemetry(false);
+                                  return next;
+                                })
+                              }
+                              className="text-xs font-semibold text-slate-300 hover:text-white transition-colors"
                             >
-                              {showRouterSignals ? 'Hide Signals' : 'Show Signals'}
+                              Advanced View {showRouterSignals ? '▴' : '▾'}
                             </button>
                             {showRouterSignals && (
-                              <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-slate-400">
-                                {Object.entries(routerDecision?.signals || {}).map(([k, v]) => (
-                                  <div key={k} className="flex justify-between gap-2 border border-slate-800 rounded px-2 py-1">
-                                    <span>{k}</span>
-                                    <span className="text-slate-200">{String(v)}</span>
+                              <div className="mt-3 space-y-4">
+                                <div className="rounded-lg border border-indigo-500/25 bg-indigo-500/5 px-3 py-2">
+                                  <p className="text-[10px] uppercase tracking-wide text-indigo-200/90">Intent</p>
+                                  <p className="text-sm font-semibold text-indigo-100 mt-0.5">{routerIntentLabel}</p>
+                                  <p className="text-[11px] text-slate-400 mt-1">
+                                    {isFullAnalysis
+                                      ? 'Full analysis mode bypasses router selection and forces fatigue, risk, and tactical agents in parallel.'
+                                      : routerDecisionForView?.rationale || routerDecisionForView?.reason || 'Decision selected from current match signals.'}
+                                  </p>
+                                </div>
+
+                                <div>
+                                  <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-1.5">Triggered by</p>
+                                  <ul className="space-y-1.5">
+                                    {matchSignalBullets.slice(0, 6).map((item, index) => (
+                                      <li key={`advanced-trigger-${index}`} className="text-[11px] text-slate-300 leading-relaxed">• {item}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+
+                                <div>
+                                  <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-1.5">Agents</p>
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {(['fatigue', 'risk', 'tactical'] as const).map((agent) => {
+                                      const selected = isFullAnalysis ? true : selectedAgentSet.has(agent);
+                                      return (
+                                        <span
+                                          key={`advanced-chip-${agent}`}
+                                          className={`text-[10px] px-2 py-0.5 rounded border ${
+                                            selected
+                                              ? 'border-emerald-500/35 text-emerald-200 bg-emerald-500/10'
+                                              : 'border-slate-700 text-slate-400 bg-slate-900/40'
+                                          }`}
+                                        >
+                                          {agent.toUpperCase()} {selected ? 'selected' : 'not needed'}
+                                        </span>
+                                      );
+                                    })}
                                   </div>
-                                ))}
+                                </div>
+
+                                <div className="rounded-lg border border-slate-700 bg-slate-900/30 px-3 py-2.5">
+                                  <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-2">Why this decision</p>
+                                  <div className="space-y-2">
+                                    {agentDecisionRows.map((row) => (
+                                      <p key={`advanced-why-${row.agent}`} className="text-[11px] text-slate-300 leading-relaxed">
+                                        <span className={(isFullAnalysis || row.selected) ? 'text-emerald-300' : 'text-slate-500'}>
+                                          {(isFullAnalysis || row.selected) ? '✅' : '⛔'}
+                                        </span>{' '}
+                                        <span className="font-semibold text-slate-200">{row.agent === 'risk' ? 'Risk' : row.agent === 'fatigue' ? 'Fatigue' : 'Tactical'}</span>{' '}
+                                        — {isFullAnalysis ? 'Forced in full combined analysis for maximum coverage.' : row.why}
+                                      </p>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                <button
+                                  type="button"
+                                  onClick={() => setShowRawTelemetry((v) => !v)}
+                                  className="text-[11px] text-slate-400 hover:text-slate-200 underline decoration-slate-600/70"
+                                >
+                                  {showRawTelemetry ? 'Hide raw telemetry' : 'Show raw telemetry'}
+                                </button>
+
+                                {showRawTelemetry && rawSignalEntries.length > 0 && (
+                                  <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-400">
+                                    {rawSignalEntries.map(({ key, value }) => (
+                                      <div key={`signal-${key}`} className="flex justify-between gap-2 border border-slate-800 rounded px-2 py-1">
+                                        <span>{key}</span>
+                                        <span className="text-slate-200">{value}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>
-
-                          {[
-                            {
-                              key: 'fatigue' as const,
-                              title: 'Fatigue Agent',
-                              subtitle: 'Workload and recovery drift',
-                              status: toStatusLabel(agentFeedStatus.fatigue, selectedAgentSet.has('fatigue'), orchestrateMeta?.usedFallbackAgents.includes('fatigue')),
-                              summary: aiAnalysis ? `${aiAnalysis.headline}` : 'No output',
-                              detail: aiAnalysis ? `Fatigue ${safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1)} · ${aiAnalysis.recommendation}` : 'Skipped by router',
-                              severity: aiAnalysis?.severity,
-                            },
-                            {
-                              key: 'risk' as const,
-                              title: 'Risk Agent',
-                              subtitle: 'Injury and no-ball risk',
-                              status: toStatusLabel(agentFeedStatus.risk, selectedAgentSet.has('risk'), orchestrateMeta?.usedFallbackAgents.includes('risk')),
-                              summary: riskAnalysis ? `${riskAnalysis.headline}` : 'No output',
-                              detail: riskAnalysis ? `Risk ${Math.round(safeNum(riskAnalysis.riskScore, 0))} · ${riskAnalysis.recommendation}` : 'Skipped by router',
-                              severity: riskAnalysis?.severity,
-                            },
-                            {
-                              key: 'tactical' as const,
-                              title: 'Tactical Agent',
-                              subtitle: 'Substitution and next action',
-                              status: toStatusLabel(agentFeedStatus.tactical, selectedAgentSet.has('tactical'), tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')),
-                              summary: tacticalAnalysis ? tacticalAnalysis.immediateAction : 'No output',
-                              detail: tacticalAnalysis ? tacticalAnalysis.rationale : 'Skipped by router',
-                              severity: tacticalAnalysis ? `${Math.round((tacticalAnalysis.confidence || 0) * 100)}%` : undefined,
-                            },
-                          ].map((step) => (
-                            <div
-                              key={step.key}
-                              className={`p-4 rounded-xl border border-l-4 ${selectedAgentSet.has(step.key) || orchestrateMeta?.mode === 'full' ? 'border-slate-700 bg-[#162032]' : 'border-slate-800 bg-slate-900/30 opacity-70'}`}
-                              style={{ borderLeftColor: agentBorderColor[step.key] }}
-                            >
-                              <div className="flex items-center justify-between mb-1">
-                                <div className="flex items-center gap-2">
-                                  <span className={`w-2 h-2 rounded-full ${
-                                    step.status === 'OK' ? 'bg-emerald-400' :
-                                    step.status === 'RUNNING' ? 'bg-indigo-400 animate-pulse' :
-                                    step.status === 'FALLBACK' ? 'bg-amber-400' :
-                                    step.status === 'ERROR' ? 'bg-rose-400' : 'bg-slate-600'
-                                  }`} />
-                                  <p className="text-xs font-bold text-white">{step.title}</p>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  {step.status === 'FALLBACK' && <span className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300">Fallback logic</span>}
-                                  <span className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200">{step.status}</span>
-                                </div>
-                              </div>
-                              <p className="text-[11px] text-slate-500 mb-1">{step.subtitle}</p>
-                              {step.status === 'SKIPPED' ? (
-                                <p className="text-xs text-slate-500">Skipped by router</p>
-                              ) : (
-                                <>
-                                  <p className="text-xs text-slate-200 line-clamp-2">{step.summary}</p>
-                                  <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{step.detail}</p>
-                                </>
-                              )}
-                            </div>
-                          ))}
-
-                          {combinedDecision && (
-                            <div className="p-5 rounded-xl border border-indigo-400/35 bg-gradient-to-b from-indigo-500/12 to-[#162032] border-l-[3px] border-l-indigo-300/85 shadow-[0_0_26px_rgba(99,102,241,0.22)]">
-                              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-300 mb-1">Final Recommendation</p>
-                              <h3 className="text-lg font-bold text-white mb-2">{combinedDecision.immediateAction}</h3>
-                              <ul className="text-xs text-slate-300 space-y-1 mb-2">
-                                <li>• {combinedDecision.rationale}</li>
-                                {(combinedDecision.suggestedAdjustments || []).slice(0, 2).map((item, idx) => (
-                                  <li key={`${item}-${idx}`}>• {item}</li>
-                                ))}
-                              </ul>
-                              {orchestrateMeta?.mode === 'full' && (
-                                <p className="text-[11px] text-indigo-200">
-                                  Consensus: Risk {riskAnalysis?.severity || 'N/A'} | Fatigue {aiAnalysis ? safeNum(aiAnalysis.fatigueIndex, 0).toFixed(1) : 'N/A'} | Tactical {tacticalAnalysis ? 'Action-ready' : 'N/A'}
-                                </p>
-                              )}
-                              {orchestrateMeta?.mode === 'auto' && orchestrateMeta.executedAgents.length <= 1 && (
-                                <p className="text-[11px] text-slate-400 mt-2">
-                                  Auto routing ran: {orchestrateMeta.executedAgents.join(', ')}. Run full analysis for a combined view.
-                                </p>
-                              )}
-                            </div>
-                          )}
 
                           {(tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')) && (
                             <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
@@ -4436,7 +6616,7 @@ function Dashboard({
                   )}
                   {!isRosterEmpty && (
                     <p className="mt-2 text-xs text-slate-500">
-                      Run Coach Agent will be enabled after player selection.
+                      Run Coach Analysis will be enabled after player selection.
                     </p>
                   )}
                   <button
@@ -4444,7 +6624,7 @@ function Dashboard({
                     disabled
                     className="mt-5 w-full rounded-full px-12 py-4 text-base font-semibold flex items-center justify-center gap-3 text-white bg-slate-700/70 opacity-70 cursor-not-allowed"
                   >
-                    <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Agent
+                    <PlayCircle className="w-5 h-5 dashboard-icon-tall-lg shrink-0" /> Run Coach Analysis
                   </button>
                 </div>
               )}
@@ -4456,10 +6636,7 @@ function Dashboard({
 	                  {isCoachOutputState && (
 	                    <>
 	                      <button type="button"
-                        onClick={() => {
-                          primeCoachAutoScroll();
-                          runAgent('full', 'button_click');
-                        }}
+                        onClick={(event) => handleRunCoachFull(event)}
                         disabled={agentState === 'thinking'}
                         className={`w-full py-3 rounded-lg border text-sm transition-colors ${agentState === 'thinking' ? 'border-slate-700 text-slate-500 cursor-not-allowed' : 'border-indigo-400/30 text-indigo-200 hover:text-white hover:bg-indigo-500/10'}`}
                       >
@@ -4481,6 +6658,17 @@ function Dashboard({
         </div>
       </div>
       </div>
+      <ConfirmSwitchOverlay
+        open={showRotateBowlerConfirm && Boolean(rotateBowlerSuggestion)}
+        suggestion={rotateBowlerSuggestion}
+        onSwitch={handleSwitchToSuggestedBowler}
+        onCancel={closeRotateBowlerConfirm}
+      />
+      <MatchModeGuardOverlay
+        open={showMatchModeGuard}
+        onSwitch={handleSwitchToBattingAndContinue}
+        onCancel={closeMatchModeGuard}
+      />
     </motion.div>
   );
 }
