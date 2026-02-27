@@ -1491,6 +1491,8 @@ const orchestrateHandler = (_req, res) =>
 
 app.post("/orchestrate", orchestrateHandler);
 app.post("/api/orchestrate", orchestrateHandler);
+app.post("/orchestrate-probe", orchestrateHandler);
+app.post("/api/orchestrate-probe", orchestrateHandler);
 
 app.post("/api/messages", async (req, res) => {
   if (!isBotEnabled) {
