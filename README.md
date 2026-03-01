@@ -312,45 +312,20 @@ DEV + DELIVERY TOOLING (MICROSOFT + GITHUB)
 ````
 ```mermaid
 flowchart TB
-
-  %% Users + UI
-  Coach[Coach / Analyst] --> UI[Web UI (Vite + React)]
-
-  %% Runtime hosting
-  UI -->|HTTPS| API[Backend API (Node/Express) - Azure App Service]
-
-  %% Core orchestration
-  API --> CTX[Context Builder / Orchestrator]
-
-  %% Router
-  CTX --> ROUTER[Model Router (Azure OpenAI - direct deployment)]
-
-  %% Specialist agents
-  ROUTER --> FAT[Fatigue Agent]
-  ROUTER --> RISK[Injury Risk Agent]
-  ROUTER --> TAC[Tactical Agent]
-
-  %% Azure OpenAI calls
-  FAT --> AOAI[(Azure OpenAI)]
-  RISK --> AOAI
-  TAC --> AOAI
-  ROUTER --> AOAI
-
-  %% Data layer
-  CTX --> COSMOS[(Azure Cosmos DB)]
-  COSMOS --> CTX
-
-  %% Observability
-  API --> INSIGHTS[Application Insights]
-
-  %% Optional outputs
-  API -. reports / exports .-> BLOB[(Azure Blob Storage)]
-
-  %% Future ingestion
-  Wear[Wearables / GPS / HRV] -. future .-> HUB[Event Hubs / IoT Hub]
-  HUB -. future .-> STREAM[Azure Functions / Stream Analytics]
-  STREAM -. future .-> COSMOS
-
-  %% Dev workflow
-  Repo[Public GitHub Repo] --> Copilot[GitHub Copilot Agent Mode]
+Coach[Coach] --> UI[Web UI]
+UI --> API[Backend API]
+API --> CTX[Orchestrator]
+CTX --> ROUTER[Model Router]
+ROUTER --> FAT[Fatigue Agent]
+ROUTER --> RISK[Injury Risk Agent]
+ROUTER --> TAC[Tactical Agent]
+FAT --> AOAI[Azure OpenAI]
+RISK --> AOAI
+TAC --> AOAI
+ROUTER --> AOAI
+CTX --> COSMOS[Cosmos DB]
+API --> INSIGHTS[Application Insights]
+Repo[GitHub Repo] --> Copilot[Copilot Agent Mode]
+Copilot --> CI[GitHub Actions]
+CI --> API
 ```
