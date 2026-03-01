@@ -1,11 +1,16 @@
 import { FatigueAgentRequest, FatigueAgentResponse, RiskAgentRequest, RiskAgentResponse } from '../shared/types';
+import { FullMatchContext, ReplacementCandidate } from '../shared/matchContext';
 
 export type OrchestrateMode = 'auto' | 'full';
 export type OrchestrateRequestMode = 'route' | 'auto' | 'full';
 export type OrchestrateIntent = 'monitor' | 'substitution' | 'strategy' | 'full';
-export type RouterIntent = 'fatigue_check' | 'risk_check' | 'substitution' | 'full';
+export type RouterIntent = 'SUBSTITUTION' | 'BOWLING_NEXT' | 'BATTING_NEXT' | 'BOTH_NEXT' | 'SAFETY_ALERT' | 'GENERAL';
+export type AgentCode = 'RISK' | 'TACTICAL' | 'FATIGUE';
+export type LegacyAgentId = 'risk' | 'tactical' | 'fatigue';
 
 export interface TacticalMatchContext {
+  teamMode?: 'BATTING' | 'BOWLING' | string;
+  matchMode?: 'BAT' | 'BOWL' | string;
   phase: 'powerplay' | 'middle' | 'death';
   requiredRunRate: number;
   currentRunRate: number;
@@ -32,6 +37,7 @@ export interface TelemetryInput {
   playerName: string;
   role: string;
   fatigueIndex: number;
+  strainIndex?: number;
   heartRateRecovery: string;
   oversBowled: number;
   consecutiveOvers: number;
@@ -55,11 +61,15 @@ export interface TacticalSubstitutionAdvice {
 export interface TacticalAgentInput {
   requestId: string;
   intent: OrchestrateIntent;
+  teamMode?: 'BATTING' | 'BOWLING';
+  focusRole?: 'BOWLER' | 'BATTER';
   matchContext: TacticalMatchContext;
   telemetry: TelemetryInput;
   players: TacticalPlayersInput;
   fatigueOutput?: FatigueAgentResponse;
   riskOutput?: RiskAgentResponse;
+  context?: FullMatchContext;
+  replacementCandidates?: ReplacementCandidate[];
 }
 
 export interface TacticalAgentOutput {
@@ -68,6 +78,11 @@ export interface TacticalAgentOutput {
   rationale: string;
   suggestedAdjustments: string[];
   substitutionAdvice?: TacticalSubstitutionAdvice;
+  nextAction?: string;
+  why?: string[];
+  swap?: TacticalSubstitutionAdvice;
+  ifIgnored?: string;
+  coachNote?: string;
   confidence: number;
   keySignalsUsed: string[];
 }
@@ -76,32 +91,48 @@ export type AgentStepStatus = 'ok' | 'fallback' | 'error' | 'running' | 'skipped
 export type AgentStatus = 'OK' | 'SKIPPED' | 'FALLBACK' | 'ERROR';
 
 export interface AgentSummary {
-  status: AgentStatus;
-  summaryTitle: string;
-  summary: string;
-  signals?: string[];
-  data?: Record<string, unknown>;
-  fallbackReason?: string;
+  status: 'success' | 'error' | 'fallback';
+  routedTo: 'llm' | 'rules';
+  output?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface RouterInputsUsed {
+  activePlayerId?: string;
+  active: {
+    fatigueIndex?: number;
+    strainIndex?: number;
+    injuryRisk?: string;
+    noBallRisk?: string;
+  };
+  match: {
+    matchMode?: string;
+    format?: string;
+    phase?: string;
+    overs?: number;
+    balls?: number;
+    scoreRuns?: number;
+    wickets?: number;
+    targetRuns?: number;
+    intensity?: string;
+  };
 }
 
 export interface RouterDecision {
+  mode?: 'auto' | 'full';
   intent: RouterIntent;
-  selectedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
-  reason: string;
-  signals: {
-    fatigueIndex: number;
-    injuryRisk: string;
-    noBallRisk: string;
-    heartRateRecovery: string;
-    oversBowled: number;
-    consecutiveOvers: number;
-    maxOvers?: number;
-    quotaComplete?: boolean;
-    phase: string;
-    wicketsInHand: number;
-    oversRemaining: number;
-    isUnfit: boolean;
+  agentsToRun: AgentCode[];
+  rulesFired: string[];
+  inputsUsed: RouterInputsUsed;
+  // Compatibility aliases consumed by current UI surfaces.
+  selectedAgents: LegacyAgentId[];
+  agents?: {
+    fatigue: { routedTo: 'llm' | 'rules'; reason: string };
+    risk: { routedTo: 'llm' | 'rules'; reason: string };
+    tactical: { routedTo: 'llm' | 'rules'; reason: string };
   };
+  reason: string;
+  signals: Record<string, unknown>;
 }
 
 export interface TacticalAgentResult {
@@ -114,21 +145,30 @@ export interface OrchestrateRequest {
   mode?: OrchestrateMode;
   rawMode?: OrchestrateRequestMode;
   intent?: OrchestrateIntent;
+  teamMode?: 'BATTING' | 'BOWLING';
+  focusRole?: 'BOWLER' | 'BATTER';
   text?: string;
   signals?: Record<string, unknown>;
   matchContext: TacticalMatchContext;
   telemetry: TelemetryInput;
   players: TacticalPlayersInput;
+  context?: FullMatchContext;
+  replacementCandidates?: ReplacementCandidate[];
+  userAction?: string;
 }
 
 export interface OrchestrateRequestBody {
   text?: string;
   mode?: OrchestrateRequestMode | string;
   intent?: OrchestrateIntent | string;
+  teamMode?: 'BATTING' | 'BOWLING' | string;
+  focusRole?: 'BOWLER' | 'BATTER' | string;
   telemetry?: Partial<TelemetryInput> | Record<string, unknown>;
   matchContext?: Partial<TacticalMatchContext> | Record<string, unknown>;
   players?: TacticalPlayersInput | string[] | Record<string, unknown>;
   signals?: Record<string, unknown>;
+  context?: FullMatchContext | Record<string, unknown>;
+  userAction?: string;
   player?: Record<string, unknown>;
   match?: Record<string, unknown>;
 }
@@ -144,10 +184,67 @@ export interface TriggerScores {
   tactical: number;
 }
 
+export interface LikelyInjury {
+  type: string;
+  reason: string;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH';
+}
+
+export interface RiskAgentOutput {
+  riskLevel: number;
+  headline: string;
+  keySignals: string[];
+  likelyInjuries: LikelyInjury[];
+  continueRiskSummary: string;
+}
+
+export interface TacticalAgentStructuredOutput {
+  headline: string;
+  nextSafeBowler: { playerId: string; name: string; reason: string };
+  nextSafeBatter: { playerId: string; name: string; reason: string };
+  benchOptions?: Array<{ playerId: string; name: string; reason: string }>;
+  actionSteps: string[];
+}
+
+export interface FatigueAgentOutput {
+  fatigueNow: number;
+  projectionNextOvers: number[];
+  recoveryAdvice: string[];
+}
+
+export interface FinalRecommendation {
+  title: string;
+  statement: string;
+  nextSafeBowler: { playerId: string; name: string; reason: string };
+  nextSafeBatter: { playerId: string; name: string; reason: string };
+  ifContinues: {
+    playerId: string;
+    name: string;
+    riskSummary: string;
+    likelyInjuries: LikelyInjury[];
+  };
+  confidence: 'LOW' | 'MEDIUM' | 'HIGH';
+}
+
 export interface OrchestrateResponse {
   fatigue?: FatigueAgentResponse;
   risk?: RiskAgentResponse;
   tactical?: TacticalAgentOutput;
+  strategicAnalysis?: {
+    signals: string[];
+    fatigueAnalysis: string;
+    injuryRiskAnalysis: string;
+    tacticalRecommendation: {
+      nextAction: string;
+      why: string;
+      ifIgnored: string;
+      alternatives: string[];
+    };
+    coachNote?: string;
+    meta?: {
+      usedBaseline: boolean;
+    };
+  };
   agentOutputs: {
     fatigue?: (FatigueAgentResponse & { status: AgentStepStatus });
     risk?: (RiskAgentResponse & { status: AgentStepStatus });
@@ -179,16 +276,49 @@ export interface OrchestrateResponse {
     };
     reason: string;
   };
+  agents?: {
+    fatigue?: { status: AgentStatus };
+    risk?: { status: AgentStatus };
+    tactical?: { status: AgentStatus };
+  };
   agentResults?: {
     fatigue: AgentSummary;
     risk: AgentSummary;
     tactical: AgentSummary;
   };
-  finalRecommendation?: {
-    title: string;
-    bulletReasons: string[];
-    confidence: number;
-    source: 'MODEL' | 'FALLBACK';
+  agentsRun?: AgentCode[];
+  contextSummary?: {
+    rosterCount: number;
+    activePlayerId?: string;
+    match: {
+      matchMode?: string;
+      format: string;
+      phase: string;
+      intensity: string;
+      scoreRuns: number;
+      wickets: number;
+      overs: number;
+      balls: number;
+      targetRuns?: number;
+    };
+    hasBaselinesCount: number;
+    hasTelemetryCount: number;
+  };
+  structuredOutputs?: {
+    risk?: RiskAgentOutput;
+    tactical?: TacticalAgentStructuredOutput;
+    fatigue?: FatigueAgentOutput;
+  };
+  finalRecommendation?: FinalRecommendation;
+  recommendation?: {
+    bowlerId: string;
+    bowlerName: string;
+    reason?: string;
+  };
+  suggestedRotation?: {
+    playerId: string;
+    name: string;
+    rationale?: string;
   };
   riskDebug?: RiskAgentResponse['riskDebug'];
   routerDecision: RouterDecision;
@@ -245,6 +375,8 @@ export const toFatigueRequest = (input: OrchestrateRequest, snapshotId: string):
     over: Number.isFinite(Number(input.matchContext.over)) ? Number(input.matchContext.over) : 0,
     intensity: String(input.matchContext.intensity || 'Medium'),
   },
+  ...(input.context ? { fullMatchContext: input.context } : {}),
+  ...(Array.isArray(input.replacementCandidates) ? { replacementCandidates: input.replacementCandidates } : {}),
 });
 
 export const toRiskRequest = (input: OrchestrateRequest): RiskAgentRequest => ({
@@ -252,6 +384,9 @@ export const toRiskRequest = (input: OrchestrateRequest): RiskAgentRequest => ({
   fatigueIndex: Number.isFinite(Number(input.telemetry.fatigueIndex))
     ? Math.max(0, Math.min(10, Number(input.telemetry.fatigueIndex)))
     : Number.NaN,
+  strainIndex: Number.isFinite(Number(input.telemetry.strainIndex))
+    ? Math.max(0, Math.min(10, Number(input.telemetry.strainIndex)))
+    : undefined,
   injuryRisk: String(input.telemetry.injuryRisk || 'UNKNOWN').toUpperCase() as RiskAgentRequest['injuryRisk'],
   noBallRisk: String(input.telemetry.noBallRisk || 'UNKNOWN').toUpperCase() as RiskAgentRequest['noBallRisk'],
   oversBowled: Number.isFinite(Number(input.telemetry.oversBowled))
@@ -284,4 +419,6 @@ export const toRiskRequest = (input: OrchestrateRequest): RiskAgentRequest => ({
   score: input.matchContext.score,
   over: input.matchContext.over,
   balls: input.matchContext.balls,
+  ...(input.context ? { fullMatchContext: input.context } : {}),
+  ...(Array.isArray(input.replacementCandidates) ? { replacementCandidates: input.replacementCandidates } : {}),
 });

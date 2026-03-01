@@ -471,22 +471,396 @@ const normalizeSelectedLegacyAgents = (inputAgents, forceAll) => {
   set.add("tactical");
   return ["fatigue", "risk", "tactical"].filter((agent) => set.has(agent));
 };
+const extractStatusCodeFromError = (error) => {
+  if (!error) return undefined;
+  if (typeof error === "object" && Number.isFinite(error.status)) return Number(error.status);
+  if (typeof error === "object" && Number.isFinite(error.code)) return Number(error.code);
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/\b(429|5\d{2})\b/);
+  if (!match) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+const isRetryableAgentError = (error) => {
+  const status = extractStatusCodeFromError(error);
+  if (status === 429) return true;
+  if (Number.isFinite(status) && status >= 500 && status < 600) return true;
+  const message = String(error instanceof Error ? error.message : error || "").toLowerCase();
+  return message.includes("timeout") || message.includes("timed out");
+};
+const runWithAbortTimeout = async (label, timeoutMs, runFn) => {
+  const controller = new AbortController();
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => runFn(controller.signal)),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+const runAgentWithRetry = async (label, runFn, timeoutMs = 9000, retries = 1) => {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await runWithAbortTimeout(label, timeoutMs, runFn);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries || !isRetryableAgentError(error)) {
+        throw error;
+      }
+      console.warn(`[orchestrate][full] retrying ${label}`, {
+        attempt: attempt + 1,
+        reason: sanitizeErrorMessage(error),
+      });
+    }
+  }
+  throw lastError || new Error(`${label} failed`);
+};
+const buildCombinedBriefing = ({ mode, telemetry, fatigueOutput, riskOutput, tacticalOutput }) => {
+  const fatigueIndex = Number.isFinite(Number(fatigueOutput?.echo?.fatigueIndex))
+    ? Number(fatigueOutput.echo.fatigueIndex)
+    : Number.isFinite(Number(telemetry?.fatigueIndex))
+      ? Number(telemetry.fatigueIndex)
+      : 0;
+  const injuryRisk = String(riskOutput?.echo?.injuryRisk || telemetry?.injuryRisk || "UNKNOWN").toUpperCase();
+  const noBallRisk = String(riskOutput?.echo?.noBallRisk || telemetry?.noBallRisk || "UNKNOWN").toUpperCase();
+  const oversBowled = Number.isFinite(Number(fatigueOutput?.echo?.oversBowled))
+    ? Number(fatigueOutput.echo.oversBowled)
+    : Number.isFinite(Number(telemetry?.oversBowled))
+      ? Number(telemetry.oversBowled)
+      : 0;
+
+  const situationLine = `Situation: fatigueIndex ${fatigueIndex.toFixed(1)}, injuryRisk ${injuryRisk}, noBallRisk ${noBallRisk}, oversBowled ${oversBowled.toFixed(1)}, mode ${String(mode || "full")}.`;
+  const fatigueRiskLine = fatigueOutput
+    ? `Fatigue: ${firstNonEmpty(fatigueOutput.headline, fatigueOutput.recommendation, fatigueOutput.explanation, "available")}`
+    : "Fatigue: data missing.";
+  const riskLine = riskOutput
+    ? `Risk: ${firstNonEmpty(riskOutput.headline, riskOutput.recommendation, riskOutput.explanation, "available")}`
+    : "Risk: data missing.";
+  const bestAction = tacticalOutput
+    ? firstNonEmpty(tacticalOutput.immediateAction, tacticalOutput.rationale, "data missing")
+    : "data missing (tactical output unavailable).";
+  const fatigueSeverity = String(fatigueOutput?.severity || "UNKNOWN").toUpperCase();
+  const riskSeverity = String(riskOutput?.severity || "UNKNOWN").toUpperCase();
+  const whyNow = `Why now: fatigue=${fatigueSeverity}, risk=${riskSeverity}, noBallRisk=${noBallRisk}; act before next-over load compounds.`;
+  const nextOverPlan = Array.isArray(tacticalOutput?.suggestedAdjustments)
+    ? tacticalOutput.suggestedAdjustments.map((entry) => String(entry || "").trim()).filter(Boolean).slice(0, 4)
+    : [];
+  if (nextOverPlan.length === 0) {
+    nextOverPlan.push("Data missing: tactical next-over plan unavailable.");
+  }
+
+  return [
+    situationLine,
+    `Key Risks: ${fatigueRiskLine} ${riskLine}`,
+    `Best Next Action: ${bestAction}`,
+    whyNow,
+    "Next over plan:",
+    ...nextOverPlan.map((entry) => `- ${entry}`),
+  ].join("\n");
+};
+const runFullCombinedOrchestrate = async (validatedValue, traceId) => {
+  const mode = "full";
+  const normalizedContextResult = normalizeFullMatchContext(validatedValue?.context);
+  const fullMatchContext = normalizedContextResult.ok ? normalizedContextResult.value : undefined;
+  const replacementCandidates = fullMatchContext ? pickReplacementCandidates(fullMatchContext, 2) : [];
+
+  const fatigueInput = sanitizeFatigueRequest({
+    ...(isRecord(validatedValue?.telemetry) ? validatedValue.telemetry : {}),
+    matchContext: validatedValue?.matchContext,
+    context: fullMatchContext || validatedValue?.context,
+    playerId: validatedValue?.telemetry?.playerId,
+    playerName: validatedValue?.telemetry?.playerName,
+    role: validatedValue?.telemetry?.role,
+  });
+  const riskInput = sanitizeRiskRequest({
+    ...(isRecord(validatedValue?.telemetry) ? validatedValue.telemetry : {}),
+    format: validatedValue?.matchContext?.format,
+    phase: validatedValue?.matchContext?.phase,
+    intensity: validatedValue?.matchContext?.intensity,
+    conditions: validatedValue?.matchContext?.conditions || validatedValue?.matchContext?.weather,
+    target: validatedValue?.matchContext?.target,
+    score: validatedValue?.matchContext?.score,
+    over: validatedValue?.matchContext?.over,
+    balls: validatedValue?.matchContext?.balls,
+    context: fullMatchContext || validatedValue?.context,
+  });
+  const tacticalPayload = {
+    requestId: `${traceId}-tactical`,
+    intent: validatedValue?.intent || "full",
+    teamMode: validatedValue?.teamMode,
+    focusRole: validatedValue?.focusRole,
+    telemetry: validatedValue?.telemetry,
+    matchContext: validatedValue?.matchContext,
+    players: validatedValue?.players,
+    ...(fullMatchContext ? { context: fullMatchContext } : {}),
+    ...(replacementCandidates.length > 0 ? { replacementCandidates } : {}),
+  };
+
+  const fatigueTask = runAgentWithRetry("fatigue", async () => backend.runFatigueAgent(fatigueInput), 9000, 1);
+  const riskTask = runAgentWithRetry("risk", async () => backend.runRiskAgent(riskInput), 9000, 1);
+  const tacticalTask = runAgentWithRetry("tactical", async () => {
+    const tacticalValidated = backend.validateTacticalRequest(tacticalPayload);
+    if (!tacticalValidated.ok) {
+      throw new Error(tacticalValidated.message || "Invalid tactical payload");
+    }
+    const tacticalInput = {
+      ...tacticalValidated.value,
+      requestId: tacticalPayload.requestId,
+      ...(fullMatchContext ? { context: fullMatchContext } : {}),
+      ...(replacementCandidates.length > 0 ? { replacementCandidates } : {}),
+    };
+    return backend.runTacticalAgent(tacticalInput);
+  }, 9000, 1);
+
+  const [fatigueSettled, riskSettled, tacticalSettled] = await Promise.allSettled([
+    fatigueTask,
+    riskTask,
+    tacticalTask,
+  ]);
+
+  const normalizeAgent = (agent, settled, fallbackOutput) => {
+    if (settled.status === "rejected") {
+      return {
+        status: "error",
+        routedTo: "rules",
+        reason: sanitizeErrorMessage(settled.reason),
+        output: fallbackOutput,
+        model: "error",
+      };
+    }
+
+    const runResult = settled.value;
+    const output =
+      agent === "tactical"
+        ? {
+            ...runResult.output,
+            status: runResult.output?.status || (Array.isArray(runResult.fallbacksUsed) && runResult.fallbacksUsed.length > 0 ? "fallback" : "ok"),
+          }
+        : {
+            ...runResult.output,
+            status: runResult.output?.status || (Array.isArray(runResult.fallbacksUsed) && runResult.fallbacksUsed.length > 0 ? "fallback" : "ok"),
+          };
+    const statusToken = String(output?.status || "").trim().toLowerCase();
+    const routedTo = statusToken === "fallback" || /^rule:/i.test(String(runResult.model || ""))
+      ? "rules"
+      : "llm";
+    const status = statusToken === "fallback" ? "fallback" : "success";
+    const reason = status === "fallback"
+      ? firstNonEmpty(
+          Array.isArray(runResult.fallbacksUsed) ? runResult.fallbacksUsed.join(", ") : "",
+          "agent_reported_fallback"
+        )
+      : "agent_success";
+    return {
+      status,
+      routedTo,
+      reason,
+      output,
+      model: String(runResult.model || ""),
+    };
+  };
+
+  const fatigueAgent = normalizeAgent("fatigue", fatigueSettled, undefined);
+  const riskAgent = normalizeAgent("risk", riskSettled, undefined);
+  const tacticalAgent = normalizeAgent("tactical", tacticalSettled, undefined);
+
+  const fatigueOutput = fatigueAgent.output;
+  const riskOutput = riskAgent.output;
+  const tacticalOutput = tacticalAgent.output;
+  const routedToSummary =
+    [fatigueAgent, riskAgent, tacticalAgent].every((entry) => entry.status === "success" && entry.routedTo === "llm")
+      ? "llm"
+      : "mixed";
+  const combinedBriefing = buildCombinedBriefing({
+    mode,
+    telemetry: validatedValue?.telemetry,
+    fatigueOutput,
+    riskOutput,
+    tacticalOutput,
+  });
+  const suggestedAdjustments = Array.isArray(tacticalOutput?.suggestedAdjustments)
+    ? tacticalOutput.suggestedAdjustments.map((entry) => String(entry || "").trim()).filter(Boolean).slice(0, 4)
+    : [];
+  if (suggestedAdjustments.length === 0) {
+    suggestedAdjustments.push("Data missing: tactical next-over plan unavailable.");
+  }
+  const combinedDecision = {
+    immediateAction: String(tacticalOutput?.immediateAction || "Continue with monitored plan"),
+    ...(isRecord(tacticalOutput?.substitutionAdvice)
+      ? { substitutionAdvice: tacticalOutput.substitutionAdvice }
+      : {}),
+    suggestedAdjustments,
+    confidence: Number.isFinite(Number(tacticalOutput?.confidence)) ? Number(tacticalOutput.confidence) : 0.58,
+    rationale: String(
+      tacticalOutput?.rationale ||
+      "Deterministic combined briefing generated from available fatigue, risk, and tactical outputs."
+    ),
+  };
+  const signals = Array.from(
+    new Set([
+      ...(Array.isArray(fatigueOutput?.signals) ? fatigueOutput.signals : []),
+      ...(Array.isArray(riskOutput?.signals) ? riskOutput.signals : []),
+      ...(Array.isArray(tacticalOutput?.keySignalsUsed) ? tacticalOutput.keySignalsUsed : []),
+    ])
+  )
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  const errors = [
+    ...(fatigueAgent.status === "error" ? [{ agent: "fatigue", message: String(fatigueAgent.reason || "unknown error") }] : []),
+    ...(riskAgent.status === "error" ? [{ agent: "risk", message: String(riskAgent.reason || "unknown error") }] : []),
+    ...(tacticalAgent.status === "error" ? [{ agent: "tactical", message: String(tacticalAgent.reason || "unknown error") }] : []),
+  ];
+  const usedFallbackAgents = [
+    ...(fatigueAgent.routedTo === "rules" ? ["fatigue"] : []),
+    ...(riskAgent.routedTo === "rules" ? ["risk"] : []),
+    ...(tacticalAgent.routedTo === "rules" ? ["tactical"] : []),
+  ];
+  const agentResults = {
+    fatigue: {
+      status: fatigueAgent.status,
+      routedTo: fatigueAgent.routedTo,
+      ...(fatigueOutput ? { output: fatigueOutput } : {}),
+      ...(fatigueAgent.reason ? { reason: fatigueAgent.reason } : {}),
+    },
+    risk: {
+      status: riskAgent.status,
+      routedTo: riskAgent.routedTo,
+      ...(riskOutput ? { output: riskOutput } : {}),
+      ...(riskAgent.reason ? { reason: riskAgent.reason } : {}),
+    },
+    tactical: {
+      status: tacticalAgent.status,
+      routedTo: tacticalAgent.routedTo,
+      ...(tacticalOutput ? { output: tacticalOutput } : {}),
+      ...(tacticalAgent.reason ? { reason: tacticalAgent.reason } : {}),
+    },
+  };
+
+  return {
+    ok: true,
+    ...(fatigueOutput ? { fatigue: fatigueOutput } : {}),
+    ...(riskOutput ? { risk: riskOutput } : {}),
+    ...(tacticalOutput ? { tactical: tacticalOutput } : {}),
+    combinedBriefing,
+    combinedDecision,
+    finalDecision: combinedDecision,
+    strategicAnalysis: {
+      signals,
+      fatigueAnalysis: String(
+        fatigueOutput?.recommendation ||
+        fatigueOutput?.explanation ||
+        "Fatigue data missing."
+      ),
+      injuryRiskAnalysis: String(
+        riskOutput?.recommendation ||
+        riskOutput?.explanation ||
+        "Risk data missing."
+      ),
+      tacticalRecommendation: {
+        nextAction: String(combinedDecision.immediateAction),
+        why: String(combinedDecision.rationale),
+        ifIgnored: String(
+          riskOutput?.recommendation ||
+          riskOutput?.headline ||
+          "Data missing: risk context unavailable."
+        ),
+        alternatives: suggestedAdjustments.slice(0, 3),
+      },
+      coachNote: combinedBriefing,
+    },
+    routerDecision: {
+      mode: "full",
+      intent: "full",
+      agentsToRun: ["FATIGUE", "RISK", "TACTICAL"],
+      selectedAgents: ["fatigue", "risk", "tactical"],
+      routedTo: routedToSummary,
+      rulesFired: ["full_mode_forced_all_agents"],
+      inputsUsed: {
+        activePlayerId: String(validatedValue?.telemetry?.playerId || ""),
+        active: {
+          fatigueIndex: Number(validatedValue?.telemetry?.fatigueIndex || 0),
+          strainIndex: Number(validatedValue?.telemetry?.strainIndex || 0),
+          injuryRisk: String(validatedValue?.telemetry?.injuryRisk || ""),
+          noBallRisk: String(validatedValue?.telemetry?.noBallRisk || ""),
+        },
+        match: {
+          matchMode: String(validatedValue?.matchContext?.matchMode || validatedValue?.matchContext?.teamMode || ""),
+          format: String(validatedValue?.matchContext?.format || ""),
+          phase: String(validatedValue?.matchContext?.phase || ""),
+          overs: Number(validatedValue?.matchContext?.overs || 0),
+          balls: Number(validatedValue?.matchContext?.balls || 0),
+          scoreRuns: Number(validatedValue?.matchContext?.score || 0),
+          wickets: Number(validatedValue?.matchContext?.wickets || 0),
+          targetRuns: Number(validatedValue?.matchContext?.target || 0),
+          intensity: String(validatedValue?.matchContext?.intensity || ""),
+        },
+      },
+      reason: "Full mode forces fatigue, risk, and tactical in parallel.",
+      signals: {
+        fatigueIndex: Number(validatedValue?.telemetry?.fatigueIndex || 0),
+        injuryRisk: String(validatedValue?.telemetry?.injuryRisk || ""),
+        noBallRisk: String(validatedValue?.telemetry?.noBallRisk || ""),
+        oversBowled: Number(validatedValue?.telemetry?.oversBowled || 0),
+      },
+      agents: {
+        fatigue: { routedTo: fatigueAgent.routedTo, reason: String(fatigueAgent.reason || "") },
+        risk: { routedTo: riskAgent.routedTo, reason: String(riskAgent.reason || "") },
+        tactical: { routedTo: tacticalAgent.routedTo, reason: String(tacticalAgent.reason || "") },
+      },
+    },
+    agentResults,
+    agents: {
+      fatigue: { status: fatigueAgent.status === "success" ? "OK" : fatigueAgent.status === "fallback" ? "FALLBACK" : "ERROR" },
+      risk: { status: riskAgent.status === "success" ? "OK" : riskAgent.status === "fallback" ? "FALLBACK" : "ERROR" },
+      tactical: { status: tacticalAgent.status === "success" ? "OK" : tacticalAgent.status === "fallback" ? "FALLBACK" : "ERROR" },
+    },
+    errors,
+    warnings: errors.length > 0 ? ["Some agent outputs are missing; briefing uses available data."] : [],
+    meta: {
+      requestId: traceId,
+      mode: "full",
+      executedAgents: ["fatigue", "risk", "tactical"],
+      modelRouting: {
+        fatigueModel: fatigueAgent.model || "error",
+        riskModel: riskAgent.model || "error",
+        tacticalModel: tacticalAgent.model || "error",
+        fallbacksUsed: usedFallbackAgents.map((agent) => `${agent}:rules`),
+      },
+      usedFallbackAgents,
+      timingsMs: {
+        total: 0,
+      },
+    },
+  };
+};
 const buildDeterministicRouterDecision = (mode, validatedValue) => {
   const fatigueIndex = Number(validatedValue?.telemetry?.fatigueIndex || 0);
   const strainIndex = Number(validatedValue?.telemetry?.strainIndex || 0);
-  const oversBowled = Number(validatedValue?.telemetry?.oversBowled || 0);
+  const fatigueLimit = Number(validatedValue?.telemetry?.fatigueLimit || 6);
+  const projectedFatigueNextOver = Number(Math.max(0, Math.min(10, fatigueIndex + Math.max(0, strainIndex) * 0.15 + 0.6)).toFixed(1));
   const injuryRisk = normalizeRiskToken(validatedValue?.telemetry?.injuryRisk);
   const noBallRisk = normalizeRiskToken(validatedValue?.telemetry?.noBallRisk);
   const selected = new Set(["tactical"]);
   const triggers = [];
+  const fatigueTriggered = fatigueIndex >= 6 || projectedFatigueNextOver >= fatigueLimit || strainIndex >= 3;
+  const riskTriggered = injuryRisk !== "LOW" || noBallRisk !== "LOW";
 
-  if (fatigueIndex >= 5 || strainIndex >= 3 || oversBowled >= 2) {
+  if (fatigueTriggered) {
     selected.add("fatigue");
-    triggers.push("fatigue_or_workload_signal");
+    triggers.push("fatigue_triggered");
   }
-  if (injuryRisk !== "LOW" || noBallRisk !== "LOW" || fatigueIndex >= 6 || strainIndex >= 4) {
+  if (riskTriggered) {
     selected.add("risk");
-    triggers.push("risk_or_control_signal");
+    triggers.push("risk_triggered");
   }
   triggers.push("tactical_always_on");
   if (mode === "full") {
@@ -498,7 +872,7 @@ const buildDeterministicRouterDecision = (mode, validatedValue) => {
   let intent = "Monitor";
   if (noBallRisk !== "LOW") intent = "Control No-Balls";
   else if (injuryRisk !== "LOW") intent = "Injury Prevention";
-  else if (fatigueIndex >= 5) intent = "Workload Control";
+  else if (fatigueTriggered) intent = "Workload Control";
 
   const selectedAgents = ["fatigue", "risk", "tactical"].filter((agent) => selected.has(agent));
   return {
@@ -532,7 +906,8 @@ const buildDeterministicRouterDecision = (mode, validatedValue) => {
       strainIndex,
       injuryRisk,
       noBallRisk,
-      oversBowled,
+      projectedFatigueNextOver,
+      fatigueLimit,
     },
   };
 };
@@ -695,8 +1070,8 @@ try {
 }
 
 const app = express();
-const parsedPort = Number(process.env.PORT || process.env.API_PORT || 5176);
-const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 5176;
+const parsedPort = Number(process.env.PORT || process.env.API_PORT || 8080);
+const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8080;
 
 app.use((req, res, next) => {
   const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
@@ -1514,417 +1889,196 @@ app.post("/api/agents/tactical", async (req, res) => {
 const orchestrateHandler = async (req, res) => {
   const startedAt = Date.now();
   const traceId = randomUUID();
-  const routingLabel = "Routing: rules-based (safe fallback)";
+  if (!ensureBackendLoaded(res)) return;
 
   try {
     const rawPayload = isRecord(req.body) ? req.body : {};
-    const telemetry = isRecord(rawPayload.telemetry) ? rawPayload.telemetry : {};
-    const matchContext = isRecord(rawPayload.matchContext) ? rawPayload.matchContext : {};
-    const players = isRecord(rawPayload.players) ? rawPayload.players : {};
-    const mode = String(rawPayload.mode || "auto").toLowerCase() === "full" ? "full" : "auto";
-
-    const fatigueIndex = Math.max(
-      0,
-      Math.min(10, toNum(telemetry.fatigueIndex, toNum(rawPayload?.signals?.fatigueIndex, 0)))
-    );
-    const strainIndex = Math.max(
-      0,
-      Math.min(10, toNum(telemetry.strainIndex, toNum(rawPayload?.signals?.strainIndex, 0)))
-    );
-    const oversBowled = Math.max(0, toNum(telemetry.oversBowled, toNum(rawPayload?.signals?.oversBowled, 0)));
-    const injuryRisk = normalizeRiskToken(telemetry.injuryRisk ?? rawPayload?.signals?.injuryRisk);
-    const noBallRisk = normalizeRiskToken(telemetry.noBallRisk ?? rawPayload?.signals?.noBallRisk);
-
-    const decision = buildDeterministicRouterDecision(mode, {
-      telemetry: {
-        fatigueIndex,
-        strainIndex,
-        oversBowled,
-        injuryRisk,
-        noBallRisk,
-        playerId: telemetry.playerId || "",
-      },
-      matchContext: {
-        matchMode: matchContext.matchMode || rawPayload.teamMode || "",
-        format: matchContext.format || "",
-        phase: matchContext.phase || "",
-        overs: toNum(matchContext.overs, 0),
-        balls: toNum(matchContext.balls, 0),
-        score: toNum(matchContext.score, 0),
-        wickets: toNum(matchContext.wickets, 0),
-        target: toNum(matchContext.target, 0),
-        intensity: matchContext.intensity || "",
-      },
-    });
-    const selectedAgents = normalizeSelectedLegacyAgents(decision.selectedAgents, mode === "full");
-    const runFlags = {
-      fatigue: selectedAgents.includes("fatigue"),
-      risk: selectedAgents.includes("risk"),
-      tactical: true,
-    };
-
-    const normalizedContextResult = normalizeFullMatchContext(rawPayload.context);
-    const fullMatchContext = normalizedContextResult.ok ? normalizedContextResult.value : undefined;
-    const replacementCandidates = fullMatchContext ? pickReplacementCandidates(fullMatchContext, 2) : [];
-
-    const fatigueRequest = sanitizeFatigueRequest({
-      ...telemetry,
-      matchContext,
-      context: fullMatchContext,
-    });
-    const riskRequest = sanitizeRiskRequest({
-      ...telemetry,
-      ...matchContext,
-      context: fullMatchContext,
-    });
-    const tacticalInput = {
-      requestId: traceId,
-      intent: String(rawPayload.intent || "monitor"),
-      teamMode: String(rawPayload.teamMode || matchContext.matchMode || "BOWLING"),
-      focusRole: String(rawPayload.focusRole || "BOWLER"),
-      telemetry: {
-        playerId: String(telemetry.playerId || "UNKNOWN"),
-        playerName: String(telemetry.playerName || "Unknown Player"),
-        role: String(telemetry.role || "Unknown Role"),
-        fatigueIndex,
-        strainIndex,
-        injuryRisk,
-        noBallRisk,
-        oversBowled,
-        consecutiveOvers: Math.max(0, toNum(telemetry.consecutiveOvers, 0)),
-        oversRemaining: Math.max(0, toNum(telemetry.oversRemaining, 0)),
-        maxOvers: Math.max(1, toNum(telemetry.maxOvers, 4)),
-        quotaComplete: Boolean(telemetry.quotaComplete),
-        heartRateRecovery: String(telemetry.heartRateRecovery || "Moderate"),
-        fatigueLimit: Math.max(0, toNum(telemetry.fatigueLimit, 6)),
-        sleepHours: Math.max(0, toNum(telemetry.sleepHours, 7)),
-        recoveryMinutes: Math.max(0, toNum(telemetry.recoveryMinutes, 45)),
-        isUnfit: Boolean(telemetry.isUnfit),
-      },
-      matchContext: {
-        matchMode: String(matchContext.matchMode || rawPayload.teamMode || "BOWLING"),
-        format: String(matchContext.format || "T20"),
-        phase: String(matchContext.phase || "middle"),
-        intensity: String(matchContext.intensity || "Medium"),
-        requiredRunRate: toNum(matchContext.requiredRunRate, 0),
-        currentRunRate: toNum(matchContext.currentRunRate, 0),
-        wicketsInHand: toNum(matchContext.wicketsInHand, 0),
-        oversRemaining: toNum(matchContext.oversRemaining, 0),
-        target: Number.isFinite(toNum(matchContext.target, NaN)) ? toNum(matchContext.target, 0) : undefined,
-        score: Number.isFinite(toNum(matchContext.score, NaN)) ? toNum(matchContext.score, 0) : undefined,
-        over: Number.isFinite(toNum(matchContext.over, NaN)) ? toNum(matchContext.over, 0) : undefined,
-        balls: Number.isFinite(toNum(matchContext.balls, NaN)) ? toNum(matchContext.balls, 0) : undefined,
-      },
-      players: {
-        striker: String(players.striker || "Striker"),
-        nonStriker: String(players.nonStriker || "Non-striker"),
-        bowler: String(players.bowler || telemetry.playerName || "Bowler"),
-        bench: Array.isArray(players.bench) ? players.bench : [],
-      },
-      ...(fullMatchContext ? { context: fullMatchContext } : {}),
-      ...(replacementCandidates.length > 0 ? { replacementCandidates } : {}),
-    };
-
-    const fatiguePromise =
-      runFlags.fatigue && backend
-        ? withTimeout(backend.runFatigueAgent(fatigueRequest), 12000, "fatigue-agent")
-        : Promise.resolve(null);
-    const riskPromise =
-      runFlags.risk && backend
-        ? withTimeout(backend.runRiskAgent(riskRequest), 12000, "risk-agent")
-        : Promise.resolve(null);
-    const tacticalPromise =
-      runFlags.tactical && backend
-        ? withTimeout(backend.runTacticalAgent(tacticalInput), 12000, "tactical-agent")
-        : Promise.resolve(null);
-
-    const [fatigueSettled, riskSettled, tacticalSettled] = await Promise.allSettled([
-      fatiguePromise,
-      riskPromise,
-      tacticalPromise,
-    ]);
-
-    const errors = [];
-    const warnings = [];
-    const usedFallbackAgents = [];
-    const getErrorMessage = (reason) => sanitizeErrorMessage(reason || "Agent call failed");
-
-    let fatigueOutput;
-    let riskOutput;
-    let tacticalOutput;
-    let fatigueStatus = runFlags.fatigue ? "ERROR" : "SKIPPED";
-    let riskStatus = runFlags.risk ? "ERROR" : "SKIPPED";
-    let tacticalStatus = "ERROR";
-
-    if (runFlags.fatigue) {
-      if (fatigueSettled.status === "fulfilled" && isRecord(fatigueSettled.value?.output)) {
-        fatigueOutput = fatigueSettled.value.output;
-        const token = String(fatigueOutput.status || "ok").toUpperCase();
-        fatigueStatus = token === "FALLBACK" ? "FALLBACK" : token === "ERROR" ? "ERROR" : "OK";
-      } else {
-        const message =
-          fatigueSettled.status === "rejected"
-            ? getErrorMessage(fatigueSettled.reason)
-            : backend
-              ? "Fatigue agent returned no output."
-              : "Fatigue agent unavailable.";
-        errors.push({ agent: "fatigue", message });
-      }
+    let payload = rawPayload;
+    try {
+      payload = await applyStoredBaselineToPayload(rawPayload);
+    } catch (baselineError) {
+      console.warn(
+        `[orchestrate:${traceId}] baseline enrichment skipped`,
+        baselineError instanceof Error ? baselineError.message : String(baselineError)
+      );
     }
 
-    if (runFlags.risk) {
-      if (riskSettled.status === "fulfilled" && isRecord(riskSettled.value?.output)) {
-        riskOutput = riskSettled.value.output;
-        const token = String(riskOutput.status || "ok").toUpperCase();
-        riskStatus = token === "FALLBACK" ? "FALLBACK" : token === "ERROR" ? "ERROR" : "OK";
-      } else {
-        const message =
-          riskSettled.status === "rejected"
-            ? getErrorMessage(riskSettled.reason)
-            : backend
-              ? "Risk agent returned no output."
-              : "Risk agent unavailable.";
-        errors.push({ agent: "risk", message });
-      }
+    const validated = backend.validateOrchestrateRequest(payload);
+    if (!validated.ok) {
+      return res.status(400).json({
+        ok: false,
+        traceId,
+        error: "invalid_request",
+        message: validated.message,
+      });
     }
 
-    if (tacticalSettled.status === "fulfilled" && isRecord(tacticalSettled.value?.output)) {
-      tacticalOutput = tacticalSettled.value.output;
-      const token = String(tacticalOutput.status || "ok").toUpperCase();
-      tacticalStatus = token === "FALLBACK" ? "FALLBACK" : token === "ERROR" ? "ERROR" : "OK";
-    } else {
-      if (tacticalSettled.status === "rejected") {
-        errors.push({ agent: "tactical", message: getErrorMessage(tacticalSettled.reason) });
-      }
-      tacticalOutput = {
-        status: "fallback",
-        immediateAction: "Apply tactical control and reassess after one over.",
-        rationale: "Rules-based routing kept tactical guidance active while deeper modules were partially unavailable.",
-        suggestedAdjustments: [
-          "Reduce execution variance in the next over and protect line and length.",
-          "Shorten high-intensity spell duration and re-check signals after one over.",
-          "Rotate if no-ball or injury trend rises in the next phase.",
-        ],
-        confidence: 0.64,
-        keySignalsUsed: decision.rulesFired,
-      };
-      tacticalStatus = "FALLBACK";
-      usedFallbackAgents.push("tactical");
-      warnings.push("Tactical fallback used.");
+    const missingAzure = getMissingAzureEnvVars();
+    if (missingAzure.length > 0) {
+      console.error(`[orchestrate:${traceId}] Azure env missing; per-agent rules fallback will be used.`, {
+        missingAzure,
+      });
     }
+    const requestMode = String(validated.value?.mode || "auto").toLowerCase() === "full" ? "full" : "auto";
+    if (requestMode === "full") {
+      const result = await withTimeout(
+        runFullCombinedOrchestrate(validated.value, traceId),
+        30000,
+        "orchestrate-full"
+      );
+      const routedAgents = Array.isArray(result?.routerDecision?.selectedAgents)
+        ? result.routerDecision.selectedAgents
+        : ["fatigue", "risk", "tactical"];
+      const executedAgents = Array.isArray(result?.meta?.executedAgents)
+        ? result.meta.executedAgents
+        : routedAgents;
+      console.log("[orchestrate][routing]", {
+        mode: "full",
+        intent: String(result?.routerDecision?.intent || validated.value?.intent || "GENERAL"),
+        forceAllAgents: true,
+        agentsToRun: routedAgents,
+        executedAgents,
+      });
+      const totalMs = Date.now() - startedAt;
+      const existingMeta = isRecord(result?.meta) ? result.meta : {};
+      const existingMetaTimings = isRecord(existingMeta.timingsMs) ? existingMeta.timingsMs : {};
 
-    const combinedSignals = Array.from(
-      new Set([
-        ...decision.rulesFired,
-        ...(Array.isArray(fatigueOutput?.signals) ? fatigueOutput.signals.map((entry) => String(entry || "")) : []),
-        ...(Array.isArray(riskOutput?.signals) ? riskOutput.signals.map((entry) => String(entry || "")) : []),
-        ...(Array.isArray(tacticalOutput?.keySignalsUsed)
-          ? tacticalOutput.keySignalsUsed.map((entry) => String(entry || ""))
-          : []),
-      ])
-    )
-      .map((entry) => entry.trim())
-      .filter(Boolean)
-      .slice(0, 7);
-
-    const combined = {
-      signals: combinedSignals,
-      fatigueAnalysis: fatigueOutput
-        ? String(fatigueOutput.recommendation || fatigueOutput.explanation || "Fatigue signal reviewed.")
-        : "Fatigue module did not return output in this run; tactical guidance is based on available workload signals.",
-      injuryRiskAnalysis: riskOutput
-        ? String(riskOutput.recommendation || riskOutput.explanation || riskOutput.headline || "Risk signal reviewed.")
-        : "Risk module did not return output in this run; control-first tactical guidance is active.",
-      tacticalRecommendation: {
-        nextAction: String(tacticalOutput.immediateAction || "Apply tactical control and reassess after one over."),
-        why: String(tacticalOutput.rationale || "Rules-based tactical fallback is active."),
-        ifIgnored:
-          String(tacticalOutput.suggestedAdjustments?.[0] || "")
-            .trim() || "Execution risk may compound in the next phase.",
-        alternatives: Array.isArray(tacticalOutput.suggestedAdjustments)
-          ? tacticalOutput.suggestedAdjustments.map((entry) => String(entry)).slice(0, 4)
-          : [],
-      },
-      coachNote: "Routing uses deterministic safety rules to guarantee tactical continuity.",
-    };
-
-    const responseBody = {
-      ok: true,
-      traceId,
-      source: "mock",
-      router: {
-        available: true,
-        usedFallback: true,
-        intent: decision.intent,
-        selectedAgents,
-        triggers: decision.rulesFired,
-      },
-      routerDecision: {
-        intent: decision.intent,
-        agentsToRun: selectedAgents.map((agent) => toAgentCode(agent)),
-        selectedAgents,
-        signalSummaryBullets: combined.signals,
-        rationale: routingLabel,
-        rulesFired: decision.rulesFired,
-        inputsUsed: decision.inputsUsed,
-        reason: routingLabel,
-        signals: decision.signals,
-      },
-      agentsRun: selectedAgents.map((agent) => toAgentCode(agent)),
-      agents: {
-        fatigue: { status: fatigueStatus },
-        risk: { status: riskStatus },
-        tactical: { status: tacticalStatus },
-      },
-      outputs: {
-        fatigue: runFlags.fatigue
-          ? fatigueOutput
-            ? { ok: true, data: fatigueOutput, text: String(fatigueOutput.recommendation || fatigueOutput.headline || "") }
-            : { ok: false, error: errors.find((entry) => entry.agent === "fatigue")?.message || "Fatigue agent failed." }
-          : { ok: false, error: "Fatigue agent not selected." },
-        risk: runFlags.risk
-          ? riskOutput
-            ? { ok: true, data: riskOutput, text: String(riskOutput.recommendation || riskOutput.headline || "") }
-            : { ok: false, error: errors.find((entry) => entry.agent === "risk")?.message || "Risk agent failed." }
-          : { ok: false, error: "Risk agent not selected." },
-        tactical: tacticalOutput
-          ? {
-              ok: true,
-              data: tacticalOutput,
-              recommendation: {
-                nextAction: String(tacticalOutput.immediateAction || ""),
-                why: String(tacticalOutput.rationale || ""),
-                ifIgnored: String(tacticalOutput.suggestedAdjustments?.[0] || ""),
-                alternatives: Array.isArray(tacticalOutput.suggestedAdjustments)
-                  ? tacticalOutput.suggestedAdjustments.slice(0, 3).map((entry) => String(entry))
-                  : [],
-              },
-            }
-          : { ok: false, error: "Tactical output unavailable." },
-      },
-      ...(fatigueOutput ? { fatigue: fatigueOutput } : {}),
-      ...(riskOutput ? { risk: riskOutput } : {}),
-      tactical: tacticalOutput,
-      combined,
-      strategicAnalysis: combined,
-      finalDecision: {
-        immediateAction: String(combined.tacticalRecommendation.nextAction || ""),
-        suggestedAdjustments: combined.tacticalRecommendation.alternatives,
-        confidence: Number.isFinite(Number(tacticalOutput?.confidence)) ? Number(tacticalOutput.confidence) : 0.64,
-        rationale: String(combined.tacticalRecommendation.why || ""),
-      },
-      combinedDecision: {
-        immediateAction: String(combined.tacticalRecommendation.nextAction || ""),
-        suggestedAdjustments: combined.tacticalRecommendation.alternatives,
-        confidence: Number.isFinite(Number(tacticalOutput?.confidence)) ? Number(tacticalOutput.confidence) : 0.64,
-        rationale: String(combined.tacticalRecommendation.why || ""),
-      },
-      errors,
-      meta: {
-        requestId: traceId,
-        mode,
-        executedAgents: selectedAgents,
-        modelRouting: {
-          fatigueModel: runFlags.fatigue ? "rules-based-router" : "skipped:not-selected",
-          riskModel: runFlags.risk ? "rules-based-router" : "skipped:not-selected",
-          tacticalModel: "rules-based-router",
-          fallbacksUsed: ["rules-based-router"],
-        },
-        usedFallbackAgents,
-        routerFallbackMessage: routingLabel,
+      return res.status(200).json({
+        ...result,
+        ok: true,
+        traceId: String(result?.traceId || traceId),
         timingsMs: {
-          total: Date.now() - startedAt,
+          ...(isRecord(result?.timingsMs) ? result.timingsMs : {}),
+          total: totalMs,
+        },
+        meta: {
+          ...existingMeta,
+          requestId: String(existingMeta.requestId || traceId),
+          mode: "full",
+          timingsMs: {
+            ...existingMetaTimings,
+            total: totalMs,
+          },
+        },
+      });
+    }
+
+    const result = await withTimeout(
+      backend.orchestrateAgents(validated.value, createInvocationContext()),
+      30000,
+      "orchestrate"
+    );
+    const routedAgents = Array.isArray(result?.routerDecision?.selectedAgents)
+      ? result.routerDecision.selectedAgents
+      : ["tactical"];
+    const executedAgents = Array.isArray(result?.meta?.executedAgents)
+      ? result.meta.executedAgents
+      : routedAgents;
+    console.log("[orchestrate][routing]", {
+      mode: requestMode,
+      intent: String(result?.routerDecision?.intent || validated.value?.intent || "GENERAL"),
+      forceAllAgents: requestMode === "full",
+      agentsToRun: routedAgents,
+      executedAgents,
+    });
+    const totalMs = Date.now() - startedAt;
+    const existingMeta = isRecord(result?.meta) ? result.meta : {};
+    const existingMetaTimings = isRecord(existingMeta.timingsMs) ? existingMeta.timingsMs : {};
+
+    return res.status(200).json({
+      ...result,
+      ok: true,
+      traceId: String(result?.traceId || traceId),
+      timingsMs: {
+        ...(isRecord(result?.timingsMs) ? result.timingsMs : {}),
+        total: totalMs,
+      },
+      meta: {
+        ...existingMeta,
+        requestId: String(existingMeta.requestId || traceId),
+        timingsMs: {
+          ...existingMetaTimings,
+          total: totalMs,
         },
       },
-      ...(warnings.length > 0 ? { warnings } : {}),
-      timingsMs: {
-        total: Date.now() - startedAt,
-      },
-    };
-
-    return res.status(200).json(responseBody);
+    });
   } catch (error) {
-    console.error("[orchestrate][deterministic-crash]", error?.stack || error);
-    const tacticalFallback = {
-      status: "fallback",
-      immediateAction: "Apply tactical control and reassess after one over.",
-      rationale: "Rules-based fallback remained active after orchestrate error.",
-      suggestedAdjustments: [
-        "Use conservative tactical execution for the next over.",
-        "Re-run analysis after one over.",
-      ],
-      confidence: 0.58,
-      keySignalsUsed: ["orchestrate_error_fallback"],
-    };
+    console.error("[orchestrate] error", sanitizeErrorMessage(error));
+    console.error("[orchestrate][crash]", error?.stack || error);
+    const missingAzure = getMissingAzureEnvVars();
+    const missingCosmos = getMissingRequiredCosmosEnv();
+    if (missingAzure.length > 0 || missingCosmos.length > 0) {
+      console.error(
+        `[orchestrate:${traceId}] missing env vars`,
+        { azure: missingAzure, cosmos: missingCosmos }
+      );
+    }
+    const totalMs = Date.now() - startedAt;
+    const mode = String(req?.body?.mode || "auto").toLowerCase() === "full" ? "full" : "auto";
+    const errorMessage = sanitizeErrorMessage(error);
+    const combinedBriefing = `Combined analysis completed with orchestrate fallback: ${errorMessage}`;
     return res.status(200).json({
       ok: true,
       traceId,
-      source: "mock",
-      router: {
-        available: true,
-        usedFallback: true,
-        intent: "Monitor",
-        selectedAgents: ["tactical"],
-        triggers: ["orchestrate_error_fallback"],
+      combinedBriefing,
+      warnings: [combinedBriefing],
+      agentResults: {
+        fatigue: { status: "error", routedTo: "rules", error: errorMessage, reason: "orchestrate_exception" },
+        risk: { status: "error", routedTo: "rules", error: errorMessage, reason: "orchestrate_exception" },
+        tactical: { status: "error", routedTo: "rules", error: errorMessage, reason: "orchestrate_exception" },
+      },
+      agents: {
+        fatigue: { status: "ERROR" },
+        risk: { status: "ERROR" },
+        tactical: { status: "ERROR" },
+      },
+      errors: [
+        { agent: "fatigue", message: errorMessage },
+        { agent: "risk", message: errorMessage },
+        { agent: "tactical", message: errorMessage },
+      ],
+      combinedDecision: {
+        immediateAction: "Continue with monitored plan",
+        suggestedAdjustments: [combinedBriefing],
+        confidence: 0.55,
+        rationale: "orchestrate_exception",
       },
       routerDecision: {
-        intent: "Monitor",
-        agentsToRun: ["TACTICAL"],
-        selectedAgents: ["tactical"],
-        signalSummaryBullets: ["orchestrate_error_fallback"],
-        rationale: routingLabel,
-        rulesFired: ["orchestrate_error_fallback"],
-        inputsUsed: { active: {}, match: {} },
-        reason: routingLabel,
-        signals: {},
-      },
-      agentsRun: ["TACTICAL"],
-      agents: {
-        fatigue: { status: "SKIPPED" },
-        risk: { status: "SKIPPED" },
-        tactical: { status: "FALLBACK" },
-      },
-      outputs: {
-        fatigue: { ok: false, error: "Fatigue agent not selected." },
-        risk: { ok: false, error: "Risk agent not selected." },
-        tactical: { ok: true, data: tacticalFallback },
-      },
-      tactical: tacticalFallback,
-      strategicAnalysis: {
-        signals: ["orchestrate_error_fallback"],
-        fatigueAnalysis: "Fatigue analysis unavailable in this run.",
-        injuryRiskAnalysis: "Risk analysis unavailable in this run.",
-        tacticalRecommendation: {
-          nextAction: tacticalFallback.immediateAction,
-          why: tacticalFallback.rationale,
-          ifIgnored: tacticalFallback.suggestedAdjustments[0],
-          alternatives: tacticalFallback.suggestedAdjustments,
+        mode,
+        intent: "GENERAL",
+        selectedAgents: ["fatigue", "risk", "tactical"],
+        agentsToRun: ["FATIGUE", "RISK", "TACTICAL"],
+        rulesFired: ["orchestrate_exception"],
+        inputsUsed: {
+          active: {},
+          match: {},
         },
-        coachNote: "Routing uses deterministic fallback while recovering from a transient backend error.",
+        reason: combinedBriefing,
+        signals: {},
+        agents: {
+          fatigue: { routedTo: "rules", reason: "orchestrate_exception" },
+          risk: { routedTo: "rules", reason: "orchestrate_exception" },
+          tactical: { routedTo: "rules", reason: "orchestrate_exception" },
+        },
       },
-      combinedDecision: {
-        immediateAction: tacticalFallback.immediateAction,
-        suggestedAdjustments: tacticalFallback.suggestedAdjustments,
-        confidence: tacticalFallback.confidence,
-        rationale: tacticalFallback.rationale,
+      missingEnv: {
+        azure: missingAzure,
+        cosmos: missingCosmos,
       },
-      errors: [],
+      timingsMs: { total: totalMs },
       meta: {
         requestId: traceId,
-        mode: "auto",
-        executedAgents: ["tactical"],
+        mode,
+        executedAgents: [],
         modelRouting: {
-          fatigueModel: "skipped:not-selected",
-          riskModel: "skipped:not-selected",
-          tacticalModel: "rules-based-router",
-          fallbacksUsed: ["rules-based-router", "orchestrate_error_fallback"],
+          fatigueModel: "error",
+          riskModel: "error",
+          tacticalModel: "error",
+          fallbacksUsed: ["orchestrate_exception"],
         },
-        usedFallbackAgents: ["tactical"],
-        routerFallbackMessage: routingLabel,
-        timingsMs: { total: Date.now() - startedAt },
+        usedFallbackAgents: ["fatigue", "risk", "tactical"],
+        timingsMs: { total: totalMs },
       },
-      warnings: ["Routing: rules-based (safe fallback)"],
-      timingsMs: { total: Date.now() - startedAt },
     });
   }
 };

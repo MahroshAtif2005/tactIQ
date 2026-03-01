@@ -31,7 +31,7 @@ const loadedEnvFiles = loadEnvFiles();
 
 const appId = process.env.MicrosoftAppId || process.env.MICROSOFT_APP_ID || '';
 const appPassword = process.env.MicrosoftAppPassword || process.env.MICROSOFT_APP_PASSWORD || '';
-const port = Number(process.env.PORT || 8080);
+const port = Number(process.env.PORT || 3978);
 const existingApiBaseUrl = process.env.EXISTING_API_BASE_URL || 'http://localhost:7071';
 const cosmosDiagnostics = getCosmosDiagnostics();
 
@@ -55,14 +55,48 @@ adapter.onTurnError = async (turnContext: TurnContext, error: Error) => {
 const agentsClient = new ExistingAgentsClient(existingApiBaseUrl);
 const bot = new CoachOrchestratorBot(agentsClient);
 
+const defaultCorsOrigins = [
+  'http://localhost:5176',
+  'http://127.0.0.1:5176',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+];
+const configuredCorsOrigins = String(process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter((origin) => origin.length > 0);
+const deployedCorsOrigins = [
+  process.env.FRONTEND_ORIGIN,
+  process.env.WEB_ORIGIN,
+  process.env.VITE_FRONTEND_ORIGIN,
+  process.env.APP_ORIGIN,
+]
+  .map((origin) => String(origin || '').trim())
+  .filter((origin) => origin.length > 0);
+const allowedCorsOrigins = new Set([...defaultCorsOrigins, ...configuredCorsOrigins, ...deployedCorsOrigins]);
+
+const setCorsHeaders = (res: express.Response, origin: string): void => {
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+};
+
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+  if (origin && allowedCorsOrigins.has(origin)) {
+    setCorsHeaders(res, origin);
+  }
   if (req.method === 'OPTIONS') {
-    res.status(204).end();
+    if (!origin || allowedCorsOrigins.has(origin)) {
+      res.status(204).end();
+      return;
+    }
+    res.status(403).json({ error: 'CORS origin not allowed' });
     return;
   }
   next();
@@ -213,6 +247,57 @@ apiRouter.get('/baselines', async (_req, res) => {
   }
 });
 
+apiRouter.get('/baselines/:id', async (req, res) => {
+  try {
+    const idRaw = String(req.params.id || '');
+    const id = decodeURIComponent(idRaw).trim();
+    if (!id) {
+      res.status(400).json({ error: 'Baseline id is required' });
+      return;
+    }
+    const lowered = id.toLowerCase();
+
+    const container = await getCosmosContainerOrNull();
+    if (!container) {
+      fallbackBaselines = loadFallbackBaselines();
+      const found = fallbackBaselines.find(
+        (row) => row.id.toLowerCase() === lowered || row.name.toLowerCase() === lowered
+      );
+      if (!found) {
+        res.status(404).json({ error: 'Baseline not found', source: 'fallback' });
+        return;
+      }
+      res.status(200).json({
+        player: toPublicBaseline(found),
+        source: 'fallback',
+        warning: getFallbackWarning(),
+      });
+      return;
+    }
+
+    const querySpec = {
+      query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@id', value: lowered },
+      ],
+    };
+    const { resources } = await container.items.query(querySpec).fetchAll();
+    const row = Array.isArray(resources) && resources.length > 0 ? resources[0] : null;
+    if (!row) {
+      res.status(404).json({ error: 'Baseline not found', source: 'cosmos' });
+      return;
+    }
+    res.status(200).json({
+      player: toPublicBaseline(row),
+      source: 'cosmos',
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({ error: 'Failed to load baseline', details: message });
+  }
+});
+
 apiRouter.get('/roster', async (_req, res) => {
   try {
     const container = await getCosmosContainerOrNull();
@@ -299,6 +384,80 @@ const saveBaselines = async (req: express.Request, res: express.Response) => {
 
 apiRouter.post('/baselines', saveBaselines);
 apiRouter.put('/baselines', saveBaselines);
+
+apiRouter.put('/baselines/:id', async (req, res) => {
+  try {
+    const idRaw = String(req.params.id || '');
+    const id = decodeURIComponent(idRaw).trim();
+    if (!id) {
+      res.status(400).json({ error: 'Baseline id is required' });
+      return;
+    }
+    const lowered = id.toLowerCase();
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? (req.body as Record<string, unknown>)
+      : {};
+
+    const buildDoc = (existing?: Record<string, unknown>): PlayerBaselineDoc =>
+      normalizeBaselineDoc({
+        ...(existing || {}),
+        id: String(existing?.id || id).trim() || id,
+        name: String(body.name || existing?.name || id).trim() || id,
+        role: body.role ?? existing?.role,
+        sleep: body.sleep ?? body.sleepHoursToday ?? body.sleepHours ?? existing?.sleep,
+        recovery: body.recovery ?? body.recoveryMinutes ?? existing?.recovery,
+        fatigueLimit: body.fatigueLimit ?? existing?.fatigueLimit,
+        control: body.control ?? body.controlBaseline ?? existing?.control,
+        speed: body.speed ?? existing?.speed,
+        power: body.power ?? existing?.power,
+        active: typeof body.active === 'boolean' ? body.active : existing?.active,
+        inRoster:
+          typeof body.inRoster === 'boolean'
+            ? body.inRoster
+            : typeof body.roster === 'boolean'
+              ? body.roster
+              : existing?.inRoster,
+      });
+
+    const container = await getCosmosContainerOrNull();
+    if (!container) {
+      const existing = fallbackBaselines.find(
+        (row) => row.id.toLowerCase() === lowered || row.name.toLowerCase() === lowered
+      );
+      const doc = buildDoc(existing as Record<string, unknown> | undefined);
+      const remaining = fallbackBaselines.filter(
+        (row) => row.id.toLowerCase() !== lowered && row.name.toLowerCase() !== lowered
+      );
+      fallbackBaselines = dedupeBaselinesById([...remaining, doc]);
+      persistFallbackBaselines(fallbackBaselines);
+      res.status(200).json({
+        ok: true,
+        player: toPublicBaseline(doc),
+        source: 'fallback',
+        warning: getFallbackWarning(),
+      });
+      return;
+    }
+
+    const querySpec = {
+      query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@id', value: lowered },
+      ],
+    };
+    const { resources } = await container.items.query(querySpec).fetchAll();
+    const existing = Array.isArray(resources) && resources.length > 0
+      ? (resources[0] as Record<string, unknown>)
+      : undefined;
+    const doc = buildDoc(existing);
+    await container.items.upsert(doc, { partitionKey: doc.id });
+    res.status(200).json({ ok: true, player: toPublicBaseline(doc), source: 'cosmos' });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({ error: 'Failed to save baseline', details: message });
+  }
+});
 
 apiRouter.delete('/baselines/:id', async (req, res) => {
   try {
@@ -489,14 +648,70 @@ apiRouter.post('/messages', async (req, res) => {
   });
 });
 
+apiRouter.post('/analysis/full', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? (req.body as Record<string, unknown>)
+      : {};
+    const context = body.context && typeof body.context === 'object' && !Array.isArray(body.context)
+      ? (body.context as Record<string, unknown>)
+      : {};
+    const roster = Array.isArray(context.roster) ? context.roster : [];
+    const activePlayerId = String(context.activePlayerId || '').trim();
+    const active = roster.find((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+      const row = entry as Record<string, unknown>;
+      return String(row.playerId || '').trim() === activePlayerId;
+    });
+    const activeBaseline =
+      active && typeof active === 'object' && !Array.isArray(active)
+        ? (active as Record<string, unknown>).baseline
+        : null;
+    const baselineFromBody = body.baseline && typeof body.baseline === 'object' && !Array.isArray(body.baseline)
+      ? body.baseline
+      : null;
+    console.log('[analysis] baseline', baselineFromBody || activeBaseline || null);
+    const payload = {
+      ...body,
+      mode: 'full',
+    };
+    const result = await agentsClient.run('all', payload);
+    const hasNarrative =
+      Boolean(result.strategicAnalysis) ||
+      Boolean(result.fatigue) ||
+      Boolean(result.risk) ||
+      Boolean(result.tactical);
+    if (!hasNarrative) {
+      res.status(502).json({
+        error: 'Full analysis unavailable',
+        details: 'All full-analysis agents failed.',
+      });
+      return;
+    }
+    res.status(result.errors.length > 0 ? 207 : 200).json({
+      ...result,
+      ...(result.errors.length > 0
+        ? { warning: 'Some signals unavailable; showing best available guidance.' }
+        : {}),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(502).json({
+      error: 'Full analysis failed',
+      details: message,
+    });
+  }
+});
+
 app.use('/api', apiRouter);
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'API route not found' });
 });
 
 app.listen(port, () => {
+  console.log(`[BOOT] Agent Framework server on ${port} file: ${__filename}`);
   console.log(`[agent-framework] listening on http://localhost:${port}`);
-  console.log('[agent-framework] mounted routes: GET /api/baselines, GET /api/roster, POST /api/baselines, PUT /api/baselines, PATCH /api/baselines/:id, DELETE /api/baselines/:id, POST /api/baselines/reset');
+  console.log('[agent-framework] mounted routes: GET /api/baselines, GET /api/baselines/:id, GET /api/roster, POST /api/baselines, PUT /api/baselines, PUT /api/baselines/:id, PATCH /api/baselines/:id, DELETE /api/baselines/:id, POST /api/baselines/reset, POST /api/analysis/full');
   console.log(`[agent-framework] forwarding agent calls to ${existingApiBaseUrl}`);
   if (!cosmosDiagnostics.configured || !cosmosDiagnostics.sdkAvailable) {
     console.warn(`[agent-framework] Cosmos baseline routes running in fallback mode (${getFallbackWarning()}).`);

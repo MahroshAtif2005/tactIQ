@@ -1,3 +1,5 @@
+import { FullMatchContext, ReplacementCandidate } from './matchContext';
+
 export type InjuryRisk = 'LOW' | 'MEDIUM' | 'HIGH' | 'MED' | 'UNKNOWN';
 export type Severity = 'LOW' | 'MED' | 'HIGH';
 
@@ -24,6 +26,8 @@ export interface FatigueAgentRequest {
     over: number;
     intensity: string;
   };
+  fullMatchContext?: FullMatchContext;
+  replacementCandidates?: ReplacementCandidate[];
 }
 
 export interface FatigueModelDebug {
@@ -53,6 +57,10 @@ export interface FatigueAgentResponse {
   status?: 'ok' | 'fallback' | 'error' | 'running' | 'skipped';
   severity: Severity;
   headline: string;
+  summary?: string;
+  why?: string[];
+  action?: string;
+  projection?: string;
   explanation: string;
   recommendation: string;
   signals: string[];
@@ -79,6 +87,7 @@ export type RiskSeverity = 'LOW' | 'MED' | 'HIGH' | 'CRITICAL' | 'UNKNOWN';
 export interface RiskAgentRequest {
   playerId: string;
   fatigueIndex: number;
+  strainIndex?: number;
   injuryRisk: RiskLevelInput;
   noBallRisk: RiskLevelInput;
   oversBowled: number;
@@ -96,6 +105,8 @@ export interface RiskAgentRequest {
   score?: number;
   over?: number;
   balls?: number;
+  fullMatchContext?: FullMatchContext;
+  replacementCandidates?: ReplacementCandidate[];
 }
 
 export interface RiskAgentResponse {
