@@ -311,25 +311,24 @@ DEV + DELIVERY TOOLING (MICROSOFT + GITHUB)
 
 ````
 ```mermaid
-
 flowchart TB
 
   %% Users + UI
-  Coach[Coach / Analyst] --> UI[Web UI<br/>Vite + React]
+  Coach[Coach / Analyst] --> UI[Web UI\nVite + React]
 
   %% Runtime hosting
-  UI -->|HTTPS| API[Backend API<br/>Node/Express<br/>Azure App Service]
+  UI -->|HTTPS| API[Backend API\nNode/Express\nAzure App Service]
 
   %% Core orchestration
-  API --> CTX[Context Builder / Orchestrator<br/>Match state • roster • roles • session logic<br/>feature extraction]
+  API --> CTX[Context Builder / Orchestrator\nMatch state • roster • roles • session logic\nfeature extraction]
 
   %% Router
-  CTX --> ROUTER[Model Router<br/>Azure OpenAI (direct deployment)<br/>Structured JSON: which agents to run]
+  CTX --> ROUTER[Model Router\nAzure OpenAI (direct deployment)\nStructured JSON: which agents to run]
 
   %% Specialist agents
-  ROUTER --> FAT[Fatigue Agent<br/>workload • strain • recovery • sleep baseline]
-  ROUTER --> RISK[Injury Risk Agent<br/>type-specific risk + triggers]
-  ROUTER --> TAC[Tactical Agent<br/>match depiction + next best move<br/>role-safe suggestions]
+  ROUTER --> FAT[Fatigue Agent\nworkload • strain • recovery • sleep baseline]
+  ROUTER --> RISK[Injury Risk Agent\ntype-specific risk + triggers]
+  ROUTER --> TAC[Tactical Agent\nmatch depiction + next best move\nrole-safe suggestions]
 
   %% Azure OpenAI calls
   FAT --> AOAI[(Azure OpenAI)]
@@ -338,19 +337,14 @@ flowchart TB
   ROUTER --> AOAI
 
   %% Data layer
-  CTX --> COSMOS[(Azure Cosmos DB<br/>Player baseline + historical workload)]
+  CTX --> COSMOS[(Azure Cosmos DB\nPlayer baseline + historical workload)]
   COSMOS --> CTX
 
   %% Observability
-  API --> INSIGHTS[Application Insights<br/>Telemetry • logs • traces]
-
-  %% Future ingestion
-  Wear[Wearables / GPS / HRV] -. future .-> HUB[Event Hubs / IoT Hub]
-  HUB -. future .-> STREAM[Azure Functions / Stream Analytics]
-  STREAM -. future .-> COSMOS
+  API --> INSIGHTS[Application Insights\nTelemetry • logs • traces]
 
   %% Dev workflow
-  Repo[Public GitHub Repo] --> Copilot[GitHub Copilot<br/>Agent Mode]
+  Repo[Public GitHub Repo] --> Copilot[GitHub Copilot\nAgent Mode]
   Copilot --> PR[Autonomous code edits / PRs]
   PR --> CI[GitHub Actions CI/CD]
   CI --> Deploy[Deploy to Azure App Service]
