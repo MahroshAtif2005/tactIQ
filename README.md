@@ -310,10 +310,9 @@ DEV + DELIVERY TOOLING (MICROSOFT + GITHUB)
 
 
 ````
+```mermaid
+
 flowchart TB
-  %% =========================
-  %% tactIQ - GitHub README Architecture
-  %% =========================
 
   %% Users + UI
   Coach[Coach / Analyst] --> UI[Web UI<br/>Vite + React]
@@ -322,15 +321,15 @@ flowchart TB
   UI -->|HTTPS| API[Backend API<br/>Node/Express<br/>Azure App Service]
 
   %% Core orchestration
-  API --> CTX[Context Builder / Orchestrator<br/>Match state • roster • roles • session logic<br/>feature extraction + rules]
+  API --> CTX[Context Builder / Orchestrator<br/>Match state • roster • roles • session logic<br/>feature extraction]
 
   %% Router
-  CTX --> ROUTER[Model Router<br/>Azure OpenAI (direct deployment)<br/>Structured JSON decision: which agents to run]
+  CTX --> ROUTER[Model Router<br/>Azure OpenAI (direct deployment)<br/>Structured JSON: which agents to run]
 
   %% Specialist agents
-  ROUTER -->|if fatigue signals high| FAT[Fatigue Agent<br/>workload • strain • recovery • sleep baseline]
-  ROUTER -->|if injury risk signals present| RISK[Injury Risk Agent<br/>type-specific risk + triggers]
-  ROUTER -->|always| TAC[Tactical Agent<br/>match depiction + next best move<br/>role-safe suggestions (bat/bowl)]
+  ROUTER --> FAT[Fatigue Agent<br/>workload • strain • recovery • sleep baseline]
+  ROUTER --> RISK[Injury Risk Agent<br/>type-specific risk + triggers]
+  ROUTER --> TAC[Tactical Agent<br/>match depiction + next best move<br/>role-safe suggestions]
 
   %% Azure OpenAI calls
   FAT --> AOAI[(Azure OpenAI)]
@@ -344,19 +343,16 @@ flowchart TB
 
   %% Observability
   API --> INSIGHTS[Application Insights<br/>Telemetry • logs • traces]
-  CTX --> INSIGHTS
 
-  %% Optional outputs
-  API -. reports / exports .-> BLOB[(Azure Blob Storage)]
-
-  %% Future production data ingestion
+  %% Future ingestion
   Wear[Wearables / GPS / HRV] -. future .-> HUB[Event Hubs / IoT Hub]
   HUB -. future .-> STREAM[Azure Functions / Stream Analytics]
   STREAM -. future .-> COSMOS
 
-  %% Dev workflow (not runtime)
+  %% Dev workflow
   Repo[Public GitHub Repo] --> Copilot[GitHub Copilot<br/>Agent Mode]
-  Copilot --> PR[Autonomous code edits / PR-ready changes]
+  Copilot --> PR[Autonomous code edits / PRs]
   PR --> CI[GitHub Actions CI/CD]
   CI --> Deploy[Deploy to Azure App Service]
   Deploy --> API
+```
