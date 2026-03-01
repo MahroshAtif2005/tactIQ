@@ -314,21 +314,21 @@ DEV + DELIVERY TOOLING (MICROSOFT + GITHUB)
 flowchart TB
 
   %% Users + UI
-  Coach[Coach / Analyst] --> UI[Web UI\nVite + React]
+  Coach[Coach / Analyst] --> UI[Web UI (Vite + React)]
 
   %% Runtime hosting
-  UI -->|HTTPS| API[Backend API\nNode/Express\nAzure App Service]
+  UI -->|HTTPS| API[Backend API (Node/Express) - Azure App Service]
 
   %% Core orchestration
-  API --> CTX[Context Builder / Orchestrator\nMatch state • roster • roles • session logic\nfeature extraction]
+  API --> CTX[Context Builder / Orchestrator]
 
   %% Router
-  CTX --> ROUTER[Model Router\nAzure OpenAI (direct deployment)\nStructured JSON: which agents to run]
+  CTX --> ROUTER[Model Router (Azure OpenAI - direct deployment)]
 
   %% Specialist agents
-  ROUTER --> FAT[Fatigue Agent\nworkload • strain • recovery • sleep baseline]
-  ROUTER --> RISK[Injury Risk Agent\ntype-specific risk + triggers]
-  ROUTER --> TAC[Tactical Agent\nmatch depiction + next best move\nrole-safe suggestions]
+  ROUTER --> FAT[Fatigue Agent]
+  ROUTER --> RISK[Injury Risk Agent]
+  ROUTER --> TAC[Tactical Agent]
 
   %% Azure OpenAI calls
   FAT --> AOAI[(Azure OpenAI)]
@@ -337,16 +337,20 @@ flowchart TB
   ROUTER --> AOAI
 
   %% Data layer
-  CTX --> COSMOS[(Azure Cosmos DB\nPlayer baseline + historical workload)]
+  CTX --> COSMOS[(Azure Cosmos DB)]
   COSMOS --> CTX
 
   %% Observability
-  API --> INSIGHTS[Application Insights\nTelemetry • logs • traces]
+  API --> INSIGHTS[Application Insights]
+
+  %% Optional outputs
+  API -. reports / exports .-> BLOB[(Azure Blob Storage)]
+
+  %% Future ingestion
+  Wear[Wearables / GPS / HRV] -. future .-> HUB[Event Hubs / IoT Hub]
+  HUB -. future .-> STREAM[Azure Functions / Stream Analytics]
+  STREAM -. future .-> COSMOS
 
   %% Dev workflow
-  Repo[Public GitHub Repo] --> Copilot[GitHub Copilot\nAgent Mode]
-  Copilot --> PR[Autonomous code edits / PRs]
-  PR --> CI[GitHub Actions CI/CD]
-  CI --> Deploy[Deploy to Azure App Service]
-  Deploy --> API
+  Repo[Public GitHub Repo] --> Copilot[GitHub Copilot Agent Mode]
 ```
