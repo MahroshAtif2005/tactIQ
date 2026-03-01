@@ -6,8 +6,7 @@
 
 ### AI Tactical Coach for Player and Match Decisions
 
-tactIQ is a real time tactical assistant that functions like a digital coach for cricket teams.  
-It focuses on player suitability, fatigue tracking, substitution decisions, and match situation awareness to support smarter on field strategy.
+tactIQ is a real-time AI tactical coach for cricket teams, analyzing player workload, fatigue, injury risk, and match context to recommend the optimal next move on the field.
 
 For now tactIQ is built for cricket, but the system is designed to extend to multiple sports such as football, basketball, and other real time decision environments.
 
