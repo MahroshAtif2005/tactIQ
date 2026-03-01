@@ -77,149 +77,125 @@ The goal is not just to show numbers but to guide decisions.
 
 ## Run locally
 
-1. Install dependencies:
-   - `npm install`
-   - `npm --prefix api install`
-2. Start Azure Functions API:
-   - Terminal 1: `cd api && func start`
-3. Start frontend:
-   - Terminal 2: `npm run dev`
-4. Verify Functions health:
-   - `curl http://localhost:7071/api/health`
+This project runs with:
 
-If port `7071` is busy, run with a different port:
-- `FUNCTION_PORT=7072 npm run dev`
-- `VITE_FUNCTIONS_PORT=7072 FUNCTION_PORT=7072 npm run dev`
+- **Backend (Express / Agent Framework):** http://localhost:8080  
+- **Frontend (Vite):** http://localhost:5173  
 
-Frontend runs on `http://localhost:5173` and Azure Functions runs on `http://localhost:7071`.
+---
 
-### Player Baselines (Cosmos DB, Express API)
+## Install Dependencies
 
-If you are using the Express backend (`node server.js`) for Player Baseline Models:
+From the project root:
 
-1. Configure environment in repo root `.env`:
-   - `COSMOS_CONNECTION_STRING` (preferred) or `COSMOS_ENDPOINT` + `COSMOS_KEY`
-   - `COSMOS_DATABASE=tactiq-db`
-   - `COSMOS_CONTAINER_PLAYERS=players`
-2. Start backend API:
-   - `npm run server` (or `node server.js`, defaults to `http://localhost:8080`)
-3. Start frontend:
-   - `npm run dev`
-   - Set `VITE_API_BASE_URL=http://localhost:8080` in `.env` (default).
-4. Important:
-   - Keep Vite on its own dev port (for example `5177`).
-   - Do not run SPA preview/static server on `8080` while backend API is running.
-5. Manual verification:
-   - Load baselines: `curl http://localhost:8080/api/baselines`
-   - Save baselines (bulk upsert):
-     - `curl -X POST http://localhost:8080/api/baselines -H \"Content-Type: application/json\" -d '{\"players\":[{\"id\":\"J. Archer\",\"role\":\"FAST\",\"sleep\":7.5,\"recovery\":45,\"fatigueLimit\":6,\"control\":80,\"speed\":9,\"power\":0,\"active\":true}]}'`
-   - Delete one baseline:
-     - `curl -X DELETE \"http://localhost:8080/api/baselines/J.%20Archer\"`
-   - Reset baselines to seed defaults:
-     - `curl -X POST http://localhost:8080/api/baselines/reset`
+```bash
+npm install
+npm --prefix server/agent-framework install
+```
 
-### Baselines API quick checks
+---
 
-Use these commands to confirm local DELETE/RESET routes are live:
+## Configure Environment
 
-- `curl -X POST http://localhost:8080/api/baselines/reset`
-- `curl -X DELETE "http://localhost:8080/api/baselines/Ben%20Ten"`
-- `curl http://localhost:8080/api/baselines`
+Edit:
 
-### Optional Agent Framework orchestration layer
+```
+server/agent-framework/.env
+```
 
-This repo now supports an opt-in Microsoft Bot Framework orchestration service that forwards to the existing tactIQ agent endpoints.
+Make sure it matches:
 
-1. Install Agent Framework service dependencies:
-   - `npm --prefix server/agent-framework install`
-2. Configure Agent Framework env:
-   - `cp server/agent-framework/.env.example server/agent-framework/.env`
-   - Keep `EXISTING_API_BASE_URL=http://localhost:7071` (or your Functions URL)
-3. Start services:
-   - Terminal 1: `cd api && func start`
-   - Terminal 2: `npm --prefix server/agent-framework run dev`
-   - Terminal 3: `VITE_USE_AGENT_FRAMEWORK=true npm run dev`
+```env
+AZURE_OPENAI_API_KEY=your_key
+AZURE_OPENAI_ENDPOINT=https://tactiq-openai.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
+AZURE_OPENAI_API_VERSION=2024-02-15-preview
 
-Notes:
-- Default behavior is unchanged (`VITE_USE_AGENT_FRAMEWORK=false`): frontend keeps calling `/api/orchestrate`.
-- When `VITE_USE_AGENT_FRAMEWORK=true`, frontend sends orchestration through `/api/messages` (proxied to `http://localhost:3978` by Vite in dev).
-- If Agent Framework is hosted elsewhere, set `VITE_AGENT_FRAMEWORK_BASE_URL`.
+PORT=8080
 
-## Production Preview (Important)
+COSMOS_ENDPOINT=https://tactiq-cosmos.documents.azure.com:443/
+COSMOS_KEY=your_key
+COSMOS_DB=tactiq-db
+COSMOS_CONTAINER=players
+```
 
-- `npm run dev` runs Vite dev mode, which is not identical to production behavior.
-- To reproduce live/Azure UI issues (for example CSS differences after production build), use:
-  - `npm run build`
-  - `npm run preview`
-- To force a specific preview port:
-  - `npm run preview -- --port 4173`
+---
 
-## API endpoints
+## Start Backend (API)
 
-- `POST http://localhost:7071/api/agents/fatigue`
-- `POST http://localhost:7071/api/agents/risk`
-- `POST http://localhost:7071/api/agents/tactical`
-- `POST http://localhost:7071/api/router`
-- `POST http://localhost:7071/api/orchestrate`
-- `GET  http://localhost:7071/api/health`
-- Frontend calls relative paths like `/api/orchestrate` via Vite proxy.
+From project root:
 
-### Full Match Context
+```bash
+node server.js
+```
 
-- `POST /orchestrate` and `POST /api/orchestrate` now expect `context: FullMatchContext` in the request body.
-- Router + fatigue/risk/tactical agents consume this context (match setup + roster baselines + live telemetry).
-- Orchestrate responses include `contextSummary` for safe debugging.
-- Set `DEBUG_CONTEXT=true` to include full `debugContext` in orchestrate responses.
+Backend will run on:
 
-### How to verify FullMatchContext wiring
+```
+http://localhost:8080
+```
 
-1. Open browser DevTools -> Network and trigger **Run Coach Agent** or **Run Full Combined Analysis**.
-2. Inspect the `/orchestrate` request payload and confirm:
-   - `context.match` exists
-   - `context.roster` exists and has current roster players
-3. Inspect the `/orchestrate` response and confirm:
-   - `contextSummary.rosterCount` matches roster shown in UI
-   - `contextSummary.hasBaselinesCount` and `contextSummary.hasTelemetryCount` are populated
-   - `routerDecision` and `agentsRun` are present
+---
 
-## Bot Framework runtime layer
+## Start Frontend (Vite)
 
-- Endpoint: `POST /api/messages`
-- This endpoint adds Microsoft Bot Framework runtime support on top of the existing orchestration.
-- Current UI flow is unchanged: the dashboard can continue calling existing orchestrator endpoints exactly as before.
+In a new terminal:
 
-If you change Vite proxy settings, restart the Vite dev server.
+```bash
+npm run dev
+```
 
-## Production API Base URL
+Frontend will run on:
 
-- If backend APIs are hosted separately from the frontend (for example Azure Functions on another host), set `VITE_API_BASE_URL` in Azure App Service -> Configuration.
-- Frontend orchestrate/health calls resolve to `${VITE_API_BASE_URL}/orchestrate` and `${VITE_API_BASE_URL}/health` (with legacy `/api/orchestrate` fallback if needed).
-- If `/health` fails, the Coach panel shows an explicit backend reachability error.
+```
+http://localhost:5173
+```
 
-## LLM Setup
+---
 
-Fatigue Agent supports two modes:
-- Rule based fallback 
-- Azure OpenAI LLM analysis 
+## Frontend API Configuration
 
-Set these in `api/local.settings.json` (or environment):
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_DEPLOYMENT`
-- `AZURE_OPENAI_API_VERSION` (defaults to `2024-02-15-preview` if not set)
-- `AOAI_DEPLOYMENT_STRONG`
-- `AOAI_DEPLOYMENT_FALLBACK`
+In the root `.env` file (frontend environment):
 
-When AOAI config is missing, Tactical Agent now returns deterministic fallback recommendations instead of failing offline.
+```env
+VITE_API_BASE_URL=http://localhost:8080
+```
 
-Quick setup:
-1. Copy `api/local.settings.example.json` to `api/local.settings.json`
-2. Add your Azure OpenAI values
-3. Run `cd api && func start`
+Restart Vite after changing environment variables.
 
-## Deployment
-Deployed on Azure App Service via GitHub Actions (CI/CD).
-Every push to `main` triggers build + deploy.
+---
+
+## Manual Verification
+
+Test API connectivity:
+
+```bash
+# Get baselines
+curl http://localhost:8080/api/baselines
+
+# Test orchestrate endpoint
+curl -X POST http://localhost:8080/api/orchestrate \
+  -H "Content-Type: application/json" \
+  -d '{"context":{}}'
+```
+
+---
+
+## Available Local API Endpoints
+
+- `POST http://localhost:8080/api/orchestrate`
+- `GET  http://localhost:8080/api/baselines`
+- `POST http://localhost:8080/api/baselines`
+- `DELETE http://localhost:8080/api/baselines/{playerId}`
+- `POST http://localhost:8080/api/baselines/reset`
+
+---
+
+## Important Notes
+
+- Do **not** run any other service on port `8080` while the backend is running.
+- If you modify `.env`, restart the backend and frontend.
+- Frontend calls backend via `VITE_API_BASE_URL`.
 
 
                                      ARCHITECTURE (tactIQ)
@@ -329,3 +305,218 @@ Repo[GitHub Repo] --> Copilot[Copilot Agent Mode]
 Copilot --> CI[GitHub Actions]
 CI --> API
 ```
+
+#  System Flow
+
+tactIQ is an AI tactical coaching system that runs a multi-agent analysis pipeline on live match context.  
+It supports two execution modes:
+
+- **Auto Mode (Model Router)** → runs only the required agents based on workload signals  
+- **Run Full Analysis** → forces Fatigue, Injury Risk, and Tactical agents to run together for a complete coaching briefing  
+
+Both modes follow the same core flow.
+
+---
+
+## 1. Coach Interaction (Web UI)
+
+The coach:
+
+- selects the **match state** (batting or bowling)  
+- chooses players from the **roster**  
+- can **add new players**, which automatically creates a baseline entry in **Azure Cosmos DB**  
+- inputs workload, strain, and overs  
+
+Each player stored in the roster has:
+
+- baseline workload profile  
+- recovery averages  
+- fatigue limits  
+
+This creates a **historical performance layer** used in future matches.
+
+---
+
+## 2. State Enforcement (Role Safety)
+
+tactIQ validates match context before running AI:
+
+- Running a **bowler in batting mode** triggers a notification to switch state  
+- Running a **batter in bowling mode** does the same  
+- Tactical recommendations are **role-safe**:
+  - Bowling → suggests the next best bowler to rotate in  
+  - Batting → suggests the next best batter  
+
+This prevents invalid substitutions.
+
+---
+
+## 3. Backend Context Builder (Azure App Service)
+
+The Node/Express API:
+
+- validates match state  
+- builds the session context  
+- fetches player baselines from **Azure Cosmos DB**  
+- computes:
+  - workload accumulation  
+  - strain trend  
+  - recovery gap  
+  - fatigue index  
+
+---
+
+## 4. Orchestrator (Agent Framework Pattern)
+
+The orchestrator prepares a structured AI context containing:
+
+- match situation  
+- player role  
+- overs remaining  
+- workload trend  
+- historical baseline  
+
+This context is passed to the **Model Router**.
+
+---
+
+## 5. Model Router (Azure OpenAI)
+
+In **Auto Mode**, the router decides which agents to run:
+
+- **Fatigue Agent** → when workload or strain is high  
+- **Injury Risk Agent** → when recovery deficit or overload is detected  
+- **Tactical Agent** → always runs  
+
+In **Run Full Analysis**, all agents execute regardless of thresholds.
+
+The router outputs a deterministic execution plan.
+
+---
+
+## 6. Specialist Agents
+
+### 🔵 Fatigue Agent
+Analyzes:
+
+- workload spikes  
+- strain accumulation  
+- recovery vs baseline  
+- sleep deficit  
+
+Outputs:
+
+- fatigue level  
+- rest recommendation  
+- substitution urgency  
+- **fatigue forecast graph** for upcoming overs
+
+---
+
+### 🔴 Injury Risk Agent
+Identifies:
+
+- probable injury type (e.g., hamstring overload, shoulder strain)  
+- trigger factors  
+- safe workload limits  
+
+Outputs:
+
+- risk level  
+- recommended action:
+  - continue  
+  - rotate  
+  - **mark unfit**
+
+Also generates an **injury risk forecast curve** if the player continues.
+
+---
+
+### 🟡 Tactical Agent
+Produces:
+
+- match situation depiction  
+- next best move  
+- **which player to switch in** (role-safe)  
+- context-aware strategy (rotate bowler, send aggressor, delay acceleration)
+
+---
+
+## 7. Player Management Actions
+
+Based on agent output, the coach can:
+
+- **Switch player** → AI suggests the optimal replacement  
+- **Rest player** → removed from active state but workload preserved  
+- **Mark unfit** → player locked from selection  
+
+These actions update the session context while keeping historical baselines intact.
+
+---
+
+## 8. Forecast Visualizations
+
+The UI displays:
+
+- fatigue projection over the next overs  
+- injury risk trend if the player continues  
+
+This enables **proactive decision-making**, not reactive substitutions.
+
+---
+
+## 9. Data Layer (Azure Cosmos DB)
+
+Stores:
+
+- player baselines  
+- historical workload  
+- recovery trends  
+
+Roster is session-based, but **every new player added persists to Cosmos DB**.
+
+---
+
+## 10. Observability (Azure Application Insights)
+
+Tracks:
+
+- router decisions  
+- agent execution paths  
+- latency and errors  
+- analysis mode (auto vs full)
+
+---
+
+## 11. Copilot-Assisted DevOps
+
+- **GitHub Copilot (Agent Mode)** → assisted UI, API, and orchestration code  
+- **GitHub Actions** → CI/CD deployment to Azure App Service  
+
+---
+
+#  Execution Modes Summary
+
+### Auto Mode
+- Smart agent selection  
+- Faster response  
+- Runs only required analysis  
+
+### Run Full Analysis
+- Fatigue + Injury + Tactical together  
+- Complete coaching briefing  
+- Used for high-stakes decisions  
+
+---
+
+#  Outcome
+
+tactIQ delivers:
+
+- role-safe player switching  
+- rest and unfit management  
+- AI-driven substitution decisions  
+- fatigue and injury forecasting  
+- baseline-aware tactical intelligence  
+
+All powered by a **multi-agent Azure architecture**.
