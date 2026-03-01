@@ -1,4 +1,4 @@
-import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse } from '../types/agents';
+import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse } from '../types/agents';
 import { Baseline, PlayerBaseline } from '../types/baseline';
 
 export type ApiClientErrorKind = 'network' | 'timeout' | 'cors' | 'http' | 'parse';
@@ -7,16 +7,18 @@ export type AgentFrameworkMode = 'route' | 'all';
 const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '');
 const ensureLeadingSlash = (value: string): string => (value.startsWith('/') ? value : `/${value}`);
 
-const rawBaseUrl = String(import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? '/api' : '')).trim();
-export const BASE_URL = trimTrailingSlashes(rawBaseUrl);
+const BASE = (String(import.meta.env.VITE_API_BASE_URL || '/api').trim() || '/api').replace(/\/+$/, '');
+export const BASE_URL = BASE || '/api';
 export const apiBaseUrl = BASE_URL;
+const baseEndsWithApi = /\/api$/i.test(BASE_URL);
 
-const resolveApiUrl = (path: string): string => {
+const joinUrl = (base: string, path: string): string => {
+  const normalizedBase = trimTrailingSlashes(String(base || '').trim());
   const normalizedPath = ensureLeadingSlash(path);
-  if (!BASE_URL) return normalizedPath;
+  if (!normalizedBase) return normalizedPath;
 
-  if (!/^https?:\/\//i.test(BASE_URL)) {
-    const relativeBase = ensureLeadingSlash(BASE_URL);
+  if (!/^https?:\/\//i.test(normalizedBase)) {
+    const relativeBase = ensureLeadingSlash(normalizedBase);
     if (normalizedPath === relativeBase || normalizedPath.startsWith(`${relativeBase}/`)) {
       return normalizedPath;
     }
@@ -26,25 +28,31 @@ const resolveApiUrl = (path: string): string => {
     return `${relativeBase}${normalizedPath}`;
   }
 
-  try {
-    return new URL(normalizedPath, BASE_URL).toString();
-  } catch {
-    return `${BASE_URL}${normalizedPath}`;
-  }
+  return `${normalizedBase}${normalizedPath}`;
 };
+const normalizePathForBase = (path: string): string => {
+  const normalizedPath = ensureLeadingSlash(path);
+  if (baseEndsWithApi && normalizedPath === '/api') return '/';
+  if (baseEndsWithApi && normalizedPath.startsWith('/api/')) return normalizedPath.slice(4);
+  return normalizedPath;
+};
+const resolveApiUrl = (path: string): string => joinUrl(BASE_URL, normalizePathForBase(path));
 export const apiHealthPath = '/health';
-export const apiLegacyHealthPath = '/api/health';
-export const apiOrchestratePath = '/api/orchestrate';
-export const apiMessagesPath = '/api/messages';
+export const apiLegacyHealthPath = '/health';
+export const apiOrchestratePath = '/orchestrate';
+export const apiLegacyOrchestratePath = '/orchestrate';
+export const apiMessagesPath = '/messages';
 export const apiHealthUrl = resolveApiUrl(apiHealthPath);
 export const apiLegacyHealthUrl = resolveApiUrl(apiLegacyHealthPath);
 export const apiOrchestrateUrl = resolveApiUrl(apiOrchestratePath);
+export const apiLegacyOrchestrateUrl = resolveApiUrl(apiLegacyOrchestratePath);
 export const apiAgentFrameworkMessagesUrl = resolveApiUrl(apiMessagesPath);
 
-const fatigueEndpoint = resolveApiUrl('/api/agents/fatigue');
-const riskEndpoint = resolveApiUrl('/api/agents/risk');
+const fatigueEndpoint = resolveApiUrl('/agents/fatigue');
+const riskEndpoint = resolveApiUrl('/agents/risk');
+const tacticalEndpoint = resolveApiUrl('/agents/tactical');
 const orchestrateEndpoint = apiOrchestrateUrl;
-const baselinesEndpoint = resolveApiUrl('/api/baselines');
+const baselinesEndpoint = resolveApiUrl('/baselines');
 
 interface ApiClientErrorOptions {
   message: string;
@@ -97,6 +105,16 @@ const isLikelyCorsBlocked = (message: string, url: string): boolean => {
   }
 };
 
+const isCrossOriginRequest = (url: string): boolean => {
+  if (typeof window === 'undefined') return false;
+  try {
+    const requestOrigin = new URL(url, window.location.origin).origin;
+    return requestOrigin !== window.location.origin;
+  } catch {
+    return false;
+  }
+};
+
 interface RequestTextOptions {
   timeoutMs?: number;
 }
@@ -105,7 +123,7 @@ async function requestText(
   url: string,
   init: RequestInit,
   options: RequestTextOptions = {}
-): Promise<{ status: number; text: string }> {
+): Promise<{ status: number; text: string; headers: Headers }> {
   const { timeoutMs } = options;
   const parentSignal = init.signal;
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -151,7 +169,9 @@ async function requestText(
     }
 
     const networkMessage = error instanceof Error ? error.message : String(error);
-    const kind: ApiClientErrorKind = isLikelyCorsBlocked(networkMessage, url) ? 'cors' : 'network';
+    const isTypeError = typeof TypeError !== 'undefined' && error instanceof TypeError;
+    const isCorsLike = isLikelyCorsBlocked(networkMessage, url) || (isTypeError && isCrossOriginRequest(url));
+    const kind: ApiClientErrorKind = isCorsLike ? 'cors' : 'network';
     devWarn('[API] Request failed', { url, status: kind, kind });
     throw new ApiClientError({
       message: kind === 'cors'
@@ -168,12 +188,19 @@ async function requestText(
     parentSignal.removeEventListener('abort', abortRelay);
   }
 
-  const responseText = await response.text();
+  let responseText = '';
+  try {
+    responseText = await response.text();
+  } catch {
+    responseText = '';
+  }
   if (!response.ok) {
     devWarn('[API] Non-2xx response', { url, status: response.status });
-    const shortText = summarizeErrorText(responseText);
+    const snippet = summarizeErrorText(responseText);
     throw new ApiClientError({
-      message: shortText || `Request failed with status ${response.status}.`,
+      message: snippet
+        ? `HTTP ${response.status}: ${snippet}`
+        : `HTTP ${response.status} ${response.statusText || ''}`.trim(),
       kind: 'http',
       url,
       status: response.status,
@@ -181,17 +208,30 @@ async function requestText(
     });
   }
 
-  return { status: response.status, text: responseText };
+  return { status: response.status, text: responseText, headers: response.headers };
 }
 
 function parseJsonResponse<TResponse>(
   text: string,
   url: string,
-  status: number
+  status: number,
+  headers?: Headers
 ): TResponse {
+  const snippet = summarizeErrorText(text);
+  const contentType = String(headers?.get('content-type') || '').toLowerCase();
+  if (contentType && !contentType.includes('application/json')) {
+    throw new ApiClientError({
+      message: `Expected JSON response (status ${status}) but received ${contentType || 'unknown'}${snippet ? `: ${snippet}` : '.'}`,
+      kind: 'parse',
+      url,
+      status,
+      body: text,
+    });
+  }
+
   if (looksLikeHtml(text)) {
     throw new ApiClientError({
-      message: `API returned HTML instead of JSON at ${url}. Check API routing and SPA fallback.`,
+      message: `Expected JSON response (status ${status}) but received HTML${snippet ? `: ${snippet}` : '.'}`,
       kind: 'parse',
       url,
       status,
@@ -204,7 +244,7 @@ function parseJsonResponse<TResponse>(
   } catch (error) {
     devWarn('[API] Invalid JSON response', { url, status });
     throw new ApiClientError({
-      message: 'Invalid JSON response from API.',
+      message: `Invalid JSON response (status ${status})${snippet ? `: ${snippet}` : '.'}`,
       kind: 'parse',
       url,
       status,
@@ -218,13 +258,13 @@ async function postJson<TResponse>(
   payload: unknown,
   signal?: AbortSignal
 ): Promise<TResponse> {
-  const { status, text } = await requestText(url, {
+  const { status, text, headers } = await requestText(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal,
   });
-  return parseJsonResponse<TResponse>(text, url, status);
+  return parseJsonResponse<TResponse>(text, url, status, headers);
 }
 
 async function putJson<TResponse>(
@@ -232,24 +272,24 @@ async function putJson<TResponse>(
   payload: unknown,
   signal?: AbortSignal
 ): Promise<TResponse> {
-  const { status, text } = await requestText(url, {
+  const { status, text, headers } = await requestText(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal,
   });
-  return parseJsonResponse<TResponse>(text, url, status);
+  return parseJsonResponse<TResponse>(text, url, status, headers);
 }
 
 async function deleteJson<TResponse>(
   url: string,
   signal?: AbortSignal
 ): Promise<TResponse> {
-  const { status, text } = await requestText(url, {
+  const { status, text, headers } = await requestText(url, {
     method: 'DELETE',
     signal,
   });
-  return parseJsonResponse<TResponse>(text, url, status);
+  return parseJsonResponse<TResponse>(text, url, status, headers);
 }
 
 async function patchJson<TResponse>(
@@ -257,24 +297,24 @@ async function patchJson<TResponse>(
   payload: unknown,
   signal?: AbortSignal
 ): Promise<TResponse> {
-  const { status, text } = await requestText(url, {
+  const { status, text, headers } = await requestText(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal,
   });
-  return parseJsonResponse<TResponse>(text, url, status);
+  return parseJsonResponse<TResponse>(text, url, status, headers);
 }
 
 async function getJson<TResponse>(
   url: string,
   signal?: AbortSignal
 ): Promise<TResponse> {
-  const { status, text } = await requestText(url, {
+  const { status, text, headers } = await requestText(url, {
     method: 'GET',
     signal,
   });
-  return parseJsonResponse<TResponse>(text, url, status);
+  return parseJsonResponse<TResponse>(text, url, status, headers);
 }
 
 function normalizeOrchestrateResponse(raw: unknown): OrchestrateResponse {
@@ -303,6 +343,11 @@ function normalizeOrchestrateResponse(raw: unknown): OrchestrateResponse {
       rationale: 'Normalized from simplified orchestrator payload.',
     },
     errors: [],
+    agentResults: {
+      fatigue: { status: 'error', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
+      risk: { status: 'error', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
+      tactical: { status: 'error', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
+    },
     meta: {
       requestId: `normalized-${Date.now()}`,
       mode,
@@ -328,6 +373,21 @@ function parsePossibleJson(text: string): unknown {
     return undefined;
   }
 }
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+const getHeaderProofValue = (
+  headers: Headers
+): { traceId?: string; source?: 'azure' | 'mock'; contextRosterCount?: number } => {
+  const traceId = headers.get('x-trace-id') || undefined;
+  const sourceHeader = headers.get('x-source');
+  const rosterCountHeader = headers.get('x-context-roster-count');
+  const parsedRosterCount = Number(rosterCountHeader);
+  const contextRosterCount = Number.isFinite(parsedRosterCount) ? parsedRosterCount : undefined;
+  const normalizedSource = sourceHeader === 'azure' || sourceHeader === 'mock' ? sourceHeader : undefined;
+  return { traceId, source: normalizedSource, contextRosterCount };
+};
 
 function extractAgentFrameworkPayload(raw: unknown): unknown {
   if (!raw || typeof raw !== 'object') return raw;
@@ -373,12 +433,90 @@ export async function postRiskAgent(
   return postJson<RiskAgentResponse>(riskEndpoint, payload, signal);
 }
 
+export async function postTacticalAgent(
+  payload: unknown,
+  signal?: AbortSignal
+): Promise<TacticalAgentResponse> {
+  return postJson<TacticalAgentResponse>(tacticalEndpoint, payload, signal);
+}
+
 export async function postOrchestrate(
   payload: unknown,
   signal?: AbortSignal
 ): Promise<OrchestrateResponse> {
-  const raw = await postJson<unknown>(orchestrateEndpoint, payload, signal);
-  return normalizeOrchestrateResponse(raw);
+  const sendRequest = async (url: string) =>
+    requestText(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+      },
+      { timeoutMs: 15000 }
+    );
+
+  let requestUrl = orchestrateEndpoint;
+  const response = await sendRequest(requestUrl).catch((error: unknown) => {
+    if (error instanceof ApiClientError && error.status === 404 && orchestrateEndpoint !== apiLegacyOrchestrateUrl) {
+      requestUrl = apiLegacyOrchestrateUrl;
+      return sendRequest(requestUrl);
+    }
+    throw error;
+  });
+
+  const raw = parseJsonResponse<unknown>(response.text, requestUrl, response.status, response.headers);
+  const normalized = normalizeOrchestrateResponse(raw);
+  const headerProof = getHeaderProofValue(response.headers);
+  const bodyProof = isRecord(normalized)
+    ? {
+        traceId: typeof normalized.traceId === 'string' ? normalized.traceId : undefined,
+        source: normalized.source === 'azure' || normalized.source === 'mock' ? normalized.source : undefined,
+      }
+    : { traceId: undefined, source: undefined };
+  const traceId = bodyProof.traceId || headerProof.traceId;
+  const source = bodyProof.source || headerProof.source;
+  const allowVerboseDevContextLog = String(import.meta.env.VITE_DEBUG_CONTEXT || '').trim().toLowerCase() === 'true';
+
+  if (import.meta.env.DEV) {
+    console.info('[orchestrate] proof', {
+      url: requestUrl,
+      traceId,
+      source,
+      headerTraceId: headerProof.traceId,
+      headerSource: headerProof.source,
+      contextRosterCount: headerProof.contextRosterCount,
+    });
+    if (allowVerboseDevContextLog) {
+      console.info('[orchestrate] raw json', raw);
+    }
+  }
+
+  return {
+    ...normalized,
+    ...(traceId ? { traceId } : {}),
+    ...(source ? { source } : {}),
+    responseHeaders: {
+      traceId: headerProof.traceId,
+      source: headerProof.source,
+      contextRosterCount: headerProof.contextRosterCount,
+    },
+  };
+}
+
+export async function postFullCombinedAnalysis(
+  payload: unknown,
+  signal?: AbortSignal
+): Promise<OrchestrateResponse> {
+  const payloadRecord =
+    payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : {};
+  const fullPayload = {
+    ...payloadRecord,
+    mode: 'full',
+  };
+  return postOrchestrate(fullPayload, signal);
 }
 
 export async function postAgentFrameworkOrchestrate(
@@ -500,6 +638,20 @@ export async function getBaselines(signal?: AbortSignal): Promise<Baseline[]> {
   return response.baselines;
 }
 
+export async function getBaselineByPlayerId(playerId: string, signal?: AbortSignal): Promise<Baseline | null> {
+  const normalizedId = String(playerId || '').trim();
+  if (!normalizedId) return null;
+  const id = encodeURIComponent(normalizedId);
+  const url = `${baselinesEndpoint}/${id}`;
+  const raw = await getJson<unknown>(url, signal);
+  if (raw && typeof raw === 'object') {
+    const record = raw as Record<string, unknown>;
+    const candidate = normalizeBaseline(record.player ?? record.baseline ?? record);
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
 export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal): Promise<Baseline[]> {
   const players: PlayerBaseline[] = baselines.map((row) => ({
     id: String(row.id || row.playerId || '').trim(),
@@ -566,7 +718,7 @@ export async function updateBaseline(
   if (import.meta.env.DEV) {
     console.log('[api] PATCH baseline', { url, payload });
   }
-  const { status, text } = await requestText(
+  const { status, text, headers } = await requestText(
     url,
     {
       method: 'PATCH',
@@ -581,7 +733,7 @@ export async function updateBaseline(
       console.log(`Removed from roster: ${normalizedId} status=${status}`);
     }
   }
-  const raw = parseJsonResponse<unknown>(text, url, status);
+  const raw = parseJsonResponse<unknown>(text, url, status, headers);
   if (raw && typeof raw === 'object') {
     const record = raw as Record<string, unknown>;
     const candidate = normalizeBaseline(record.player ?? record.baseline ?? record);

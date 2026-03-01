@@ -264,17 +264,34 @@ writeFallbackBaselinesToDisk();
 
 const cloneFallbackBaselines = () => fallbackBaselines.map((item) => ({ ...item }));
 
+const firstNonEmptyEnv = (...values) => {
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const normalized = value.trim();
+    if (normalized.length > 0) return normalized;
+  }
+  return '';
+};
+
 const getConfig = () => ({
   connectionString: String(process.env.COSMOS_CONNECTION_STRING || '').trim(),
-  endpoint: String(process.env.COSMOS_ENDPOINT || '').trim(),
-  key: String(process.env.COSMOS_KEY || '').trim(),
-  databaseId:
-    String(process.env.COSMOS_DATABASE_ID || process.env.COSMOS_DATABASE || DEFAULT_DATABASE).trim() || DEFAULT_DATABASE,
-  containerId:
-    String(
-      process.env.COSMOS_CONTAINER_ID || process.env.COSMOS_CONTAINER_PLAYERS || process.env.COSMOS_CONTAINER || DEFAULT_CONTAINER
-    ).trim() ||
-    DEFAULT_CONTAINER,
+  endpoint: firstNonEmptyEnv(process.env.COSMOS_ENDPOINT, process.env.AZURE_COSMOS_ENDPOINT),
+  key: firstNonEmptyEnv(process.env.COSMOS_KEY, process.env.AZURE_COSMOS_KEY),
+  databaseId: firstNonEmptyEnv(
+    process.env.COSMOS_DB,
+    process.env.COSMOS_DATABASE,
+    process.env.AZURE_COSMOS_DATABASE,
+    process.env.COSMOS_DATABASE_NAME,
+    process.env.COSMOS_DATABASE_ID,
+    process.env.COSMOS_DB_NAME
+  ),
+  containerId: firstNonEmptyEnv(
+    process.env.COSMOS_CONTAINER,
+    process.env.AZURE_COSMOS_CONTAINER,
+    process.env.COSMOS_CONTAINER_NAME,
+    process.env.COSMOS_CONTAINER_ID,
+    process.env.COSMOS_CONTAINER_PLAYERS
+  ),
 });
 
 const parseCosmosAccount = (config) => {
@@ -323,7 +340,8 @@ const logCosmosConnectFail = (error) => {
 const isCosmosConfigured = () => {
   logCosmosEnvOnce();
   const config = getConfig();
-  return config.connectionString.length > 0 || (config.endpoint.length > 0 && config.key.length > 0);
+  const hasAccountAuth = config.connectionString.length > 0 || (config.endpoint.length > 0 && config.key.length > 0);
+  return hasAccountAuth && config.databaseId.length > 0 && config.containerId.length > 0;
 };
 
 let cachedContainer = null;
@@ -704,12 +722,28 @@ const resetBaselines = async (options = {}) => {
 const getCosmosDiagnostics = () => {
   const config = getConfig();
   const account = parseCosmosAccount(config);
+  const missing = [];
+  if (!config.connectionString && !config.endpoint) {
+    missing.push('COSMOS_CONNECTION_STRING or COSMOS_ENDPOINT or AZURE_COSMOS_ENDPOINT');
+  }
+  if (!config.connectionString && !config.key) {
+    missing.push('COSMOS_KEY or AZURE_COSMOS_KEY (or use COSMOS_CONNECTION_STRING)');
+  }
+  if (!config.databaseId) {
+    missing.push(
+      'COSMOS_DB or COSMOS_DATABASE or AZURE_COSMOS_DATABASE or COSMOS_DATABASE_NAME or COSMOS_DATABASE_ID'
+    );
+  }
+  if (!config.containerId) {
+    missing.push('COSMOS_CONTAINER or AZURE_COSMOS_CONTAINER or COSMOS_CONTAINER_NAME or COSMOS_CONTAINER_ID');
+  }
   return {
     configured: isCosmosConfigured(),
     sdkAvailable: loadCosmosClientCtor() !== null,
     account,
     databaseId: config.databaseId,
     containerId: config.containerId,
+    missing,
     initialized: Boolean(cachedContainer),
     initError: initError ? String(initError.message || initError) : null,
   };

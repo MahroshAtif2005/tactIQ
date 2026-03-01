@@ -4,5 +4,6 @@ export const ROUTES = {
   tactical: 'agents/tactical',
   router: 'router',
   orchestrate: 'orchestrate',
+  analysisFull: 'analysis/full',
   health: 'health',
 } as const;

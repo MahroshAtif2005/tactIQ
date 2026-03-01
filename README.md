@@ -103,11 +103,14 @@ If you are using the Express backend (`node server.js`) for Player Baseline Mode
    - `COSMOS_DATABASE=tactiq-db`
    - `COSMOS_CONTAINER_PLAYERS=players`
 2. Start backend API:
-   - `node server.js` (defaults to `http://localhost:8080`)
+   - `npm run server` (or `node server.js`, defaults to `http://localhost:8080`)
 3. Start frontend:
    - `npm run dev`
-   - Set `VITE_API_BASE_URL=/api` in `.env` (recommended for Vite proxy in dev).
-4. Manual verification:
+   - Set `VITE_API_BASE_URL=http://localhost:8080` in `.env` (default).
+4. Important:
+   - Keep Vite on its own dev port (for example `5177`).
+   - Do not run SPA preview/static server on `8080` while backend API is running.
+5. Manual verification:
    - Load baselines: `curl http://localhost:8080/api/baselines`
    - Save baselines (bulk upsert):
      - `curl -X POST http://localhost:8080/api/baselines -H \"Content-Type: application/json\" -d '{\"players\":[{\"id\":\"J. Archer\",\"role\":\"FAST\",\"sleep\":7.5,\"recovery\":45,\"fatigueLimit\":6,\"control\":80,\"speed\":9,\"power\":0,\"active\":true}]}'`
@@ -162,6 +165,24 @@ Notes:
 - `GET  http://localhost:7071/api/health`
 - Frontend calls relative paths like `/api/orchestrate` via Vite proxy.
 
+### Full Match Context
+
+- `POST /orchestrate` and `POST /api/orchestrate` now expect `context: FullMatchContext` in the request body.
+- Router + fatigue/risk/tactical agents consume this context (match setup + roster baselines + live telemetry).
+- Orchestrate responses include `contextSummary` for safe debugging.
+- Set `DEBUG_CONTEXT=true` to include full `debugContext` in orchestrate responses.
+
+### How to verify FullMatchContext wiring
+
+1. Open browser DevTools -> Network and trigger **Run Coach Agent** or **Run Full Combined Analysis**.
+2. Inspect the `/orchestrate` request payload and confirm:
+   - `context.match` exists
+   - `context.roster` exists and has current roster players
+3. Inspect the `/orchestrate` response and confirm:
+   - `contextSummary.rosterCount` matches roster shown in UI
+   - `contextSummary.hasBaselinesCount` and `contextSummary.hasTelemetryCount` are populated
+   - `routerDecision` and `agentsRun` are present
+
 ## Bot Framework runtime layer
 
 - Endpoint: `POST /api/messages`
@@ -173,8 +194,8 @@ If you change Vite proxy settings, restart the Vite dev server.
 ## Production API Base URL
 
 - If backend APIs are hosted separately from the frontend (for example Azure Functions on another host), set `VITE_API_BASE_URL` in Azure App Service -> Configuration.
-- The frontend builds API URLs as `${VITE_API_BASE_URL}/api/...` when configured, and defaults to same-origin `/api/...` when empty (so local Vite proxy still works).
-- If `/api/health` fails and `VITE_API_BASE_URL` is empty, the Coach panel now shows an explicit error suggesting this configuration.
+- Frontend orchestrate/health calls resolve to `${VITE_API_BASE_URL}/orchestrate` and `${VITE_API_BASE_URL}/health` (with legacy `/api/orchestrate` fallback if needed).
+- If `/health` fails, the Coach panel shows an explicit backend reachability error.
 
 ## LLM Setup
 

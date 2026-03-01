@@ -7,7 +7,7 @@ const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '')
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, process.cwd(), '');
-    const proxyTarget = 'http://localhost:8080';
+    const proxyTarget = trimTrailingSlashes(env.VITE_API_TARGET || 'http://localhost:8080');
 
     return {
     plugins: [react()],
@@ -64,11 +64,6 @@ export default defineConfig(({ mode }) => {
       open: true,
       proxy: {
         '/api': {
-          target: proxyTarget,
-          changeOrigin: true,
-          secure: false,
-        },
-        '/health': {
           target: proxyTarget,
           changeOrigin: true,
           secure: false,
