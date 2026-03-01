@@ -2673,58 +2673,7 @@ export default function App() {
       });
 
       const visibleErrors = result.errors.filter((e) => !(e.agent === 'tactical' && tacticalMapped));
-      const deriveRoutingNotice = (): string | null => {
-        const routed = (['fatigue', 'risk', 'tactical'] as const)
-          .map((agent) => {
-            const routeStatus = String(result.agentResults?.[agent]?.status || '').trim().toLowerCase();
-            const routeChoiceToken = String(result.agentResults?.[agent]?.routedTo || '').trim().toLowerCase();
-            const serverStatus = normalizeAgentStatusToken(result.agents?.[agent]?.status);
-            const hasRouteData =
-              selectedAgentSet.has(agent) ||
-              hasAgentOutput(agent) ||
-              Boolean(result.agentResults?.[agent]) ||
-              serverStatus.length > 0;
-            if (!hasRouteData) return null;
-            const routedTo: 'llm' | 'rules' =
-              routeChoiceToken === 'llm' || routeChoiceToken === 'rules'
-                ? routeChoiceToken
-                : routeStatus === 'fallback' || serverStatus === 'FALLBACK'
-                  ? 'rules'
-                  : 'llm';
-            const status: 'success' | 'fallback' | 'error' =
-              routeStatus === 'success' || routeStatus === 'fallback' || routeStatus === 'error'
-                ? routeStatus
-                : serverStatus === 'FALLBACK'
-                  ? 'fallback'
-                  : serverStatus === 'ERROR'
-                    ? 'error'
-                    : hasAgentOutput(agent)
-                      ? 'success'
-                      : 'error';
-            return { agent, routedTo, status };
-          })
-          .filter((entry): entry is { agent: AgentKey; routedTo: 'llm' | 'rules'; status: 'success' | 'fallback' | 'error' } => Boolean(entry));
 
-        if (routed.length === 0) {
-          const fallbackText = typeof result.meta.routerFallbackMessage === 'string' ? result.meta.routerFallbackMessage.trim() : '';
-          return fallbackText || null;
-        }
-
-        const fallbackAgents = routed
-          .filter((entry) => entry.status === 'fallback' || entry.routedTo === 'rules')
-          .map((entry) => entry.agent);
-        const allRules = routed.every((entry) => entry.routedTo === 'rules' || entry.status === 'fallback');
-        const allLLM = routed.every((entry) => entry.routedTo === 'llm' && entry.status === 'success');
-
-        if (allLLM) return 'Routing: AI (Azure OpenAI)';
-        if (allRules) return 'Routing: rules-based (safe fallback)';
-        if (fallbackAgents.length > 0) {
-          return `Routing: AI (partial fallback) | fallback: ${fallbackAgents.join(', ')}`;
-        }
-        return 'Routing: AI (Azure OpenAI)';
-      };
-
-      const routingNotice = deriveRoutingNotice();
       const sanitizeUiNotice = (value: unknown): string => {
         const normalized = String(value || '').replace(/\s+/g, ' ').trim();
         if (!normalized) return '';
@@ -2744,7 +2693,7 @@ export default function App() {
       const responseWarnings = Array.isArray(result.warnings)
         ? result.warnings.map((entry) => sanitizeUiNotice(entry)).filter(Boolean).join(' | ')
         : null;
-      const warning = [routingNotice, responseWarnings, errorNotice, sanitizeUiNotice(options?.extraWarning)]
+      const warning = [responseWarnings, errorNotice, sanitizeUiNotice(options?.extraWarning)]
         .filter(Boolean)
         .join(' | ') || null;
       const hasAnyAgentOutput =
@@ -5222,12 +5171,36 @@ function Dashboard({
       };
     }
     return {
-      label: 'Routing: Hybrid',
+      label: 'Routing: Hybrid AI',
       toneClass: 'border-amber-500/35 text-amber-200 bg-amber-500/10',
       dotClass: 'bg-amber-300',
       engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
     };
   })();
+  const routerAgentChips = (['tactical', 'fatigue', 'risk'] as const).map((agent) => {
+    const row = routerDetailRows.find((entry) => entry.agent === agent);
+    const agentLabel = agent === 'tactical' ? 'Tactical' : agent === 'fatigue' ? 'Fatigue' : 'Risk';
+    if (!row || !row.engaged) {
+      return {
+        key: `router-chip-${agent}`,
+        label: `${agentLabel}: Skipped`,
+        className: 'border-slate-700 text-slate-300 bg-slate-900/40',
+      };
+    }
+    const isFallback = row.routedTo === 'rules' || row.statusLabel === 'Fallback' || row.statusLabel === 'Error';
+    if (isFallback) {
+      return {
+        key: `router-chip-${agent}`,
+        label: `${agentLabel}: Fallback`,
+        className: 'border-amber-500/35 text-amber-200 bg-amber-500/10',
+      };
+    }
+    return {
+      key: `router-chip-${agent}`,
+      label: `${agentLabel}: AI`,
+      className: 'border-emerald-500/35 text-emerald-200 bg-emerald-500/10',
+    };
+  });
   const routerNarrative =
     sanitizeRouterReason(routerDecisionForView?.rationale || routerDecisionForView?.reason || '') ||
     'Decision selected from current match signals.';
@@ -7630,6 +7603,16 @@ function Dashboard({
                               </span>
                             </div>
                             <p className="text-[11px] text-slate-300 mt-1">{routerStatusHint.engagedLine}</p>
+                            <div className="mt-2 flex flex-wrap gap-1.5">
+                              {routerAgentChips.map((chip) => (
+                                <span
+                                  key={chip.key}
+                                  className={`text-[10px] px-2 py-0.5 rounded border font-semibold tracking-wide ${chip.className}`}
+                                >
+                                  {chip.label}
+                                </span>
+                              ))}
+                            </div>
                           </div>
                         )}
                         {agentWarning && (
