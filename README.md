@@ -309,9 +309,7 @@ DEV + DELIVERY TOOLING (MICROSOFT + GITHUB)
 └──────────────────────────────────────────────────────────────────────────────┘
 
 
-````markdown
-```mermaid
-
+````
 flowchart TB
   %% =========================
   %% tactIQ - GitHub README Architecture
