@@ -133,6 +133,9 @@ const toAgentStatus = (status: string | undefined, didRun: boolean): AgentStatus
 const isRecordValue = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const isExplicitDisable = (value: unknown): boolean => value === true || String(value || '').trim().toLowerCase() === 'true';
+const allowFatigueDisableFlag =
+  String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production' &&
+  String(process.env.DISABLE_FATIGUE_LLM || '').trim().toLowerCase() === 'true';
 const isAgentEnabled = (input: OrchestrateRequest, agent: LegacyAgentId): boolean => {
   const signalRecord = isRecordValue(input.signals) ? input.signals : {};
   const agentFlags = isRecordValue((input as unknown as Record<string, unknown>).agents)
@@ -147,7 +150,12 @@ const isAgentEnabled = (input: OrchestrateRequest, agent: LegacyAgentId): boolea
   const explicitDisableInSignals = disableFlagKey.some((key) => isExplicitDisable(signalRecord[key]));
   const explicitDisableInAgents =
     isRecordValue(agentFlags[agent]) && (agentFlags[agent] as Record<string, unknown>).enabled === false;
-  return !(explicitDisableInSignals || explicitDisableInAgents);
+  const explicitDisable = explicitDisableInSignals || explicitDisableInAgents;
+  if (agent === 'tactical') return true;
+  if (agent === 'fatigue' && explicitDisable && !allowFatigueDisableFlag) {
+    return true;
+  }
+  return !explicitDisable;
 };
 const toAgentRoute = (status: string | undefined, model: string): 'llm' | 'rules' =>
   status === 'fallback' || /^rule:/i.test(String(model || '')) ? 'rules' : 'llm';
@@ -418,21 +426,54 @@ function computeTriggers(input: OrchestrateRequest): TriggerScores {
 
 export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateRequest): RouterDecision {
   const contextPayload = input.context;
+  const signalRecord = isRecordValue(input.signals) ? input.signals : {};
   const activeFromContext = getActivePlayerContext(input) || contextPayload?.roster?.[0];
   const activePlayerId = activeFromContext?.playerId || contextPayload?.activePlayerId || undefined;
-  const fatigueIndex = safeNumber(activeFromContext?.live?.fatigueIndex, 0);
-  const strainIndex = safeNumber(activeFromContext?.live?.strainIndex, 0);
-  const injuryRisk = normalizeRisk(activeFromContext?.live?.injuryRisk);
-  const noBallRisk = normalizeRisk(activeFromContext?.live?.noBallRisk);
+  const fatigueIndex = safeNumber(activeFromContext?.live?.fatigueIndex, safeNumber(input.telemetry?.fatigueIndex, 0));
+  const strainIndex = safeNumber(activeFromContext?.live?.strainIndex, safeNumber(input.telemetry?.strainIndex, 0));
+  const oversBowled = safeNumber(activeFromContext?.live?.oversBowled, safeNumber(input.telemetry?.oversBowled, 0));
+  const injuryRisk = normalizeRisk(activeFromContext?.live?.injuryRisk ?? input.telemetry?.injuryRisk);
+  const noBallRisk = normalizeRisk(activeFromContext?.live?.noBallRisk ?? input.telemetry?.noBallRisk);
+  const recoveryToken = String(activeFromContext?.live?.heartRateRecovery || input.telemetry?.heartRateRecovery || '')
+    .trim()
+    .toUpperCase();
+  const recoveryNotGood = recoveryToken.length > 0 && recoveryToken !== 'GOOD';
+  const fatigueTrendToken = String(
+    signalRecord.fatigueTrend ??
+      signalRecord.fatigueTrendDirection ??
+      signalRecord.fatigueTrendLabel ??
+      (activeFromContext?.live as Record<string, unknown> | undefined)?.fatigueTrend ??
+      ''
+  )
+    .trim()
+    .toLowerCase();
+  const fatigueTrendRising =
+    signalRecord.fatigueTrendRising === true ||
+    String(signalRecord.fatigueTrendRising || '').trim().toLowerCase() === 'true' ||
+    fatigueTrendToken === 'up' ||
+    fatigueTrendToken === 'rising' ||
+    fatigueTrendToken === 'increase' ||
+    fatigueTrendToken === 'increasing';
   const match = contextPayload?.match;
   const matchMode = normalizeMatchMode(match?.matchMode);
   const matchPhase = String(match?.phase || 'Middle');
   const matchIntensity = String(match?.intensity || 'Medium');
   const fatigueLimit = safeNumber(activeFromContext?.baseline?.fatigueLimit, safeNumber(input.telemetry?.fatigueLimit, 6));
   const projectedFatigueNextOver = Number(clamp(fatigueIndex + Math.max(0, strainIndex) * 0.15 + 0.6, 0, 10).toFixed(1));
-  const fatigueTriggered = fatigueIndex >= 6 || projectedFatigueNextOver >= fatigueLimit || strainIndex >= 3;
+  // Cost-aware hybrid routing with safety fallback:
+  // Tactical always runs, while Fatigue/Risk run only when trigger thresholds indicate meaningful impact.
+  const fatigueTriggered =
+    fatigueIndex >= 4 ||
+    strainIndex >= 2 ||
+    oversBowled >= 2 ||
+    recoveryNotGood ||
+    fatigueTrendRising;
   const riskTriggered =
-    injuryRisk === 'MEDIUM' || injuryRisk === 'HIGH' || noBallRisk === 'MEDIUM' || noBallRisk === 'HIGH';
+    injuryRisk === 'MEDIUM' ||
+    injuryRisk === 'HIGH' ||
+    noBallRisk === 'MEDIUM' ||
+    noBallRisk === 'HIGH' ||
+    strainIndex >= 2;
 
   const rulesFired: string[] = [];
   let intent: RouterDecision['intent'] = 'GENERAL';
@@ -445,6 +486,8 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
   rulesFired.push('tactical_always_on');
   if (fatigueTriggered) rulesFired.push('fatigue_triggered');
   if (riskTriggered) rulesFired.push('risk_triggered');
+  if (recoveryNotGood) rulesFired.push('recovery_not_good');
+  if (fatigueTrendRising) rulesFired.push('fatigue_trend_rising');
 
   if (mode === 'full') {
     intent = 'BOTH_NEXT';
@@ -478,6 +521,9 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
       strainIndex,
       injuryRisk,
       noBallRisk,
+      oversBowled,
+      recovery: recoveryToken || 'UNKNOWN',
+      fatigueTrend: fatigueTrendToken || 'unknown',
     },
     match: {
       matchMode,
@@ -507,6 +553,9 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
       ...inputsUsed.match,
       projectedFatigueNextOver,
       fatigueLimit,
+      oversBowled,
+      recovery: recoveryToken || 'UNKNOWN',
+      fatigueTrendRising,
     },
   };
 }
@@ -882,9 +931,10 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
       ? routerDecisionRaw.selectedAgents
       : toLegacyAgents(routerDecisionRaw.agentsToRun)
   );
-  const selectedAgents = forceAllAgents
+  const selectedAgentsBase = forceAllAgents
     ? (['fatigue', 'risk', 'tactical'] as LegacyAgentId[])
     : (routerSelectedAgents.length > 0 ? routerSelectedAgents : (['tactical'] as LegacyAgentId[]));
+  const selectedAgents = normalizeSelectedLegacyAgents([...selectedAgentsBase, 'tactical']);
   const routerDecision: RouterDecision = {
     ...routerDecisionRaw,
     mode,
@@ -893,10 +943,15 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     reason: routerDecisionRaw.reason,
   };
   const selectedSet = new Set<LegacyAgentId>(routerDecision.selectedAgents);
+  const enabledFlags = {
+    fatigue: isAgentEnabled(inputWithContext, 'fatigue'),
+    risk: isAgentEnabled(inputWithContext, 'risk'),
+    tactical: true,
+  };
   const runFlags = {
-    fatigue: selectedSet.has('fatigue') && isAgentEnabled(inputWithContext, 'fatigue'),
-    risk: selectedSet.has('risk') && isAgentEnabled(inputWithContext, 'risk'),
-    tactical: selectedSet.has('tactical') && isAgentEnabled(inputWithContext, 'tactical'),
+    fatigue: selectedSet.has('fatigue') && enabledFlags.fatigue,
+    risk: selectedSet.has('risk') && enabledFlags.risk,
+    tactical: true,
   };
   const executedAgents: LegacyAgentId[] = (['fatigue', 'risk', 'tactical'] as const).filter((agent) => runFlags[agent]);
   context.log('[orchestrate] routing', {
@@ -1268,27 +1323,51 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     agent: LegacyAgentId,
     didRun: boolean,
     status: string | undefined,
-    agentModel: string
+    selected: boolean,
+    enabled: boolean
   ): string => {
-    if (!didRun) return 'disabled_by_request';
+    if (!selected) return 'not_selected_by_auto_router';
+    if (!enabled) return 'disabled_by_request';
+    if (!didRun) return 'not_executed';
     if (status === 'fallback') {
-      return `${agent}:fallback(${/^rule:|fallback/i.test(agentModel) ? 'openai_or_json_failure' : 'fallback'})`;
+      return 'llm_failed';
     }
     if (status === 'error') return `${agent}:error`;
-    return `${agent}:llm_success`;
+    return 'llm_success';
   };
+  const fatigueRouteReason = deriveRouteReason(
+    'fatigue',
+    runFlags.fatigue,
+    fatigue?.status,
+    selectedSet.has('fatigue'),
+    enabledFlags.fatigue
+  );
+  const riskRouteReason = deriveRouteReason(
+    'risk',
+    runFlags.risk,
+    risk?.status,
+    selectedSet.has('risk'),
+    enabledFlags.risk
+  );
+  const tacticalRouteReason = deriveRouteReason(
+    'tactical',
+    runFlags.tactical,
+    tactical?.status,
+    selectedSet.has('tactical'),
+    enabledFlags.tactical
+  );
   const routerAgentDetails: NonNullable<RouterDecision['agents']> = {
     fatigue: {
       routedTo: fatigueRoutedTo,
-      reason: deriveRouteReason('fatigue', runFlags.fatigue, fatigue?.status, fatigueModel),
+      reason: fatigueRouteReason,
     },
     risk: {
       routedTo: riskRoutedTo,
-      reason: deriveRouteReason('risk', runFlags.risk, risk?.status, riskModel),
+      reason: riskRouteReason,
     },
     tactical: {
       routedTo: tacticalRoutedTo,
-      reason: deriveRouteReason('tactical', runFlags.tactical, tactical?.status, tacticalModel),
+      reason: tacticalRouteReason,
     },
   };
   const routerDecisionWithRoutes: RouterDecision = {
@@ -1297,27 +1376,9 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     agents: routerAgentDetails,
   };
 
-  context.log(`[router] fatigue -> ${runFlags.fatigue ? fatigueRoutedTo : 'rules'} (reason: ${
-    runFlags.fatigue
-      ? fatigue?.status === 'fallback'
-        ? 'openai_error'
-        : 'agent_success'
-      : 'disabled_by_request'
-  })`);
-  context.log(`[router] risk -> ${runFlags.risk ? riskRoutedTo : 'rules'} (reason: ${
-    runFlags.risk
-      ? risk?.status === 'fallback'
-        ? 'openai_error'
-        : 'agent_success'
-      : 'disabled_by_request'
-  })`);
-  context.log(`[router] tactical -> ${runFlags.tactical ? tacticalRoutedTo : 'rules'} (reason: ${
-    runFlags.tactical
-      ? tactical?.status === 'fallback'
-        ? 'openai_error'
-        : 'agent_success'
-      : 'disabled_by_request'
-  })`);
+  context.log(`[router] fatigue -> ${runFlags.fatigue ? fatigueRoutedTo : 'rules'} (reason: ${fatigueRouteReason})`);
+  context.log(`[router] risk -> ${runFlags.risk ? riskRoutedTo : 'rules'} (reason: ${riskRouteReason})`);
+  context.log(`[router] tactical -> ${runFlags.tactical ? tacticalRoutedTo : 'rules'} (reason: ${tacticalRouteReason})`);
 
   const agentResults: OrchestrateResponse['agentResults'] = {
     fatigue: {
@@ -1325,7 +1386,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
       routedTo: fatigueRoutedTo,
       ...(fatigue ? { output: fatigue as unknown as Record<string, unknown> } : {}),
       ...(!runFlags.fatigue
-        ? { error: 'Agent explicitly disabled by request.' }
+        ? { error: selectedSet.has('fatigue') ? 'Agent explicitly disabled by request.' : 'Agent not selected by auto router.' }
         : !fatigue
           ? { error: errors.find((entry) => entry.agent === 'fatigue')?.message || 'Fatigue analysis unavailable.' }
           : {}),
@@ -1335,7 +1396,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
       routedTo: riskRoutedTo,
       ...(risk ? { output: risk as unknown as Record<string, unknown> } : {}),
       ...(!runFlags.risk
-        ? { error: 'Agent explicitly disabled by request.' }
+        ? { error: selectedSet.has('risk') ? 'Agent explicitly disabled by request.' : 'Agent not selected by auto router.' }
         : !risk
           ? { error: errors.find((entry) => entry.agent === 'risk')?.message || 'Risk analysis unavailable.' }
           : {}),
@@ -1345,7 +1406,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
       routedTo: tacticalRoutedTo,
       ...(tactical ? { output: tactical as unknown as Record<string, unknown> } : {}),
       ...(!runFlags.tactical
-        ? { error: 'Agent explicitly disabled by request.' }
+        ? { error: selectedSet.has('tactical') ? 'Agent explicitly disabled by request.' : 'Agent not selected by auto router.' }
         : !tactical
           ? { error: errors.find((entry) => entry.agent === 'tactical')?.message || 'Tactical analysis unavailable.' }
           : {}),
