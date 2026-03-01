@@ -1330,6 +1330,9 @@ const normalizeApiFailureBody = (body?: string): string | null => {
   if (!body) return null;
   const trimmed = body.trim();
   if (!trimmed) return null;
+  if (/(backend modules are not ready|backend modules unavailable|backend_not_ready|npm --prefix api run build|api\/dist)/i.test(trimmed)) {
+    return 'Rules fallback (temporary backend build issue)';
+  }
   if (/^<!doctype html/i.test(trimmed) || /^<html/i.test(trimmed)) {
     return 'API returned HTML instead of JSON (likely SPA fallback intercepting /api routes).';
   }
@@ -1343,7 +1346,13 @@ const normalizeApiFailureBody = (body?: string): string | null => {
     const candidate = [parsed.message, parsed.error, parsed.detail].find(
       (value): value is string => typeof value === 'string' && value.trim().length > 0
     );
-    if (candidate) return traceId ? `${candidate.trim()} (traceId: ${traceId})` : candidate.trim();
+    if (candidate) {
+      const normalizedCandidate = candidate.trim();
+      if (/(backend modules are not ready|backend modules unavailable|backend_not_ready|npm --prefix api run build|api\/dist)/i.test(normalizedCandidate)) {
+        return 'Rules fallback (temporary backend build issue)';
+      }
+      return traceId ? `${normalizedCandidate} (traceId: ${traceId})` : normalizedCandidate;
+    }
     if (traceId) return `Request failed (traceId: ${traceId})`;
   } catch {
     // Keep plain-text body fallback.
@@ -2716,11 +2725,28 @@ export default function App() {
       };
 
       const routingNotice = deriveRoutingNotice();
-      const errorNotice = visibleErrors.length > 0 ? visibleErrors.map((e) => `${e.agent}: ${e.message}`).join(' | ') : null;
-      const responseWarnings = Array.isArray(result.warnings)
-        ? result.warnings.map((entry) => String(entry || '').trim()).filter(Boolean).join(' | ')
+      const sanitizeUiNotice = (value: unknown): string => {
+        const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+        if (!normalized) return '';
+        if (/(backend modules are not ready|backend modules unavailable|backend_not_ready|npm --prefix api run build|api\/dist)/i.test(normalized)) {
+          return 'Rules fallback (temporary backend build issue)';
+        }
+        const withoutCommands = normalized.replace(/\b(npm|pnpm|yarn|node|curl)\b[^|]*/gi, 'temporary issue');
+        const withoutJson = withoutCommands.replace(/[\{\}\[\]`]/g, '').replace(/https?:\/\/\S+/gi, '').trim();
+        return withoutJson.length > 180 ? `${withoutJson.slice(0, 179).trim()}…` : withoutJson;
+      };
+      const errorNotice = visibleErrors.length > 0
+        ? visibleErrors
+            .map((e) => `${e.agent}: ${sanitizeUiNotice(e.message)}`)
+            .filter((entry) => entry.trim().length > 0)
+            .join(' | ')
         : null;
-      const warning = [routingNotice, responseWarnings, errorNotice, options?.extraWarning].filter(Boolean).join(' | ') || null;
+      const responseWarnings = Array.isArray(result.warnings)
+        ? result.warnings.map((entry) => sanitizeUiNotice(entry)).filter(Boolean).join(' | ')
+        : null;
+      const warning = [routingNotice, responseWarnings, errorNotice, sanitizeUiNotice(options?.extraWarning)]
+        .filter(Boolean)
+        .join(' | ') || null;
       const hasAnyAgentOutput =
         hasAgentOutput('fatigue') || hasAgentOutput('risk') || hasAgentOutput('tactical');
       setAgentWarning(warning);
@@ -5057,15 +5083,46 @@ function Dashboard({
     risk: orchestrateMeta?.modelRouter?.risk || routerDecisionForView?.agents?.risk,
     tactical: orchestrateMeta?.modelRouter?.tactical || routerDecisionForView?.agents?.tactical,
   };
-  const modelRouterSummary = (['fatigue', 'risk', 'tactical'] as const)
-    .map((agent) => {
-      const entry = modelRouterForView[agent];
-      if (!entry) return null;
-      const routeLabel = entry.routedTo === 'rules' ? 'RULES' : 'LLM';
-      const reason = String(entry.reason || '').trim();
-      return reason ? `${agent}: ${routeLabel} (${reason})` : `${agent}: ${routeLabel}`;
-    })
-    .filter((entry): entry is string => Boolean(entry));
+  const debugRouterEnabled = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    const params = new URLSearchParams(window.location.search || '');
+    return params.get('debugRouter') === '1';
+  }, []);
+  const showRouterTechnicalDetails = import.meta.env.DEV || debugRouterEnabled;
+  const isBackendBuildIssueText = (value: unknown): boolean =>
+    /(backend modules are not ready|backend modules unavailable|backend_not_ready|npm --prefix api run build|api\/dist|cannot find module.*api\/dist|module not found.*api\/dist)/i.test(
+      String(value || '')
+    );
+  const sanitizeRouterReason = (value: unknown): string => {
+    const raw = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return '';
+    if (isBackendBuildIssueText(raw)) {
+      return 'Rules fallback (temporary backend build issue)';
+    }
+    if (/(disabled_by_request|not_selected_by_auto_router|not_selected|skipped)/i.test(raw)) {
+      return 'Not selected for this run.';
+    }
+    if (/(llm_success|openai_success|ai_success|azure)/i.test(raw)) {
+      return 'AI response received.';
+    }
+    if (/(fallback|timeout|http|5\d\d|429|invalid json|json parse|parse|failed|error)/i.test(raw)) {
+      return 'Temporary issue, fallback applied.';
+    }
+    const withoutDangerousParens = raw.replace(
+      /\(([^)]*(http|trace|stack|failed|error|npm|pnpm|yarn|node|curl|json|[\{\[])[^)]*)\)/gi,
+      '(temporary issue)'
+    );
+    const withoutCommands = withoutDangerousParens.replace(
+      /\b(npm|pnpm|yarn|node|curl)\b[^,;]*/gi,
+      'temporary issue'
+    );
+    const withoutJson = withoutCommands
+      .replace(/https?:\/\/\S+/gi, '')
+      .replace(/[\{\}\[\]`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return withoutJson.length > 88 ? `${withoutJson.slice(0, 87).trim()}…` : withoutJson;
+  };
   const routerSelectedAgents =
     (routerDecisionForView?.selectedAgents && routerDecisionForView.selectedAgents.length > 0
       ? routerDecisionForView.selectedAgents
@@ -5087,6 +5144,93 @@ function Dashboard({
     ])
   );
   const selectedAgentSet = new Set(selectedAgents);
+  const formatAgentList = (agents: AgentKey[]): string => {
+    const labels = agents.map((agent) => {
+      if (agent === 'fatigue') return 'Fatigue';
+      if (agent === 'risk') return 'Risk';
+      return 'Tactical';
+    });
+    if (labels.length === 0) return 'None';
+    if (labels.length === 1) return `${labels[0]} only`;
+    return labels.join(' + ');
+  };
+  const routerDetailRows = (['fatigue', 'risk', 'tactical'] as const).map((agent) => {
+    const entry = modelRouterForView[agent];
+    const status = agentFeedStatus[agent];
+    const engaged = runMode === 'full' ? true : selectedAgentSet.has(agent) || status === 'RUNNING';
+    const routedTo: 'llm' | 'rules' = entry?.routedTo
+      ? entry.routedTo
+      : status === 'FALLBACK' || status === 'SKIPPED'
+        ? 'rules'
+        : 'llm';
+    const reason = sanitizeRouterReason(
+      String(entry?.reason || '').trim() || (!engaged && runMode !== 'full' ? 'not_selected_by_auto_router' : '')
+    );
+    const statusLabel =
+      status === 'SUCCESS'
+        ? 'Success'
+        : status === 'FALLBACK'
+          ? 'Fallback'
+          : status === 'RUNNING'
+            ? 'Running'
+            : status === 'SKIPPED'
+              ? 'Skipped'
+              : status === 'ERROR'
+                ? 'Error'
+                : 'Idle';
+    const routeLabel = routedTo === 'llm' ? 'AI' : 'Rules';
+    return {
+      agent,
+      engaged,
+      routedTo,
+      statusLabel,
+      routeLabel,
+      reason,
+      backendBuildIssue: isBackendBuildIssueText(entry?.reason || ''),
+    };
+  });
+  const routerStatusHint = (() => {
+    const engagedRows = routerDetailRows.filter((row) => row.engaged);
+    if (engagedRows.length === 0) return null;
+    const hasBackendBuildIssue = engagedRows.some((row) => row.backendBuildIssue);
+    const hasSkipped = routerDetailRows.some((row) => row.statusLabel === 'Skipped');
+    const allRules = engagedRows.every((row) => row.routedTo === 'rules');
+    const anyRules = engagedRows.some((row) => row.routedTo === 'rules');
+    const allAi = engagedRows.every((row) => row.routedTo === 'llm');
+    if (hasBackendBuildIssue) {
+      return {
+        label: 'Rules fallback (temporary backend build issue)',
+        toneClass: 'border-slate-500/35 text-slate-200 bg-slate-500/10',
+        dotClass: 'bg-slate-300',
+        engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
+      };
+    }
+    if (allRules) {
+      return {
+        label: 'Routing: Rules fallback',
+        toneClass: 'border-slate-500/35 text-slate-200 bg-slate-500/10',
+        dotClass: 'bg-slate-300',
+        engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
+      };
+    }
+    if (allAi && !hasSkipped && !anyRules) {
+      return {
+        label: 'Routing: AI',
+        toneClass: 'border-emerald-500/35 text-emerald-200 bg-emerald-500/10',
+        dotClass: 'bg-emerald-400',
+        engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
+      };
+    }
+    return {
+      label: 'Routing: Hybrid',
+      toneClass: 'border-amber-500/35 text-amber-200 bg-amber-500/10',
+      dotClass: 'bg-amber-300',
+      engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
+    };
+  })();
+  const routerNarrative =
+    sanitizeRouterReason(routerDecisionForView?.rationale || routerDecisionForView?.reason || '') ||
+    'Decision selected from current match signals.';
   const isCoachOutputState = analysisActive || showCoachInsights;
   const shouldShowTelemetryGraph = showCoachInsights && (analysisActive || agentState !== 'idle');
   const isFullAnalysis = runMode === 'full';
@@ -7477,10 +7621,15 @@ function Dashboard({
                         <div className="rounded-lg border border-indigo-400/25 bg-indigo-500/5 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-indigo-200">
                           {agentState === 'thinking' ? 'Analyzing...' : 'AI Strategic Analysis'}
                         </div>
-                        {modelRouterSummary.length > 0 && (
+                        {routerStatusHint && (
                           <div className="rounded-md border border-slate-700 bg-slate-900/30 px-3 py-2">
-                            <p className="text-[10px] uppercase tracking-wide text-slate-400">Model Router</p>
-                            <p className="text-[11px] text-slate-200 mt-1">{modelRouterSummary.join(' | ')}</p>
+                            <div className="flex items-center gap-2">
+                              <span className={`inline-block h-1.5 w-1.5 rounded-full ${routerStatusHint.dotClass}`} />
+                              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold tracking-wide ${routerStatusHint.toneClass}`}>
+                                {routerStatusHint.label}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-300 mt-1">{routerStatusHint.engagedLine}</p>
                           </div>
                         )}
                         {agentWarning && (
@@ -7812,7 +7961,7 @@ function Dashboard({
                                   <p className="text-[11px] text-slate-400 mt-1">
                                     {isFullAnalysis
                                       ? 'Full analysis mode bypasses router selection and forces fatigue, risk, and tactical agents in parallel.'
-                                      : routerDecisionForView?.rationale || routerDecisionForView?.reason || 'Decision selected from current match signals.'}
+                                      : routerNarrative}
                                   </p>
                                 </div>
 
@@ -7844,6 +7993,26 @@ function Dashboard({
                                       );
                                     })}
                                   </div>
+                                </div>
+
+                                <div className="rounded-lg border border-slate-700 bg-slate-900/30 px-3 py-2.5">
+                                  <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-2">Debug details</p>
+                                  <div className="space-y-1.5">
+                                    {routerDetailRows.map((row) => (
+                                      <p key={`advanced-router-${row.agent}`} className="text-[11px] text-slate-300 leading-relaxed">
+                                        <span className="font-semibold text-slate-200">
+                                          {row.agent === 'risk' ? 'Risk' : row.agent === 'fatigue' ? 'Fatigue' : 'Tactical'}
+                                        </span>{' '}
+                                        - {row.routeLabel} - {row.statusLabel}
+                                        {row.reason ? ` - ${row.reason}` : ''}
+                                      </p>
+                                    ))}
+                                  </div>
+                                  {!showRouterTechnicalDetails && (
+                                    <p className="text-[10px] text-slate-500 mt-2">
+                                      Technical traces are hidden in production view.
+                                    </p>
+                                  )}
                                 </div>
 
                                 {showWhyThisDecision && (

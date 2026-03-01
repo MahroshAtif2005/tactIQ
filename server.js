@@ -1038,6 +1038,19 @@ if (isBotEnabled) {
 
 let backend = null;
 let backendLoadError = null;
+let backendNotReadyLogged = false;
+const expectedApiBuildFiles = [
+  path.resolve(__dirname, "api/dist/orchestrator/orchestrator.js"),
+  path.resolve(__dirname, "api/dist/orchestrator/validation.js"),
+  path.resolve(__dirname, "api/dist/agents/fatigueAgent.js"),
+  path.resolve(__dirname, "api/dist/agents/riskAgent.js"),
+  path.resolve(__dirname, "api/dist/agents/tacticalAgent.js"),
+  path.resolve(__dirname, "api/dist/llm/modelRegistry.js"),
+];
+const getMissingApiBuildFiles = () =>
+  expectedApiBuildFiles.filter((filePath) => !fs.existsSync(filePath));
+const canAttemptRuntimeApiBuild =
+  String(process.env.NODE_ENV || "development").trim().toLowerCase() !== "production";
 const loadBackendModules = () => {
   const { orchestrateAgents, buildRouterDecision } = require("./api/dist/orchestrator/orchestrator");
   const { validateOrchestrateRequest, validateTacticalRequest } = require("./api/dist/orchestrator/validation");
@@ -1060,12 +1073,21 @@ const loadBackendModules = () => {
 try {
   backend = loadBackendModules();
 } catch (firstError) {
-  try {
-    execSync("npm --prefix api run build", { stdio: "ignore" });
-    backend = loadBackendModules();
-  } catch (secondError) {
-    backendLoadError = secondError;
-    console.error("Backend modules unavailable:", secondError.message || firstError.message);
+  const missingApiBuildFiles = getMissingApiBuildFiles();
+  if (missingApiBuildFiles.length > 0) {
+    console.error("[boot] API build artifacts missing.", { missingApiBuildFiles });
+  }
+  if (canAttemptRuntimeApiBuild) {
+    try {
+      execSync("npm --prefix api run build", { stdio: "ignore" });
+      backend = loadBackendModules();
+    } catch (secondError) {
+      backendLoadError = secondError;
+      console.error("[boot] Backend modules unavailable:", sanitizeErrorMessage(secondError || firstError));
+    }
+  } else {
+    backendLoadError = firstError;
+    console.error("[boot] Backend modules unavailable:", sanitizeErrorMessage(firstError));
   }
 }
 
@@ -1102,9 +1124,18 @@ const createInvocationContext = () => ({
 
 const ensureBackendLoaded = (res) => {
   if (backend) return true;
-  res.status(500).json({
-    error: "Backend modules are not ready. Run `npm --prefix api run build` and restart the server.",
-    details: backendLoadError ? String(backendLoadError.message || backendLoadError) : "unknown",
+  if (!backendNotReadyLogged) {
+    backendNotReadyLogged = true;
+    console.error("[boot] Backend not ready for request handling.", {
+      missingApiBuildFiles: getMissingApiBuildFiles(),
+      error: sanitizeErrorMessage(backendLoadError),
+    });
+  }
+  res.status(503).json({
+    ok: false,
+    error: "backend_not_ready",
+    message: "AI agents are temporarily unavailable due to a backend build issue.",
+    details: "Rules fallback is active while backend modules recover.",
   });
   return false;
 };
