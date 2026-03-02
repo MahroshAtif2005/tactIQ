@@ -60,6 +60,132 @@ const normalizeRisk = (value: unknown): 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN' =>
   if (token === 'MED' || token === 'MEDIUM') return 'MEDIUM';
   return 'UNKNOWN';
 };
+const getFormatMaxOvers = (format?: string): number => {
+  const token = String(format || '').trim().toUpperCase();
+  if (token === 'T20') return 4;
+  if (token === 'ODI') return 10;
+  return 12;
+};
+const sanitizeLine = (value: unknown, fallback: string, maxChars = 120): string => {
+  const normalized = String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/\b([a-z]+)(?:\s*,\s*\1\b)+/gi, '$1')
+    .replace(/\b([a-z]+)(?:\s+\1\b){1,}/gi, '$1')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .trim();
+  const broken =
+    !normalized ||
+    /(?:\bof\.?$|\bof$| of and )/i.test(normalized) ||
+    /\bis\s*,\s*is\b/i.test(normalized);
+  if (broken) return truncateChars(fallback, maxChars) || fallback;
+  return truncateChars(normalized, maxChars) || truncateChars(fallback, maxChars) || fallback;
+};
+const sanitizeBullets = (items: Array<unknown>, max = 3): string[] =>
+  dedupeTextList(
+    items
+      .map((entry) => sanitizeLine(entry, '', 90))
+      .filter((entry) => entry.length > 0)
+      .filter((entry) => !/(?:\bof\.?$|\bof$| of and )/i.test(entry))
+  ).slice(0, max);
+const applyTacticalDefaults = (input: TacticalAgentInput): TacticalAgentInput => {
+  const bowlerName = sanitizeLine(input.telemetry?.playerName || input.players?.bowler, 'Current bowler', 80);
+  const fatigueIndex = Number.isFinite(Number(input.telemetry?.fatigueIndex)) ? Number(input.telemetry?.fatigueIndex) : 0;
+  const fatigueLimit = Number.isFinite(Number(input.telemetry?.fatigueLimit)) ? Number(input.telemetry?.fatigueLimit) : 7;
+  const oversBowled = Number.isFinite(Number(input.telemetry?.oversBowled)) ? Number(input.telemetry?.oversBowled) : 0;
+  const strainIndex = Number.isFinite(Number(input.telemetry?.strainIndex)) ? Number(input.telemetry?.strainIndex) : 0;
+  const injuryRisk = normalizeRisk(input.telemetry?.injuryRisk) === 'UNKNOWN' ? 'LOW' : normalizeRisk(input.telemetry?.injuryRisk);
+  const noBallRisk = normalizeRisk(input.telemetry?.noBallRisk) === 'UNKNOWN' ? 'LOW' : normalizeRisk(input.telemetry?.noBallRisk);
+  const recovery = sanitizeLine(input.telemetry?.heartRateRecovery, 'Good', 16);
+  return {
+    ...input,
+    players: {
+      ...input.players,
+      bowler: sanitizeLine(input.players?.bowler || bowlerName, 'Current bowler', 80),
+    },
+    telemetry: {
+      ...input.telemetry,
+      playerName: bowlerName,
+      fatigueIndex,
+      fatigueLimit,
+      oversBowled,
+      strainIndex,
+      injuryRisk,
+      noBallRisk,
+      heartRateRecovery: recovery,
+    },
+  };
+};
+const shouldForceContinueGuardrail = (input: TacticalAgentInput, teamMode: 'BATTING' | 'BOWLING'): boolean => {
+  if (teamMode !== 'BOWLING') return false;
+  const oversBowled = Number(input.telemetry?.oversBowled || 0);
+  const fatigueIndex = Number(input.telemetry?.fatigueIndex || 0);
+  const injuryRisk = normalizeRisk(input.telemetry?.injuryRisk);
+  return oversBowled === 0 || (fatigueIndex <= 4 && injuryRisk === 'LOW');
+};
+const buildContinueGuardrailOutput = (input: TacticalAgentInput, status: TacticalAgentOutput['status']): TacticalAgentOutput => {
+  const teamMode = normalizeTeamMode(input);
+  const bowlerName = sanitizeLine(input.telemetry?.playerName || input.players?.bowler, 'Current bowler', 80);
+  const oversBowled = Number(input.telemetry?.oversBowled || 0);
+  const fatigueIndex = Number(input.telemetry?.fatigueIndex || 0);
+  const recovery = sanitizeLine(input.telemetry?.heartRateRecovery, 'Good', 16);
+  const maxOvers = Number.isFinite(Number(input.telemetry?.maxOvers))
+    ? Number(input.telemetry.maxOvers)
+    : getFormatMaxOvers(input.matchContext?.format);
+  const alternatives = listEligibleReplacements(input, teamMode)
+    .slice(0, 3)
+    .map((candidate) => candidate.name)
+    .filter(Boolean);
+  const whyBullets = [
+    `Overs bowled: ${oversBowled.toFixed(1)}/${Math.max(1, maxOvers)}; no overuse signal.`,
+    `Fatigue: ${fatigueIndex.toFixed(1)}/10; recovery: ${recovery}.`,
+    'Risk is low; maintain control-focused lines.',
+  ];
+  const optionsLine = alternatives.length > 0 ? `Other options: ${alternatives.join(', ')}.` : '';
+  return {
+    status,
+    immediateAction: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
+    nextAction: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
+    rationale: `${bowlerName} is in a safe state to continue this spell.`,
+    suggestedAdjustments: optionsLine ? [...whyBullets, optionsLine] : [...whyBullets],
+    why: [...whyBullets],
+    ifIgnored: 'Minimal risk; monitor strain if tempo increases.',
+    coachNote: alternatives.length > 0 ? optionsLine : 'No immediate replacement required.',
+    confidence: 0.82,
+    keySignalsUsed: ['oversBowled', 'fatigueIndex', 'injuryRisk', 'heartRateRecovery', 'guardrail:stable_continue'],
+  };
+};
+const sanitizeTacticalOutput = (output: TacticalAgentOutput): TacticalAgentOutput => {
+  const immediateAction = sanitizeLine(output.immediateAction, 'Continue with monitored tactical plan', 70);
+  const rationale = sanitizeLine(output.rationale, 'Tactical recommendation generated from live telemetry.', 90);
+  const why = sanitizeBullets(output.why || [rationale], 3);
+  const suggestedAdjustments = sanitizeBullets(output.suggestedAdjustments || why, 6);
+  const ifIgnored = sanitizeLine(output.ifIgnored, 'Minimal risk; continue monitoring for workload changes.', 90);
+  const coachNote = sanitizeLine(output.coachNote, 'Apply this plan for one over, then reassess live risk signals.', 110);
+  return {
+    ...output,
+    immediateAction,
+    nextAction: sanitizeLine(output.nextAction || immediateAction, immediateAction, 70),
+    rationale,
+    why,
+    suggestedAdjustments,
+    ifIgnored,
+    coachNote,
+    substitutionAdvice: output.substitutionAdvice
+      ? {
+          out: sanitizeLine(output.substitutionAdvice.out, 'Current player', 80),
+          in: sanitizeLine(output.substitutionAdvice.in, 'No eligible replacement', 80),
+          reason: sanitizeLine(output.substitutionAdvice.reason, 'Substitution recommended from tactical model.', 90),
+        }
+      : undefined,
+    swap: output.swap
+      ? {
+          out: sanitizeLine(output.swap.out, 'Current player', 80),
+          in: sanitizeLine(output.swap.in, 'No eligible replacement', 80),
+          reason: sanitizeLine(output.swap.reason, 'Substitution recommended from tactical model.', 90),
+        }
+      : undefined,
+  };
+};
 const buildTelemetryBasis = (input: TacticalAgentInput): string => {
   const oversBowled = Number(input.telemetry?.oversBowled || 0);
   const fatigueIndex = Number(input.telemetry?.fatigueIndex || 0);
@@ -505,17 +631,27 @@ const compactTacticalContext = (input: TacticalAgentInput) => {
 };
 
 export function buildTacticalFallback(input: TacticalAgentInput, reason: string): TacticalAgentResult {
-  const fatigueIndex = Number(input.telemetry.fatigueIndex) || 0;
-  const injuryRisk = String(input.telemetry.injuryRisk || 'MEDIUM').toUpperCase();
-  const noBallRisk = String(input.telemetry.noBallRisk || 'MEDIUM').toUpperCase();
-  const teamMode = normalizeTeamMode(input);
-  const telemetryBasis = buildTelemetryBasis(input);
-  const baselineDirective = deriveBaselineDirective(input);
-  const poorRecovery = ['poor', 'very poor'].includes(String(input.telemetry.heartRateRecovery || '').toLowerCase());
-  const replacementCandidate = listEligibleReplacements(input, teamMode)[0];
-  const replacement = replacementCandidate?.name || pickBenchReplacement(input, teamMode);
+  const safeInput = applyTacticalDefaults(input);
+  const teamMode = normalizeTeamMode(safeInput);
+  if (shouldForceContinueGuardrail(safeInput, teamMode)) {
+    return {
+      output: sanitizeTacticalOutput(buildContinueGuardrailOutput(safeInput, 'fallback')),
+      model: 'fallback-heuristic',
+      fallbacksUsed: [reason, 'guardrail:stable_continue'],
+    };
+  }
+  const fatigueIndex = Number(safeInput.telemetry.fatigueIndex) || 0;
+  const injuryRisk = String(safeInput.telemetry.injuryRisk || 'MEDIUM').toUpperCase();
+  const noBallRisk = String(safeInput.telemetry.noBallRisk || 'MEDIUM').toUpperCase();
+  const telemetryBasis = buildTelemetryBasis(safeInput);
+  const baselineDirective = deriveBaselineDirective(safeInput);
+  const poorRecovery = ['poor', 'very poor'].includes(String(safeInput.telemetry.heartRateRecovery || '').toLowerCase());
+  const replacementCandidate = listEligibleReplacements(safeInput, teamMode)[0];
+  const replacement = replacementCandidate?.name || pickBenchReplacement(safeInput, teamMode);
   const hasEligibleReplacement = Boolean(replacementCandidate) && !/^No eligible/i.test(replacement);
-  const outToken = String(input.telemetry.playerId || input.telemetry.playerName || input.players.bowler || 'Current player');
+  const outToken = String(
+    safeInput.telemetry.playerId || safeInput.telemetry.playerName || safeInput.players.bowler || 'Current player'
+  );
   const inToken = String(replacementCandidate?.playerId || replacement);
   const shouldSubstitute = hasEligibleReplacement && (injuryRisk === 'HIGH' || injuryRisk === 'CRITICAL' || fatigueIndex >= 7 || poorRecovery);
   const whyBullets = shouldSubstitute
@@ -550,7 +686,7 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
           ];
 
   return {
-    output: {
+    output: sanitizeTacticalOutput({
       status: 'fallback',
       immediateAction:
         teamMode === 'BATTING'
@@ -587,13 +723,15 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
         : undefined,
       confidence: shouldSubstitute ? 0.72 : 0.67,
       keySignalsUsed: ['fatigueIndex', 'injuryRisk', 'noBallRisk', 'heartRateRecovery', 'phase', reason],
-    },
+    }),
     model: 'fallback-heuristic',
     fallbacksUsed: [reason],
   };
 }
 
 export async function runTacticalAgent(input: TacticalAgentInput): Promise<TacticalAgentResult> {
+  const safeInput = applyTacticalDefaults(input);
+  const teamMode = normalizeTeamMode(safeInput);
   const routing = routeModel({ task: 'tactical', needsJson: true, complexity: 'high' });
   const aoai = getAoaiConfig();
   if (!aoai.ok || !routing.deployment) {
@@ -603,7 +741,7 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
       hasApiVersion: aoai.ok,
       missing: aoai.ok ? [] : aoai.missing,
     });
-    return buildTacticalFallback(input, `missing:${(aoai.ok ? ['AZURE_OPENAI_DEPLOYMENT'] : aoai.missing).join(',')}`);
+    return buildTacticalFallback(safeInput, `missing:${(aoai.ok ? ['AZURE_OPENAI_DEPLOYMENT'] : aoai.missing).join(',')}`);
   }
   const endpointHost = (() => {
     try {
@@ -617,10 +755,9 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
     deployment: routing.deployment,
     apiVersion: aoai.config.apiVersion,
   });
-  const teamMode = normalizeTeamMode(input);
-  const focusRole = normalizeFocusRole(input, teamMode);
-  const telemetryBasis = buildTelemetryBasis(input);
-  const baselineDirective = deriveBaselineDirective(input);
+  const focusRole = normalizeFocusRole(safeInput, teamMode);
+  const telemetryBasis = buildTelemetryBasis(safeInput);
+  const baselineDirective = deriveBaselineDirective(safeInput);
   const teamModeInstruction =
     teamMode === 'BOWLING'
       ? 'Team mode is BOWLING. Recommend only bowling actions (next safe bowler, bowling field plan, workload safety). Never mention next batter.'
@@ -649,14 +786,14 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         constraints: {
           modeStrictness: teamModeInstruction,
           telemetryRequired: ['oversBowled', 'fatigueIndex', 'strainIndex'],
-          baselineRequired:
-            'When baseline exists, mention sleepHours + recoveryMinutes + fatigueLimit and explain how they change the action.',
+        baselineRequired:
+          'When baseline exists, mention sleepHours + recoveryMinutes + fatigueLimit and explain how they change the action.',
           noImmediateRotationRule:
             'If oversBowled=0 and fatigueIndex<=4 and strainIndex<=2 and injury/no-ball risk are not HIGH, avoid immediate bowler rotation.',
         },
         baseline: baselineDirective.profile,
-        input,
-        context: compactTacticalContext(input),
+        input: safeInput,
+        context: compactTacticalContext(safeInput),
       }),
     },
   ];
@@ -710,15 +847,20 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
       parsed.coachNote = truncateChars(`${baselineDirective.text} ${telemetryBasis}`.trim(), 110);
     }
     if (baselineDirective.constrained && teamMode === 'BOWLING' && !/rotate|substitut|switch/i.test(parsed.immediateAction.toLowerCase())) {
-      parsed.immediateAction = `Rotate ${input.telemetry.playerName || 'current bowler'} now and shorten the next spell`;
+      parsed.immediateAction = `Rotate ${safeInput.telemetry.playerName || 'current bowler'} now and shorten the next spell`;
     }
-    parsed = applyRotationGuardrail(parsed, input, telemetryBasis);
-    parsed = enforceSubstitutionEligibility(parsed, input, teamMode);
+    parsed = applyRotationGuardrail(parsed, safeInput, telemetryBasis);
+    parsed = enforceSubstitutionEligibility(parsed, safeInput, teamMode);
+    if (shouldForceContinueGuardrail(safeInput, teamMode)) {
+      parsed = buildContinueGuardrailOutput(safeInput, parsed.status);
+      fallbacksUsed = [...new Set([...fallbacksUsed, 'guardrail:stable_continue'])];
+    }
     parsed.nextAction = truncateChars(parsed.nextAction || parsed.immediateAction, 70) || parsed.immediateAction;
     parsed.why = dedupeTextList((parsed.why || [parsed.rationale]).map((entry) => truncateChars(entry, 90))).slice(0, 2);
     parsed.ifIgnored = truncateChars(parsed.ifIgnored || parsed.suggestedAdjustments?.[0] || 'Risk may increase if unchanged.', 90);
     parsed.coachNote = truncateChars(parsed.coachNote || `${baselineDirective.text} ${telemetryBasis}`, 110);
     parsed.rationale = truncateChars(parsed.rationale, 90);
+    parsed = sanitizeTacticalOutput(parsed);
 
     return {
       output: parsed,
@@ -738,6 +880,6 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
     }
     const reason = classifyTacticalFallbackReason(error);
     console.log('[tactical] fallback reason:', reason);
-    return buildTacticalFallback(input, reason);
+    return buildTacticalFallback(safeInput, reason);
   }
 }
