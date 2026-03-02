@@ -5,7 +5,6 @@ import {
   Users, 
   Brain, 
   ChevronRight, 
-  Settings, 
   Wind, 
   Thermometer, 
   PlayCircle, 
@@ -19,7 +18,6 @@ import {
   Zap,
   Shield,
   LogOut,
-  User,
   Hexagon,
   Trash2,
   UserMinus,
@@ -32,6 +30,7 @@ import {
   CartesianGrid,
   Line,
   LineChart,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
@@ -739,7 +738,12 @@ const getMaxOvers = (format: string): number => {
   const normalized = String(format || '').trim().toUpperCase();
   if (normalized === 'T20') return 4;
   if (normalized === 'ODI') return 10;
-  return 999; // Test / no strict cap.
+  return 12; // Session cap for Test format.
+};
+
+const getProjectionHorizon = (format: string): number => {
+  const normalized = String(format || '').trim().toUpperCase();
+  return normalized === 'T20' ? 4 : 5;
 };
 
 const clampOversBowled = (value: number, maxOvers: number): number => {
@@ -757,7 +761,7 @@ type SanitizedBowlerWorkload = Pick<Player, 'overs' | 'consecutiveOvers' | 'last
 
 /**
  * Bowling workload invariants:
- * - 0 <= oversBowled <= format cap (T20=4, ODI=10, Test=999)
+ * - 0 <= oversBowled <= format cap (T20=4, ODI=10, Test=12)
  * - 0 <= oversRemaining <= maxOvers
  * - oversRemaining === maxOvers - oversBowled
  * - legacy consecutiveOvers is retained as 0 for backward compatibility only
@@ -1458,6 +1462,7 @@ export default function App() {
   const matchRosterIdsRef = useRef<string[]>([]);
   const teamModeLockedRef = useRef(Boolean(initialStoredMatchMode));
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const profileMenuRef = useRef<HTMLDivElement | null>(null);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
   const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1483,6 +1488,29 @@ export default function App() {
   useEffect(() => {
     writeStoredActivePlayerId(activePlayerId);
   }, [activePlayerId]);
+
+  useEffect(() => {
+    if (!isProfileOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!profileMenuRef.current?.contains(event.target as Node)) {
+        setIsProfileOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsProfileOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isProfileOpen]);
 
   useEffect(() => {
     const applyBaselinesToRoster = (rows: Baseline[], reason: 'mount' | 'event') => {
@@ -1655,7 +1683,7 @@ export default function App() {
     const oversBowled = workload.overs;
     const maxOvers = workload.maxOvers;
     const oversRemaining = workload.oversRemaining;
-    const quotaComplete = maxOvers < 999 && oversBowled >= maxOvers;
+    const quotaComplete = oversBowled >= maxOvers;
     const lastRestOvers = workload.lastRestOvers;
     const fatigueLimit = Math.max(0, safeNum(selectedPlayer.baselineFatigue, 6));
     const sleepHrs = Math.max(0, safeNum(selectedPlayer.sleepHours, 7));
@@ -2314,7 +2342,7 @@ export default function App() {
     const maxOvers = Math.max(1, safeNum(currentTelemetry.maxOvers, getMaxOvers(matchContext.format)));
     const oversBowled = clampOversBowled(safeNum(currentTelemetry.oversBowled, 0), maxOvers);
     const oversRemaining = computeOversRemaining(oversBowled, maxOvers);
-    const quotaComplete = Boolean(currentTelemetry.quotaComplete) || (maxOvers < 999 && oversBowled >= maxOvers);
+    const quotaComplete = Boolean(currentTelemetry.quotaComplete) || oversBowled >= maxOvers;
     const fatigue = Math.max(0, Math.min(10, safeNum(currentTelemetry.fatigueIndex, 0)));
     const injuryLabelRaw = String(currentTelemetry.injuryRisk || 'LOW').toUpperCase();
     const noBallRiskLabelRaw = String(currentTelemetry.noBallRisk || 'LOW').toUpperCase();
@@ -3444,12 +3472,12 @@ export default function App() {
               )}
               
               {/* Profile Dropdown */}
-              <div className="relative">
+              <div ref={profileMenuRef} className="relative">
                 <button type="button" 
                   onClick={() => setIsProfileOpen(!isProfileOpen)}
                   className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-slate-700 text-xs font-medium text-slate-400 hover:text-white hover:border-emerald-500 transition-colors"
                 >
-                  CM
+                  C
                 </button>
 
                 <AnimatePresence>
@@ -3460,21 +3488,15 @@ export default function App() {
                       exit={{ opacity: 0, y: 10, scale: 0.95 }}
                       className="absolute right-0 mt-2 w-56 bg-[#0F172A] border border-white/10 rounded-xl shadow-2xl p-4 z-50"
                     >
-                      <div className="flex items-center gap-3 mb-3 pb-3 border-b border-white/5">
-                        <div className="w-10 h-10 rounded-full bg-emerald-500/10 flex items-center justify-center text-emerald-500">
-                          <User className="w-5 h-5" />
-                        </div>
-                        <div>
-                          <p className="text-sm font-bold text-white">Coach Mahrosh</p>
-                          <p className="text-xs text-slate-400">coach.mahrosh@tactical.ai</p>
-                        </div>
+                      <div className="space-y-2">
+                        <p className="text-sm font-bold text-white">tactIQ Coach Assist</p>
+                        <p className="text-xs leading-relaxed text-slate-300">
+                          Multi-agent tactical AI that combines fatigue, risk, and match context to recommend safer, smarter moves in real time.
+                        </p>
+                        <p className="text-[11px] text-slate-500">
+                          Azure-Powered Multi-Agent Decision System
+                        </p>
                       </div>
-                      <button type="button" className="w-full flex items-center gap-2 text-sm text-slate-400 hover:text-white py-2 px-2 hover:bg-white/5 rounded-lg transition-colors">
-                        <Settings className="w-4 h-4" /> Account Settings
-                      </button>
-                      <button type="button" className="w-full flex items-center gap-2 text-sm text-rose-400 hover:text-rose-300 py-2 px-2 hover:bg-rose-500/10 rounded-lg transition-colors">
-                        <LogOut className="w-4 h-4" /> Sign Out
-                      </button>
                     </motion.div>
                   )}
                 </AnimatePresence>
@@ -3835,6 +3857,8 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
 interface FatigueForecastPoint {
   overAhead: number;
   fatigue: number;
+  injuryRiskPct: number;
+  reason: string;
 }
 
 interface PressureForecastPoint {
@@ -3844,6 +3868,9 @@ interface PressureForecastPoint {
 
 const FORECAST_OVERS = [0, 1, 2, 3, 4, 5];
 const FORECAST_Y_TICKS = [0, 2.5, 5, 7.5, 10];
+const FORECAST_RISK_TICKS = [0, 20, 40, 60, 80, 100];
+const HIGH_RISK_THRESHOLD_PCT = 65;
+const RISK_ACCELERATION_THRESHOLD = 12;
 
 const fatigueIntensityMultiplier = (intensity?: string): number => {
   const normalized = String(intensity || '').trim().toUpperCase();
@@ -3861,48 +3888,193 @@ const fatigueRecoveryDelta = (heartRateRecovery?: Player['hrRecovery'] | 'OK' | 
   return -0.1;
 };
 
+const normalizeRiskToken = (value: unknown): 'LOW' | 'MEDIUM' | 'HIGH' => {
+  const token = String(value || '').trim().toUpperCase();
+  if (token === 'HIGH' || token === 'CRITICAL') return 'HIGH';
+  if (token === 'MED' || token === 'MEDIUM') return 'MEDIUM';
+  return 'LOW';
+};
+
+const toRecoveryScore = (heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok'): number => {
+  const normalized = String(heartRateRecovery || '').trim().toUpperCase();
+  if (normalized === 'GOOD') return 2;
+  if (normalized === 'OK' || normalized === 'MODERATE') return 1;
+  return 0;
+};
+
+const baselineInjuryRiskPct = ({
+  injuryRisk,
+  noBallRisk,
+  currentFatigue,
+  strainIndex,
+  heartRateRecovery,
+}: {
+  injuryRisk?: string;
+  noBallRisk?: string;
+  currentFatigue: number;
+  strainIndex: number;
+  heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
+}): number => {
+  const injuryToken = normalizeRiskToken(injuryRisk);
+  const noBallToken = normalizeRiskToken(noBallRisk);
+  const injuryBase = injuryToken === 'HIGH' ? 72 : injuryToken === 'MEDIUM' ? 50 : 20;
+  const noBallBump = noBallToken === 'HIGH' ? 10 : noBallToken === 'MEDIUM' ? 5 : 0;
+  const fatigueBump = Math.max(0, (clamp(currentFatigue, 0, 10) - 4) * 4);
+  const strainBump = Math.max(0, clamp(strainIndex, 0, 10) * 4.5);
+  const recoveryAdjustment = toRecoveryScore(heartRateRecovery) === 2 ? -6 : toRecoveryScore(heartRateRecovery) === 1 ? 0 : 6;
+  return Math.round(clamp(injuryBase + noBallBump + fatigueBump + strainBump + recoveryAdjustment, 0, 100));
+};
+
+const buildRiskReason = ({
+  fatigue,
+  strainIndex,
+  overAhead,
+  heartRateRecovery,
+}: {
+  fatigue: number;
+  strainIndex: number;
+  overAhead: number;
+  heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
+}): string => {
+  const reasons: string[] = [];
+  if (strainIndex >= 2.5 || overAhead >= 3) {
+    reasons.push('acute load is rising');
+  }
+  if (toRecoveryScore(heartRateRecovery) < 2) {
+    reasons.push('recovery is low');
+  }
+  if (fatigue >= 6) {
+    reasons.push('fatigue is above threshold');
+  }
+  if (reasons.length === 0) {
+    return 'Risk remains controlled under current workload.';
+  }
+  return `Risk ↑ because ${reasons.join(' + ')}.`;
+};
+
 const buildFatigueForecast = ({
   currentFatigue,
+  currentRiskPct,
+  strainIndex,
+  oversBowled,
+  projectionHorizon,
   intensity,
-  consecutiveOvers,
   heartRateRecovery,
 }: {
   currentFatigue: number;
+  currentRiskPct: number;
+  strainIndex: number;
+  oversBowled: number;
+  projectionHorizon: number;
   intensity?: string;
-  consecutiveOvers: number;
   heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
 }): FatigueForecastPoint[] => {
   const startFatigue = clamp(currentFatigue, 0, 10);
-  const safeConsecutiveOvers = Math.max(0, consecutiveOvers);
+  const safeStrain = Math.max(0, strainIndex);
+  const safeOvers = Math.max(0, oversBowled);
   const incrementPerOver =
     0.55 * fatigueIntensityMultiplier(intensity) +
-    0.10 * safeConsecutiveOvers +
+    0.08 * safeStrain +
+    0.04 * Math.max(0, safeOvers - 1) +
     fatigueRecoveryDelta(heartRateRecovery);
+  const recoveryScore = toRecoveryScore(heartRateRecovery);
+  const oversAhead = Array.from({ length: projectionHorizon + 1 }, (_, index) => index);
+  let previousRisk = clamp(currentRiskPct, 0, 100);
 
-  return FORECAST_OVERS.map((overAhead) => ({
-    overAhead,
-    fatigue: Number(clamp(startFatigue + incrementPerOver * overAhead, 0, 10).toFixed(1)),
-  }));
+  return oversAhead.map((overAhead) => {
+    const linearFatigue = startFatigue + incrementPerOver * overAhead;
+    const nonLinearFatigue = linearFatigue >= 6 ? (linearFatigue - 6) * 0.12 * Math.max(0, overAhead - 1) : 0;
+    const fatigue = Number(clamp(linearFatigue + nonLinearFatigue, 0, 10).toFixed(1));
+    const rawRisk = clamp(
+      currentRiskPct +
+        fatigue * 6 +
+        safeStrain * 8 -
+        recoveryScore * 5 +
+        overAhead * 3 +
+        (fatigue >= 6 ? (fatigue - 6) * (5 + overAhead * 1.2) : 0),
+      0,
+      100
+    );
+    const smoothingFactor = overAhead <= 2 ? 0.30 : 0.45;
+    const injuryRiskPct =
+      overAhead === 0
+        ? Math.round(clamp(currentRiskPct, 0, 100))
+        : Math.round(clamp(previousRisk + (rawRisk - previousRisk) * smoothingFactor, 0, 100));
+    previousRisk = injuryRiskPct;
+    return {
+      overAhead,
+      fatigue,
+      injuryRiskPct,
+      reason: buildRiskReason({
+        fatigue,
+        strainIndex: safeStrain,
+        overAhead,
+        heartRateRecovery,
+      }),
+    };
+  });
 };
 
 function FatigueForecastChart({
   currentFatigue,
+  strainIndex,
+  oversBowled,
+  currentInjuryRisk,
+  currentNoBallRisk,
+  matchFormat,
   intensity,
-  consecutiveOvers,
   heartRateRecovery,
 }: {
   currentFatigue: number;
+  strainIndex: number;
+  oversBowled: number;
+  currentInjuryRisk?: string;
+  currentNoBallRisk?: string;
+  matchFormat: string;
   intensity?: string;
-  consecutiveOvers: number;
   heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
 }) {
+  const projectionHorizon = React.useMemo(
+    () => getProjectionHorizon(matchFormat),
+    [matchFormat]
+  );
+  const oversTicks = React.useMemo(
+    () => Array.from({ length: projectionHorizon + 1 }, (_, index) => index),
+    [projectionHorizon]
+  );
+  const currentRiskPct = React.useMemo(
+    () =>
+      baselineInjuryRiskPct({
+        injuryRisk: currentInjuryRisk,
+        noBallRisk: currentNoBallRisk,
+        currentFatigue,
+        strainIndex,
+        heartRateRecovery,
+      }),
+    [currentInjuryRisk, currentNoBallRisk, currentFatigue, strainIndex, heartRateRecovery]
+  );
   const points: FatigueForecastPoint[] = React.useMemo(() => {
-    const inc = 0.56;
-    return Array.from({ length: 6 }, (_, i) => ({
-      overAhead: i,
-      fatigue: Math.round(clamp((currentFatigue ?? 0) + inc * i, 0, 10) * 10) / 10,
-    }));
-  }, [currentFatigue]);
+    return buildFatigueForecast({
+      currentFatigue,
+      currentRiskPct,
+      strainIndex,
+      oversBowled,
+      projectionHorizon,
+      intensity,
+      heartRateRecovery,
+    });
+  }, [currentFatigue, currentRiskPct, strainIndex, oversBowled, projectionHorizon, intensity, heartRateRecovery]);
+  const riskAtTwo = points.find((point) => point.overAhead === 2)?.injuryRiskPct ?? points[Math.min(2, points.length - 1)]?.injuryRiskPct ?? currentRiskPct;
+  const terminalOver = projectionHorizon >= 5 ? 5 : 4;
+  const riskAtTerminal = points.find((point) => point.overAhead === terminalOver)?.injuryRiskPct ?? points[points.length - 1]?.injuryRiskPct ?? currentRiskPct;
+  const riskAcceleration = Number((riskAtTerminal - riskAtTwo).toFixed(1));
+  const riskCrossPoint = points.find((point, index) => {
+    if (point.injuryRiskPct < HIGH_RISK_THRESHOLD_PCT) return false;
+    if (index === 0) return true;
+    return points[index - 1].injuryRiskPct < HIGH_RISK_THRESHOLD_PCT;
+  });
+  const emphasizeHighRisk = Boolean(riskCrossPoint) || riskAcceleration >= RISK_ACCELERATION_THRESHOLD;
+  const forecastGridColsClass = points.length === 5 ? 'grid-cols-3 sm:grid-cols-5' : 'grid-cols-3 sm:grid-cols-6';
 
   return (
     <div className="relative rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] p-4 overflow-hidden">
@@ -3911,61 +4083,115 @@ function FatigueForecastChart({
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
             <h3 className="text-sm font-bold text-white">Fatigue Forecast</h3>
-            <p className="text-xs text-slate-400">Next 5 overs • AI projection</p>
+            <p className="text-xs text-slate-400">{`Next ${projectionHorizon} overs • AI projection`}</p>
           </div>
           <span className="rounded-full border border-cyan-400/35 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-cyan-200">
             AI
           </span>
         </div>
-
         <div className="mt-4 h-[240px] w-full" style={{ height: 240 }}>
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={points} margin={{ top: 10, right: 12, left: 0, bottom: 18 }}>
+            <LineChart data={points} margin={{ top: 10, right: 90, bottom: 30, left: 48 }}>
               <defs>
                 <linearGradient id="fatigueLine" x1="0%" y1="0%" x2="100%" y2="0%">
                   <stop offset="0%" stopColor="rgba(34,211,238,0.95)" />
                   <stop offset="100%" stopColor="rgba(16,185,129,0.95)" />
                 </linearGradient>
+                <linearGradient id="riskLine" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="rgba(251,191,36,0.95)" />
+                  <stop offset="100%" stopColor="rgba(244,114,182,0.92)" />
+                </linearGradient>
               </defs>
+              <ReferenceArea yAxisId="risk" y1={0} y2={35} fill="rgba(16,185,129,0.08)" strokeOpacity={0} />
+              <ReferenceArea yAxisId="risk" y1={35} y2={65} fill="rgba(245,158,11,0.08)" strokeOpacity={0} />
+              <ReferenceArea yAxisId="risk" y1={65} y2={100} fill="rgba(244,63,94,0.08)" strokeOpacity={0} />
               <CartesianGrid strokeDasharray="4 6" vertical={false} stroke="rgba(255,255,255,0.08)" />
               <XAxis
                 dataKey="overAhead"
-                ticks={FORECAST_OVERS}
+                ticks={oversTicks}
                 tickFormatter={(value) => (value === 0 ? 'Now' : `+${value}`)}
                 tickLine={false}
                 axisLine={{ stroke: 'rgba(255,255,255,0.10)' }}
                 tick={{ fill: 'rgba(255,255,255,0.55)', fontSize: 12 }}
-                label={{ value: 'Overs Ahead', position: 'insideBottom', offset: -8, fill: 'rgba(255,255,255,0.55)' }}
+                label={{ value: 'Overs Ahead', position: 'bottom', offset: 8, fill: 'rgba(255,255,255,0.55)' }}
               />
               <YAxis
+                yAxisId="fatigue"
                 domain={[0, 10]}
                 ticks={FORECAST_Y_TICKS}
                 tickLine={false}
                 axisLine={false}
+                width={62}
                 tick={{ fill: 'rgba(255,255,255,0.55)', fontSize: 12 }}
-                label={{ value: 'Fatigue (0–10)', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.55)' }}
+                label={{ value: 'Fatigue (0–10)', angle: -90, position: 'insideLeft', dx: -22, dy: 18, fill: 'rgba(255,255,255,0.55)' }}
+              />
+              <YAxis
+                yAxisId="risk"
+                orientation="right"
+                domain={[0, 100]}
+                ticks={FORECAST_RISK_TICKS}
+                tickLine={false}
+                axisLine={false}
+                width={48}
+                tickFormatter={(value) => `${value}%`}
+                tick={{ fill: 'rgba(255,255,255,0.52)', fontSize: 11 }}
+                label={{ value: 'Injury Risk (0–100%)', angle: 90, position: 'right', offset: 28, dy: -25, fill: 'rgba(255,255,255,0.52)' }}
               />
               <Tooltip
-                contentStyle={{
-                  backgroundColor: '#0f172a',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: '12px'
+                cursor={{ stroke: 'rgba(255,255,255,0.15)', strokeDasharray: '3 3' }}
+                content={({ active, payload }) => {
+                  if (!active || !payload || payload.length === 0) return null;
+                  const point = payload[0]?.payload as FatigueForecastPoint | undefined;
+                  if (!point) return null;
+                  const overLabel = point.overAhead === 0 ? 'Now' : `+${point.overAhead}`;
+                  return (
+                    <div
+                      className="rounded-xl border border-white/10 bg-[#0f172a] px-3 py-2 shadow-xl"
+                      style={{ minWidth: 220 }}
+                    >
+                      <p className="text-[11px] font-semibold text-slate-200">Over: {overLabel}</p>
+                      <p className="mt-1 text-[11px] text-cyan-200">Fatigue: {point.fatigue.toFixed(1)} / 10</p>
+                      <p className="text-[11px] text-amber-200">Injury Risk: {point.injuryRiskPct.toFixed(0)}%</p>
+                      <p className="mt-1 text-[10px] leading-relaxed text-slate-300">{point.reason}</p>
+                    </div>
+                  );
                 }}
-                formatter={(value: number) => value}
-                labelFormatter={(label) => `+${label} overs`}
               />
-              <ReferenceLine
-                y={7}
-                stroke="rgba(255,255,255,0.12)"
-                strokeDasharray="6 6"
-                label={{ value: 'High risk ≥ 7', position: 'insideTopRight', fill: 'rgba(255,255,255,0.40)' }}
+              {emphasizeHighRisk && (
+                <ReferenceLine
+                  yAxisId="risk"
+                  y={HIGH_RISK_THRESHOLD_PCT}
+                  stroke="rgba(251,113,133,0.42)"
+                  strokeDasharray="6 6"
+                  label={{ value: 'High risk ≥ 65%', position: 'insideTopRight', fill: 'rgba(255,255,255,0.42)' }}
+                />
+              )}
+              {riskCrossPoint && (
+                <ReferenceLine
+                  yAxisId="risk"
+                  x={riskCrossPoint.overAhead}
+                  stroke="rgba(251,191,36,0.35)"
+                  strokeDasharray="4 4"
+                  label={{ value: 'Risk jump', position: 'top', fill: 'rgba(251,191,36,0.85)', fontSize: 10 }}
+                />
+              )}
+              <Line
+                type="monotone"
+                yAxisId="fatigue"
+                dataKey="fatigue"
+                stroke="url(#fatigueLine)"
+                strokeWidth={3}
+                dot={{ r: 4, fill: '#22d3ee', stroke: '#a5f3fc', strokeWidth: 1 }}
+                activeDot={{ r: 6, fill: '#06b6d4' }}
               />
               <Line
                 type="monotone"
-                dataKey="fatigue"
-                stroke="#22d3ee"
-                strokeWidth={3}
-                dot={{ r: 5 }}
+                yAxisId="risk"
+                dataKey="injuryRiskPct"
+                stroke="url(#riskLine)"
+                strokeWidth={2.5}
+                dot={{ r: 4, fill: '#f59e0b', stroke: '#fde68a', strokeWidth: 1 }}
+                activeDot={{ r: 6, fill: '#f59e0b' }}
               />
             </LineChart>
           </ResponsiveContainer>
@@ -3973,7 +4199,7 @@ function FatigueForecastChart({
 
         <div className="mt-4 border-t border-white/10" />
 
-        <div className="mt-4 grid grid-cols-3 sm:grid-cols-6 gap-2">
+        <div className={`mt-4 grid gap-2 ${forecastGridColsClass}`}>
           {points.map((point, index) => {
             const isLast = index === points.length - 1;
             return (
@@ -3988,6 +4214,9 @@ function FatigueForecastChart({
                 </p>
                 <p className={`text-xs font-mono font-bold ${isLast ? 'text-emerald-300' : 'text-cyan-200'}`}>
                   {point.fatigue.toFixed(1)}
+                </p>
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Risk {point.injuryRiskPct.toFixed(0)}%
                 </p>
               </div>
             );
@@ -4090,7 +4319,7 @@ function PressureForecastChart({
                 tickLine={false}
                 axisLine={false}
                 tick={{ fill: 'rgba(255,255,255,0.55)', fontSize: 12 }}
-                label={{ value: 'Pressure (0–10)', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.55)' }}
+                label={{ value: 'Pressure (0–10)', angle: -90, position: 'insideLeft', dy: 15, fill: 'rgba(255,255,255,0.55)' }}
               />
               <Tooltip
                 contentStyle={{
@@ -4501,6 +4730,16 @@ function Dashboard({
   const [briefCopied, setBriefCopied] = useState(false);
   const [showMatchModeGuard, setShowMatchModeGuard] = useState(false);
   const [showBowlingCoachModeGuard, setShowBowlingCoachModeGuard] = useState(false);
+  const [matchModeGuardContent, setMatchModeGuardContent] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+  } | null>(null);
+  const [bowlingCoachModeGuardContent, setBowlingCoachModeGuardContent] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+  } | null>(null);
   const [inningsLockNotice, setInningsLockNotice] = useState<string | null>(null);
   const [showRotateBowlerConfirm, setShowRotateBowlerConfirm] = useState(false);
   const [rotateBowlerSuggestion, setRotateBowlerSuggestion] = useState<SuggestedBowlerRecommendation | null>(null);
@@ -4621,7 +4860,7 @@ function Dashboard({
   const isInningsFinished = !isUnlimitedInningsFormat && ballsBowled >= totalBalls;
   const inningsComplete = isInningsFinished;
   const formatMaxOvers = activePlayer?.maxOvers ?? getMaxOvers(matchContext.format);
-  const hasFormatCap = formatMaxOvers < 999;
+  const hasFormatCap = Number.isFinite(formatMaxOvers);
   const atOversCap = Boolean(activePlayer && activePlayer.overs >= formatMaxOvers);
   const isQuotaComplete = Boolean(activePlayer && (activePlayer.quotaComplete === true || (hasFormatCap && activePlayer.overs >= formatMaxOvers)));
   const isMedicalCritical = Boolean(activePlayer && (activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical'));
@@ -5616,6 +5855,7 @@ function Dashboard({
       playerName: string;
       fatigueIndex: number;
       strainIndex: number;
+      oversBowled: number;
       injuryRisk: string;
       noBallRisk: string;
     },
@@ -5643,9 +5883,8 @@ function Dashboard({
     };
     const sanitizeCoachLine = (value: unknown, fallback: string, maxChars = 110): string => {
       const cleaned = normalizeRecommendationText(value)
-        .replace(/telemetry basis:[^.]*\.?/gi, '')
-        .replace(/\b(fatigueindex|strainindex|oversbowled|baseline|sleep|recovery|fatigue limit|fatigue ceiling|injuryrisk|noballrisk)\b/gi, '')
-        .replace(/\b\d+(\.\d+)?\b/g, '')
+        .replace(/\b([a-z]+)(?:\s*,\s*\1\b)+/gi, '$1')
+        .replace(/\b([a-z]+)(?:\s+\1\b){1,}/gi, '$1')
         .replace(/\s+/g, ' ')
         .replace(/\s+([,.;:!?])/g, '$1')
         .trim();
@@ -5704,68 +5943,104 @@ function Dashboard({
       selectedReplacementPlayer?.id || selectedReplacementPlayer?.name,
       activeName
     ) || activeName;
+    const alternatives = dedupeBullets(
+      [...compatibleBowlers].sort(byLowestFatigue).map((player) => resolveRosterName(player.id || player.name, player.name)),
+      3
+    );
     const fatigue = Math.max(0, safeNum(telemetry.fatigueIndex, 0));
     const strain = Math.max(0, safeNum(telemetry.strainIndex, 0));
+    const oversBowled = Math.max(0, safeNum(telemetry.oversBowled, safeNum(activePlayer?.overs, 0)));
+    const maxOvers = Math.max(1, safeNum(activePlayer?.maxOvers, getMaxOvers(inputMatchContext.format)));
     const injuryRiskToken = String(telemetry.injuryRisk || 'LOW').toUpperCase();
     const noBallRiskToken = String(telemetry.noBallRisk || 'LOW').toUpperCase();
     const elevatedControlRisk = noBallRiskToken === 'HIGH' || noBallRiskToken === 'MED' || noBallRiskToken === 'MEDIUM';
     const elevatedInjuryRisk = injuryRiskToken === 'HIGH' || injuryRiskToken === 'CRITICAL' || injuryRiskToken === 'MED' || injuryRiskToken === 'MEDIUM';
+    const safeContinue = oversBowled === 0 || (fatigue <= 4 && injuryRiskToken === 'LOW');
+    const recoveryLabel =
+      Number.isFinite(Number(baseline.recoveryMinutes))
+        ? Number(baseline.recoveryMinutes) < 35
+          ? 'Poor'
+          : Number(baseline.recoveryMinutes) < 55
+            ? 'Moderate'
+            : 'Good'
+        : 'Good';
     const constrainedRecoveryProfile =
       (Number.isFinite(Number(baseline.sleepHours)) && Number(baseline.sleepHours) < 7) ||
       (Number.isFinite(Number(baseline.recoveryMinutes)) && Number(baseline.recoveryMinutes) < 50);
-    const assessmentLine1 = elevatedControlRisk && elevatedInjuryRisk
-      ? `${activeName} is losing rhythm and the risk trend is rising in this spell.`
-      : elevatedInjuryRisk
-        ? `${activeName} is carrying workload stress that can escalate if this spell continues.`
-        : elevatedControlRisk
-          ? `${activeName} is drifting off control under phase pressure.`
-          : `${activeName} is still competing well, but this is the right tactical timing to rotate.`;
-    const assessmentLine2 = constrainedRecoveryProfile
-      ? 'Recovery signals suggest caution, so proactive rotation is the safer call.'
-      : 'A proactive switch now protects execution quality before momentum flips.';
+    const assessmentLine1 = safeContinue
+      ? `${activeName} is in a safe state to continue this spell.`
+      : elevatedControlRisk && elevatedInjuryRisk
+        ? `${activeName} is losing rhythm and the risk trend is rising in this spell.`
+        : elevatedInjuryRisk
+          ? `${activeName} is carrying workload stress that can escalate if this spell continues.`
+          : elevatedControlRisk
+            ? `${activeName} is drifting off control under phase pressure.`
+            : `${activeName} is still competing well, but this is the right tactical timing to rotate.`;
+    const assessmentLine2 = safeContinue
+      ? 'Current workload is controlled, so keep rhythm and reassess after the over.'
+      : constrainedRecoveryProfile
+        ? 'Recovery signals suggest caution, so proactive rotation is the safer call.'
+        : 'A proactive switch now protects execution quality before momentum flips.';
     const confidenceScore = clamp(safeNum(tacticalAnalysis?.confidence, safeNum(combinedDecision?.confidence, 0.62)), 0, 1);
     const confidence = toConfidenceLabel(confidenceScore);
+    const optionsLine = alternatives.length > 0
+      ? `Other options: ${alternatives.slice(0, 3).join(', ')}.`
+      : '';
     const swap = {
       out: activeName,
       in: replacementName,
       reason: sanitizeCoachLine(
-        tacticalAnalysis?.swap?.reason ||
-        tacticalAnalysis?.substitutionAdvice?.reason ||
-        'This change steadies control now and reduces escalation risk through the phase.',
-        'This change steadies control now and reduces escalation risk through the phase.',
+        safeContinue
+          ? optionsLine || 'Current spell is stable; keep alternatives warm if pressure rises.'
+          : tacticalAnalysis?.swap?.reason ||
+            tacticalAnalysis?.substitutionAdvice?.reason ||
+            'This change steadies control now and reduces escalation risk through the phase.',
+        safeContinue
+          ? optionsLine || 'Current spell is stable; keep alternatives warm if pressure rises.'
+          : 'This change steadies control now and reduces escalation risk through the phase.',
         90
       ),
     };
-    const recommendedMove = `Bring in ${swap.in} for ${swap.out} at the next over change and run a control-first plan.`;
-    const whyThisIsSmart = dedupeBullets([
-      sanitizeCoachLine(
-        tacticalAnalysis?.why?.[0] || `${swap.in} is the freshest compatible bowler for this phase.`,
-        `${swap.in} is the freshest compatible bowler for this phase.`,
-        90
-      ),
-      sanitizeCoachLine(
-        tacticalAnalysis?.why?.[1] || (elevatedInjuryRisk
-          ? 'Rotation now helps prevent injury risk from escalating late in the spell.'
-          : 'Rotation now protects execution before control risk compounds.'),
-        elevatedInjuryRisk
-          ? 'Rotation now helps prevent injury risk from escalating late in the spell.'
-          : 'Rotation now protects execution before control risk compounds.',
-        90
-      ),
-      sanitizeCoachLine(
-        tacticalAnalysis?.suggestedAdjustments?.[0] || 'Timing the switch here preserves tactical flexibility for later overs.',
-        'Timing the switch here preserves tactical flexibility for later overs.',
-        90
-      ),
-    ], 3);
-    const ifYouIgnore = sanitizeCoachLine(
-      tacticalAnalysis?.ifIgnored ||
-      finalRecommendation?.ifContinues?.riskSummary ||
-      activeStrategicAnalysis?.tacticalRecommendation?.ifIgnored ||
-      'Keep a one-over leash, tighten the field, and switch immediately at the next break.',
-      'Keep a one-over leash, tighten the field, and switch immediately at the next break.',
-      110
-    );
+    const recommendedMove = safeContinue
+      ? `Continue with ${activeName} for the next over — projected fatigue remains within safe range.`
+      : `Bring in ${swap.in} for ${swap.out} at the next over change and run a control-first plan.`;
+    const whyThisIsSmart = safeContinue
+      ? dedupeBullets([
+          `Overs bowled: ${oversBowled.toFixed(1)}/${maxOvers}; no overuse signal.`,
+          `Fatigue: ${fatigue.toFixed(1)}/10; recovery: ${recoveryLabel}.`,
+          'Risk is low; maintain control-focused lines.',
+        ], 3)
+      : dedupeBullets([
+          sanitizeCoachLine(
+            tacticalAnalysis?.why?.[0] || `${swap.in} is the freshest compatible bowler for this phase.`,
+            `${swap.in} is the freshest compatible bowler for this phase.`,
+            90
+          ),
+          sanitizeCoachLine(
+            tacticalAnalysis?.why?.[1] || (elevatedInjuryRisk
+              ? 'Rotation now helps prevent injury risk from escalating late in the spell.'
+              : 'Rotation now protects execution before control risk compounds.'),
+            elevatedInjuryRisk
+              ? 'Rotation now helps prevent injury risk from escalating late in the spell.'
+              : 'Rotation now protects execution before control risk compounds.',
+            90
+          ),
+          sanitizeCoachLine(
+            tacticalAnalysis?.suggestedAdjustments?.[0] || 'Timing the switch here preserves tactical flexibility for later overs.',
+            'Timing the switch here preserves tactical flexibility for later overs.',
+            90
+          ),
+        ], 3);
+    const ifYouIgnore = safeContinue
+      ? 'Minimal risk; monitor strain if tempo increases.'
+      : sanitizeCoachLine(
+          tacticalAnalysis?.ifIgnored ||
+          finalRecommendation?.ifContinues?.riskSummary ||
+          activeStrategicAnalysis?.tacticalRecommendation?.ifIgnored ||
+          'Keep a one-over leash, tighten the field, and switch immediately at the next break.',
+          'Keep a one-over leash, tighten the field, and switch immediately at the next break.',
+          110
+        );
     const hasShortOrInitialSection = (value: string): boolean => {
       const normalized = normalizeRecommendationText(value);
       return normalized.length < 8 || isInitialOnlyName(normalized);
@@ -5775,20 +6050,32 @@ function Dashboard({
       const fallbackSwap = {
         out: activeName,
         in: replacementName,
-        reason: shouldRotate
+        reason: safeContinue
+          ? optionsLine || 'Current spell is stable; keep alternatives warm if pressure rises.'
+          : shouldRotate
           ? 'This switch protects control before risk compounds in this phase.'
           : 'This proactive rotation keeps momentum stable and preserves tactical timing.',
       };
       return {
         matchSituation: [matchSituationLine, scoreLine] as [string, string],
         assessment: [assessmentLine1, assessmentLine2] as [string, string],
-        recommendedMove: `Bring in ${fallbackSwap.in} for ${fallbackSwap.out} at the next over change and run a control-first plan.`,
-        whyThisIsSmart: dedupeBullets([
-          `${fallbackSwap.in} offers fresher execution for this phase.`,
-          'The timing of this change helps prevent control slippage under pressure.',
-          'You keep a safer path now while preserving options for the next tactical window.',
-        ], 3),
-        ifYouIgnore: 'Keep a one-over leash, tighten the field, and rotate immediately at the next break.',
+        recommendedMove: safeContinue
+          ? `Continue with ${activeName} for the next over — projected fatigue remains within safe range.`
+          : `Bring in ${fallbackSwap.in} for ${fallbackSwap.out} at the next over change and run a control-first plan.`,
+        whyThisIsSmart: safeContinue
+          ? dedupeBullets([
+              `Overs bowled: ${oversBowled.toFixed(1)}/${maxOvers}; no overuse signal.`,
+              `Fatigue: ${fatigue.toFixed(1)}/10; recovery: ${recoveryLabel}.`,
+              'Risk is low; maintain control-focused lines.',
+            ], 3)
+          : dedupeBullets([
+              `${fallbackSwap.in} offers fresher execution for this phase.`,
+              'The timing of this change helps prevent control slippage under pressure.',
+              'You keep a safer path now while preserving options for the next tactical window.',
+            ], 3),
+        ifYouIgnore: safeContinue
+          ? 'Minimal risk; monitor strain if tempo increases.'
+          : 'Keep a one-over leash, tighten the field, and rotate immediately at the next break.',
         confidence,
         primaryPlayerName: activeName,
         swap: fallbackSwap,
@@ -5822,6 +6109,7 @@ function Dashboard({
       playerName: currentTelemetry.playerName,
       fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
       strainIndex: clampedStrainIndex,
+      oversBowled: safeNum(activePlayer?.overs, 0),
       injuryRisk: String(activePlayer?.injuryRisk || riskAnalysis?.injuryRisk || 'LOW'),
       noBallRisk: String(activePlayer?.noBallRisk || riskAnalysis?.noBallRisk || 'LOW'),
     },
@@ -5833,6 +6121,27 @@ function Dashboard({
     },
     players
   );
+  const isBrokenTacticalText = (value: unknown): boolean => {
+    const text = normalizeRecommendationText(value);
+    return !text || /(?:\bof\.?$|\bof$| of and )/i.test(text);
+  };
+  const toCleanTacticalLines = (values: Array<unknown>, max = 3): string[] =>
+    values
+      .map((entry) => normalizeRecommendationText(entry))
+      .filter((entry) => !isBrokenTacticalText(entry))
+      .slice(0, max);
+  const tacticalMatchSituationLines = toCleanTacticalLines(tacticalRecommendation.matchSituation, 2);
+  const tacticalAssessmentLines = toCleanTacticalLines(tacticalRecommendation.assessment, 2);
+  const tacticalWhyLines = toCleanTacticalLines(tacticalRecommendation.whyThisIsSmart, 3);
+  const tacticalRecommendedMove = isBrokenTacticalText(tacticalRecommendation.recommendedMove)
+    ? ''
+    : normalizeRecommendationText(tacticalRecommendation.recommendedMove);
+  const tacticalSwapReason = isBrokenTacticalText(tacticalRecommendation.swap.reason)
+    ? ''
+    : normalizeRecommendationText(tacticalRecommendation.swap.reason);
+  const tacticalIfIgnored = isBrokenTacticalText(tacticalRecommendation.ifYouIgnore)
+    ? ''
+    : normalizeRecommendationText(tacticalRecommendation.ifYouIgnore);
   const tacticalRiskToken = String(
     riskAnalysis?.severity ||
     riskAnalysis?.injuryRisk ||
@@ -5944,12 +6253,12 @@ function Dashboard({
     activeStrategicAnalysis?.injuryRiskAnalysis || riskAnalysis?.headline || riskAnalysis?.recommendation || 'Injury risk trend reviewed.',
     '',
     'Tactical Recommendation:',
-    `MATCH SITUATION: ${tacticalRecommendation.matchSituation.filter(Boolean).join(' ')}`,
-    `ASSESSMENT: ${tacticalRecommendation.assessment.filter(Boolean).join(' ')}`,
-    `RECOMMENDED MOVE: Bring in ${tacticalRecommendation.swap.in} for ${tacticalRecommendation.swap.out}.`,
+    `MATCH SITUATION: ${tacticalMatchSituationLines.join(' ')}`,
+    `ASSESSMENT: ${tacticalAssessmentLines.join(' ')}`,
+    `RECOMMENDED MOVE: ${tacticalRecommendedMove || `Bring in ${tacticalRecommendation.swap.in} for ${tacticalRecommendation.swap.out}.`}`,
     'WHY THIS WORKS:',
-    ...(tacticalRecommendation.whyThisIsSmart.slice(0, 3).map((item) => `- ${item}`)),
-    `IF YOU IGNORE: ${tacticalRecommendation.ifYouIgnore}`,
+    ...(tacticalWhyLines.map((item) => `- ${item}`)),
+    `IF YOU IGNORE: ${tacticalIfIgnored || 'Tactical output unavailable. Please rerun analysis.'}`,
     `CONFIDENCE: ${tacticalRecommendation.confidence}`,
   ].join('\n');
   const handleCopyBriefing = useCallback(async () => {
@@ -6380,11 +6689,13 @@ function Dashboard({
 
   const closeMatchModeGuard = useCallback(() => {
     pendingMatchModeActionRef.current = null;
+    setMatchModeGuardContent(null);
     setShowMatchModeGuard(false);
   }, []);
 
   const closeBowlingCoachModeGuard = useCallback(() => {
     pendingBowlingCoachActionRef.current = null;
+    setBowlingCoachModeGuardContent(null);
     setShowBowlingCoachModeGuard(false);
   }, []);
 
@@ -6411,6 +6722,7 @@ function Dashboard({
   const handleSwitchToBattingAndContinue = useCallback(() => {
     const pendingAction = pendingMatchModeActionRef.current;
     pendingMatchModeActionRef.current = null;
+    setMatchModeGuardContent(null);
     setShowMatchModeGuard(false);
     setTeamMode('BATTING');
     if (pendingAction) {
@@ -6421,6 +6733,7 @@ function Dashboard({
   const handleSwitchToBowlingAndRunCoach = useCallback(() => {
     const pendingAction = pendingBowlingCoachActionRef.current;
     pendingBowlingCoachActionRef.current = null;
+    setBowlingCoachModeGuardContent(null);
     setShowBowlingCoachModeGuard(false);
     setTeamMode('BOWLING');
     if (pendingAction) {
@@ -6428,17 +6741,56 @@ function Dashboard({
     }
   }, [setTeamMode]);
 
+  // Shared mode gate for coach runs: enforce panel-required mode, prompt switch, then run once on confirm.
+  const guardModeAndRun = useCallback(
+    ({
+      requiredMode,
+      sourcePanel,
+      runFn,
+    }: {
+      requiredMode: TeamMode;
+      sourcePanel: 'Batters UI' | 'Bowlers UI';
+      runFn: () => void;
+    }): boolean => {
+      if (agentState === 'thinking') return false;
+      if (showMatchModeGuard || showBowlingCoachModeGuard) return false;
+      if (pendingMatchModeActionRef.current || pendingBowlingCoachActionRef.current) return false;
+
+      if (teamMode === requiredMode) {
+        runFn();
+        return true;
+      }
+
+      const title = requiredMode === 'BATTING' ? 'Switch to Batting Mode?' : 'Switch to Bowling Mode?';
+      const message = `You’re currently in ${teamMode}. To run this analysis from the ${sourcePanel}, switch to ${requiredMode}.`;
+
+      if (requiredMode === 'BATTING') {
+        pendingMatchModeActionRef.current = runFn;
+        setMatchModeGuardContent({ title, message, confirmLabel: 'Switch & Run' });
+        setShowMatchModeGuard(true);
+      } else {
+        pendingBowlingCoachActionRef.current = runFn;
+        setBowlingCoachModeGuardContent({ title, message, confirmLabel: 'Switch & Run' });
+        setShowBowlingCoachModeGuard(true);
+      }
+      return false;
+    },
+    [agentState, showMatchModeGuard, showBowlingCoachModeGuard, teamMode]
+  );
+
   const runCoachAgentAuto = useCallback(
     async (modeOverride?: TeamMode) => {
+      const resolvedMode = modeOverride || teamMode;
+      const resolvedFocusRole: 'BOWLER' | 'BATTER' = resolvedMode === 'BATTING' ? 'BATTER' : 'BOWLER';
       setShowCoachInsights(true);
       primeCoachAutoScroll();
       return runAgent('auto', 'button_click', {
-        teamMode: modeOverride || teamMode,
-        focusRole,
+        teamMode: resolvedMode,
+        focusRole: resolvedFocusRole,
         strainIndex: clampedStrainIndex,
       });
     },
-    [clampedStrainIndex, focusRole, primeCoachAutoScroll, runAgent, teamMode]
+    [clampedStrainIndex, primeCoachAutoScroll, runAgent, teamMode]
   );
 
   const runCoachWithFallback = useCallback(async (): Promise<{ recommendation: SuggestedBowlerRecommendation | null; raw?: OrchestrateResponse }> => {
@@ -6586,38 +6938,31 @@ function Dashboard({
     try {
       const selectedPlayerId = activePlayer?.id || currentTelemetry.playerId;
       // console.log('[coach] click', { matchState: teamMode, selectedPlayerId, selectedRole: String(activePlayer?.role || currentTelemetry.role || '') });
-      if (teamMode === 'BATTING' || String(teamMode).toLowerCase() === 'batting') {
-        setAgentWarning(null);
-        setAgentFailure(null);
-        pendingBowlingCoachActionRef.current = () => {
-          void runCoachAgentAuto('BOWLING');
-        };
-        setShowBowlingCoachModeGuard(true);
-        return;
-      }
       if (!selectedPlayerId) {
         setShowCoachInsights(true);
         setAgentFailure(null);
         setAgentWarning('Select a player to run analysis.');
         return;
       }
-      if (blockCoachForModeMismatch()) return;
-      const execute = (modeOverride?: TeamMode) => {
-        void runCoachAgentAuto(modeOverride);
-      };
-
-      if (focusRole === 'BATTER') {
-        runBattingGuardedAction(() => execute('BATTING'));
-        return;
-      }
-
-      execute();
+      pendingBowlingCoachActionRef.current = null;
+      setShowBowlingCoachModeGuard(false);
+      setAgentWarning(null);
+      setAgentFailure(null);
+      const requiredMode: TeamMode = focusRole === 'BATTER' ? 'BATTING' : 'BOWLING';
+      const sourcePanel: 'Batters UI' | 'Bowlers UI' = requiredMode === 'BATTING' ? 'Batters UI' : 'Bowlers UI';
+      guardModeAndRun({
+        requiredMode,
+        sourcePanel,
+        runFn: () => {
+          void runCoachAgentAuto(requiredMode);
+        },
+      });
     } catch {
       setShowCoachInsights(true);
       setAgentFailure(null);
       setAgentWarning('Unable to run analysis right now. Please try again.');
     }
-  }, [activePlayer?.id, blockCoachForModeMismatch, currentTelemetry.playerId, runBattingGuardedAction, runCoachAgentAuto, setAgentFailure, setAgentWarning, teamMode]);
+  }, [activePlayer?.id, currentTelemetry.playerId, focusRole, guardModeAndRun, runCoachAgentAuto, setAgentFailure, setAgentWarning, teamMode]);
 
   const handleRunCoachFull = useCallback((event?: React.MouseEvent<HTMLButtonElement>) => {
     const selectedPlayerId = activePlayer?.id || currentTelemetry.playerId;
@@ -6633,24 +6978,24 @@ function Dashboard({
       setAgentWarning('Select a player to run analysis.');
       return;
     }
-    if (blockCoachForModeMismatch()) return;
-    const execute = (modeOverride?: TeamMode) => {
+    const execute = (modeOverride: TeamMode) => {
+      const resolvedFocusRole: 'BOWLER' | 'BATTER' = modeOverride === 'BATTING' ? 'BATTER' : 'BOWLER';
       setShowCoachInsights(true);
       primeCoachAutoScroll();
       void runAgent('full', 'button_click', {
-        teamMode: modeOverride || teamMode,
-        focusRole,
+        teamMode: modeOverride,
+        focusRole: resolvedFocusRole,
         strainIndex: clampedStrainIndex,
       });
     };
-
-    if (focusRole === 'BATTER') {
-      runBattingGuardedAction(() => execute('BATTING'));
-      return;
-    }
-
-    execute();
-  }, [activePlayer?.id, agentState, blockCoachForModeMismatch, clampedStrainIndex, currentTelemetry.playerId, focusRole, primeCoachAutoScroll, runAgent, runBattingGuardedAction, teamMode]);
+    const requiredMode: TeamMode = focusRole === 'BATTER' ? 'BATTING' : 'BOWLING';
+    const sourcePanel: 'Batters UI' | 'Bowlers UI' = requiredMode === 'BATTING' ? 'Batters UI' : 'Bowlers UI';
+    guardModeAndRun({
+      requiredMode,
+      sourcePanel,
+      runFn: () => execute(requiredMode),
+    });
+  }, [activePlayer?.id, agentState, clampedStrainIndex, currentTelemetry.playerId, focusRole, guardModeAndRun, primeCoachAutoScroll, runAgent, teamMode]);
 
   // Auto-follow new analysis output while user is near the bottom.
   useEffect(() => {
@@ -7441,8 +7786,12 @@ function Dashboard({
                     <div className="mt-6">
                       <FatigueForecastChart
                         currentFatigue={activePlayer.fatigue}
+                        strainIndex={safeNum(activePlayer.strainIndex, 0)}
+                        oversBowled={safeNum(activePlayer.overs, 0)}
+                        currentInjuryRisk={activePlayer.injuryRisk}
+                        currentNoBallRisk={activePlayer.noBallRisk}
+                        matchFormat={matchContext.format}
                         intensity={matchContext.pitch || matchContext.phase || 'Medium'}
-                        consecutiveOvers={0}
                         heartRateRecovery={activePlayer.hrRecovery ?? 'Good'}
                       />
                     </div>
@@ -7865,40 +8214,51 @@ function Dashboard({
                                     </span>
                                   </div>
                                   <div className="space-y-3">
-                                    <div>
-                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Match Situation</p>
-                                      <p className="text-xs text-slate-300 mt-1 leading-relaxed">{tacticalRecommendation.matchSituation[0]}</p>
-                                      {tacticalRecommendation.matchSituation[1] && (
-                                        <p className="text-xs text-slate-300 leading-relaxed">{tacticalRecommendation.matchSituation[1]}</p>
-                                      )}
-                                    </div>
-                                    <div>
-                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Assessment</p>
-                                      <p className="text-xs text-slate-300 mt-1 leading-relaxed">{tacticalRecommendation.assessment[0]}</p>
-                                      {tacticalRecommendation.assessment[1] && (
-                                        <p className="text-xs text-slate-300 leading-relaxed">{tacticalRecommendation.assessment[1]}</p>
-                                      )}
-                                    </div>
-                                    <div>
-                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Recommended Move</p>
-                                      <p className="text-sm text-white mt-1 leading-relaxed">
-                                        Bring in <span className="font-semibold">{tacticalRecommendation.swap.in}</span> for{' '}
-                                        <span className="font-semibold">{tacticalRecommendation.swap.out}</span> at the next over change.
-                                      </p>
-                                      <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">{tacticalRecommendation.swap.reason}</p>
-                                    </div>
-                                    <div>
-                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">Why This Is Smart</p>
-                                      <ul className="space-y-1 mt-1">
-                                        {tacticalRecommendation.whyThisIsSmart.slice(0, 3).map((item, index) => (
-                                          <li key={`tactical-why-${index}`} className="text-[11px] text-slate-300">• {item}</li>
+                                    {tacticalMatchSituationLines.length > 0 && (
+                                      <div>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Match Situation</p>
+                                        {tacticalMatchSituationLines.map((line, index) => (
+                                          <p key={`tactical-situation-${index}`} className="text-xs text-slate-300 mt-1 leading-relaxed">{line}</p>
                                         ))}
-                                      </ul>
-                                    </div>
-                                    <div>
-                                      <p className="text-[10px] uppercase tracking-wide text-slate-400">If Ignored</p>
-                                      <p className="text-xs text-slate-300 mt-1 leading-relaxed">{tacticalRecommendation.ifYouIgnore}</p>
-                                    </div>
+                                      </div>
+                                    )}
+                                    {tacticalAssessmentLines.length > 0 && (
+                                      <div>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Assessment</p>
+                                        {tacticalAssessmentLines.map((line, index) => (
+                                          <p key={`tactical-assessment-${index}`} className="text-xs text-slate-300 mt-1 leading-relaxed">{line}</p>
+                                        ))}
+                                      </div>
+                                    )}
+                                    {(tacticalRecommendedMove || tacticalSwapReason) && (
+                                      <div>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Recommended Move</p>
+                                        {tacticalRecommendedMove && (
+                                          <p className="text-sm text-white mt-1 leading-relaxed">
+                                            {tacticalRecommendedMove}
+                                          </p>
+                                        )}
+                                        {tacticalSwapReason && (
+                                          <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">{tacticalSwapReason}</p>
+                                        )}
+                                      </div>
+                                    )}
+                                    {tacticalWhyLines.length > 0 && (
+                                      <div>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Why This Is Smart</p>
+                                        <ul className="space-y-1 mt-1">
+                                          {tacticalWhyLines.map((item, index) => (
+                                            <li key={`tactical-why-${index}`} className="text-[11px] text-slate-300">• {item}</li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                    {tacticalIfIgnored && (
+                                      <div>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">If Ignored</p>
+                                        <p className="text-xs text-slate-300 mt-1 leading-relaxed">{tacticalIfIgnored}</p>
+                                      </div>
+                                    )}
                                     <div>
                                       <p className="text-[10px] uppercase tracking-wide text-slate-400">Confidence</p>
                                       <p className="text-xs text-slate-300 mt-1 leading-relaxed">{tacticalRecommendation.confidence}</p>
@@ -8111,14 +8471,17 @@ function Dashboard({
         open={showMatchModeGuard}
         onSwitch={handleSwitchToBattingAndContinue}
         onCancel={closeMatchModeGuard}
+        title={matchModeGuardContent?.title}
+        message={matchModeGuardContent?.message}
+        confirmLabel={matchModeGuardContent?.confirmLabel}
       />
       <MatchModeGuardOverlay
         open={showBowlingCoachModeGuard}
         onSwitch={handleSwitchToBowlingAndRunCoach}
         onCancel={closeBowlingCoachModeGuard}
-        title="Switch to BOWLING?"
-        message="Bowler Coach Analysis requires BOWLING mode."
-        confirmLabel="Switch & Run"
+        title={bowlingCoachModeGuardContent?.title || 'Switch to BOWLING?'}
+        message={bowlingCoachModeGuardContent?.message || 'Bowler Coach Analysis requires BOWLING mode.'}
+        confirmLabel={bowlingCoachModeGuardContent?.confirmLabel || 'Switch & Run'}
       />
     </motion.div>
   );
