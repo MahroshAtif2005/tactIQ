@@ -5,6 +5,7 @@ const { randomUUID } = require('crypto');
 const DEFAULT_DATABASE = 'tactiq-db';
 const DEFAULT_CONTAINER = 'players';
 const DEFAULT_COACH_CONTAINER = 'playersByCoach';
+const DEFAULT_USERS_CONTAINER = 'users';
 const FALLBACK_BASELINES_PATH =
   process.env.BASELINE_FALLBACK_FILE ||
   path.resolve(process.cwd(), 'server/data/baselines.json');
@@ -78,6 +79,7 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const normalizeId = (value) => String(value || '').trim();
 const normalizeUserId = (value) => String(value || '').trim();
+const normalizeTeamId = (value) => String(value || '').trim();
 const normalizeBaselineKey = (value) => String(value || '').trim().toLowerCase();
 const normalizeOrderIndex = (value) => {
   const parsed = Number(value);
@@ -168,6 +170,7 @@ const validateAndNormalizeBaseline = (raw, options = {}) => {
     baselineId: id || 'Unknown Player',
     type: 'playerBaseline',
     userId: normalizeUserId(payload.userId),
+    teamId: normalizeTeamId(payload.teamId),
     name: String(payload.name || id || 'Unknown Player').trim() || 'Unknown Player',
     role,
     sleep: parseNumericField(
@@ -304,6 +307,11 @@ const getConfig = () => ({
     process.env.COSMOS_CONTAINER_PLAYERS_BY_COACH,
     DEFAULT_COACH_CONTAINER
   ),
+  usersContainerId: firstNonEmptyEnv(
+    process.env.COSMOS_USERS_CONTAINER,
+    process.env.COSMOS_CONTAINER_USERS,
+    DEFAULT_USERS_CONTAINER
+  ),
 });
 
 const parseCosmosAccount = (config) => {
@@ -358,8 +366,10 @@ const isCosmosConfigured = () => {
 
 let cachedContainer = null;
 let cachedCoachContainer = null;
+let cachedUsersContainer = null;
 let initPromise = null;
 let coachInitPromise = null;
+let usersInitPromise = null;
 let initError = null;
 let cosmosCtor = null;
 
@@ -440,6 +450,38 @@ const getCoachContainer = async () => {
   return coachInitPromise;
 };
 
+const getUsersContainer = async () => {
+  logCosmosEnvOnce();
+  if (!isCosmosConfigured()) return null;
+  if (cachedUsersContainer) return cachedUsersContainer;
+  if (usersInitPromise) return usersInitPromise;
+
+  usersInitPromise = (async () => {
+    const CosmosClient = loadCosmosClientCtor();
+    if (!CosmosClient) return null;
+
+    const { connectionString, endpoint, key, databaseId, usersContainerId } = getConfig();
+    const client = connectionString
+      ? new CosmosClient(connectionString)
+      : new CosmosClient({ endpoint, key });
+
+    const { database } = await client.databases.createIfNotExists({ id: databaseId });
+    const { container } = await database.containers.createIfNotExists({
+      id: usersContainerId || DEFAULT_USERS_CONTAINER,
+      partitionKey: { paths: ['/userId'] },
+    });
+
+    cachedUsersContainer = container;
+    return container;
+  })().catch((error) => {
+    initError = error;
+    logCosmosConnectFail(error);
+    return null;
+  });
+
+  return usersInitPromise;
+};
+
 const chunk = (items, size) => {
   const batches = [];
   for (let index = 0; index < items.length; index += size) {
@@ -448,33 +490,160 @@ const chunk = (items, size) => {
   return batches;
 };
 
+const resolveScope = (scope = {}) => ({
+  userId: normalizeUserId(scope?.userId),
+  teamId: normalizeTeamId(scope?.teamId),
+});
+
+const buildScopeFilter = (scope = {}, alias = 'c') => {
+  const { userId, teamId } = resolveScope(scope);
+  if (teamId) {
+    return {
+      query: `${alias}.teamId = @teamId`,
+      parameters: [{ name: '@teamId', value: teamId }],
+      partitionKey: userId || undefined,
+    };
+  }
+  if (userId) {
+    return {
+      query: `${alias}.userId = @userId`,
+      parameters: [{ name: '@userId', value: userId }],
+      partitionKey: userId,
+    };
+  }
+  return {
+    query: '',
+    parameters: [],
+    partitionKey: undefined,
+  };
+};
+
+const normalizeCoachUser = (raw, fallback = {}) => {
+  const payload = isRecord(raw) ? raw : {};
+  const fallbackRecord = isRecord(fallback) ? fallback : {};
+  const now = new Date().toISOString();
+  const userId = normalizeUserId(payload.userId || payload.id || fallbackRecord.userId || fallbackRecord.id);
+  const teamId = normalizeTeamId(payload.teamId || fallbackRecord.teamId) || randomUUID();
+  return {
+    id: userId,
+    type: 'coachUser',
+    userId,
+    teamId,
+    email: String(payload.email || fallbackRecord.email || '').trim() || null,
+    name: String(payload.name || fallbackRecord.name || '').trim() || null,
+    role: String(payload.role || fallbackRecord.role || 'coach').trim() || 'coach',
+    createdAt: normalizeIsoTimestamp(payload.createdAt || fallbackRecord.createdAt || now),
+    updatedAt: normalizeIsoTimestamp(now),
+  };
+};
+
+const ensureCoachUserProfile = async ({ userId, email, name } = {}) => {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) {
+    const error = new Error('userId is required to ensure coach profile.');
+    error.code = 'VALIDATION_ERROR';
+    throw error;
+  }
+  if (!isCosmosConfigured()) {
+    throw createCosmosUnavailableError('Cannot ensure coach profile: Cosmos is not configured.');
+  }
+  const container = await getUsersContainer();
+  if (!container) {
+    throw createCosmosUnavailableError('Cannot ensure coach profile: users container unavailable.');
+  }
+
+  let existing = null;
+  try {
+    const { resource } = await container.item(normalizedUserId, normalizedUserId).read();
+    existing = resource || null;
+  } catch (error) {
+    const statusCode = Number(error?.code || error?.statusCode);
+    if (statusCode !== 404) throw error;
+  }
+
+  const merged = normalizeCoachUser(
+    {
+      ...(existing || {}),
+      id: normalizedUserId,
+      userId: normalizedUserId,
+      ...(typeof email === 'string' && email.trim().length > 0 ? { email: email.trim() } : {}),
+      ...(typeof name === 'string' && name.trim().length > 0 ? { name: name.trim() } : {}),
+    },
+    existing || {}
+  );
+  await container.items.upsert(merged, { partitionKey: normalizedUserId });
+  return merged;
+};
+
+const backfillBaselinesTeamId = async ({ userId, teamId } = {}) => {
+  const normalizedUserId = normalizeUserId(userId);
+  const normalizedTeamId = normalizeTeamId(teamId);
+  if (!normalizedUserId || !normalizedTeamId) return { updated: 0 };
+  if (!isCosmosConfigured()) {
+    throw createCosmosUnavailableError('Cannot backfill teamId: Cosmos is not configured.');
+  }
+
+  const container = await getCoachContainer();
+  if (!container) {
+    throw createCosmosUnavailableError('Cannot backfill teamId: coach container unavailable.');
+  }
+
+  const result = await container.items
+    .query({
+      query:
+        'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId AND (NOT IS_DEFINED(c.teamId) OR c.teamId = "")',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: normalizedUserId },
+      ],
+    })
+    .fetchAll();
+
+  const docs = Array.isArray(result.resources) ? result.resources : [];
+  if (docs.length === 0) return { updated: 0 };
+
+  const batches = chunk(docs, 5);
+  for (const batch of batches) {
+    await Promise.all(
+      batch.map((doc) =>
+        container.items.upsert(
+          {
+            ...doc,
+            teamId: normalizedTeamId,
+            updatedAt: new Date().toISOString(),
+          },
+          { partitionKey: normalizedUserId }
+        )
+      )
+    );
+  }
+  return { updated: docs.length };
+};
+
 const getAllBaselines = async (scope = {}) => {
-  const userId = normalizeUserId(scope?.userId);
+  const { userId, teamId } = resolveScope(scope);
   logCosmosEnvOnce();
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: missing configuration.');
   }
 
-  const container = userId ? await getCoachContainer() : await getContainer();
+  const container = userId || teamId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: container not initialized.');
   }
 
   let resources;
   try {
-    const queryText = userId
-      ? 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId'
+    const scopeFilter = buildScopeFilter({ userId, teamId });
+    const queryText = scopeFilter.query
+      ? `SELECT * FROM c WHERE c.type = @type AND ${scopeFilter.query}`
       : 'SELECT * FROM c WHERE c.type = @type';
-    const parameters = userId
-      ? [
-          { name: '@type', value: 'playerBaseline' },
-          { name: '@userId', value: userId },
-        ]
-      : [{ name: '@type', value: 'playerBaseline' }];
+    const parameters = [{ name: '@type', value: 'playerBaseline' }, ...scopeFilter.parameters];
     const result = await container.items
       .query({
         query: queryText,
         parameters,
+        ...(scopeFilter.partitionKey ? { partitionKey: scopeFilter.partitionKey } : {}),
       })
       .fetchAll();
     resources = result.resources;
@@ -490,32 +659,29 @@ const getAllBaselines = async (scope = {}) => {
 };
 
 const getRosterBaselines = async (scope = {}) => {
-  const userId = normalizeUserId(scope?.userId);
+  const { userId, teamId } = resolveScope(scope);
   logCosmosEnvOnce();
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: missing configuration.');
   }
 
-  const container = userId ? await getCoachContainer() : await getContainer();
+  const container = userId || teamId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: container not initialized.');
   }
 
   let resources;
   try {
-    const queryText = userId
-      ? 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true)'
+    const scopeFilter = buildScopeFilter({ userId, teamId });
+    const queryText = scopeFilter.query
+      ? `SELECT * FROM c WHERE c.type = @type AND ${scopeFilter.query} AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true)`
       : 'SELECT * FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type) AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true)';
-    const parameters = userId
-      ? [
-          { name: '@type', value: 'playerBaseline' },
-          { name: '@userId', value: userId },
-        ]
-      : [{ name: '@type', value: 'playerBaseline' }];
+    const parameters = [{ name: '@type', value: 'playerBaseline' }, ...scopeFilter.parameters];
     const result = await container.items
       .query({
         query: queryText,
         parameters,
+        ...(scopeFilter.partitionKey ? { partitionKey: scopeFilter.partitionKey } : {}),
       })
       .fetchAll();
     resources = result.resources;
@@ -531,27 +697,24 @@ const getRosterBaselines = async (scope = {}) => {
 };
 
 const fetchExistingOrderIndexMap = async (container, scope = {}) => {
-  const userId = normalizeUserId(scope?.userId);
+  const { userId, teamId } = resolveScope(scope);
   if (!container) return new Map();
   try {
-    const queryText = userId
-      ? 'SELECT c.id, c.baselineId, c.playerId, c.orderIndex, c.createdAt FROM c WHERE c.type = @type AND c.userId = @userId'
+    const scopeFilter = buildScopeFilter({ userId, teamId });
+    const queryText = scopeFilter.query
+      ? `SELECT c.id, c.baselineId, c.playerId, c.orderIndex, c.createdAt FROM c WHERE c.type = @type AND ${scopeFilter.query}`
       : 'SELECT c.id, c.orderIndex FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type)';
-    const parameters = userId
-      ? [
-          { name: '@type', value: 'playerBaseline' },
-          { name: '@userId', value: userId },
-        ]
-      : [{ name: '@type', value: 'playerBaseline' }];
+    const parameters = [{ name: '@type', value: 'playerBaseline' }, ...scopeFilter.parameters];
     const result = await container.items
       .query({
         query: queryText,
         parameters,
+        ...(scopeFilter.partitionKey ? { partitionKey: scopeFilter.partitionKey } : {}),
       })
       .fetchAll();
     const map = new Map();
     (Array.isArray(result.resources) ? result.resources : []).forEach((row) => {
-      const key = userId
+      const key = userId || teamId
         ? normalizeBaselineKey(row?.baselineId || row?.playerId || row?.name || row?.id)
         : normalizeBaselineKey(row?.id);
       if (!key) return;
@@ -578,26 +741,25 @@ const getMaxOrderIndex = (values) => {
 };
 
 const getBaseline = async (id, scope = {}) => {
-  const userId = normalizeUserId(scope?.userId);
+  const { userId, teamId } = resolveScope(scope);
   const normalizedId = normalizeId(id);
   if (!normalizedId) return null;
 
-  if (!isCosmosConfigured() || userId) {
-    if (userId) {
+  if (!isCosmosConfigured() || userId || teamId) {
+    if (userId || teamId) {
       const container = await getCoachContainer();
       if (!container) {
         throw createCosmosUnavailableError('Cosmos baselines are unavailable: coach container not initialized.');
       }
       try {
+        const scopeFilter = buildScopeFilter({ userId, teamId });
+        if (!scopeFilter.query) return null;
+        const queryText = `SELECT TOP 1 * FROM c WHERE c.type = @type AND ${scopeFilter.query} AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id)`;
         const result = await container.items
           .query({
-            query:
-              'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id)',
-            parameters: [
-              { name: '@type', value: 'playerBaseline' },
-              { name: '@userId', value: userId },
-              { name: '@id', value: normalizedId },
-            ],
+            query: queryText,
+            parameters: [{ name: '@type', value: 'playerBaseline' }, ...scopeFilter.parameters, { name: '@id', value: normalizedId }],
+            ...(scopeFilter.partitionKey ? { partitionKey: scopeFilter.partitionKey } : {}),
           })
           .fetchAll();
         const resource = Array.isArray(result.resources) ? result.resources[0] : null;
@@ -632,7 +794,7 @@ const getBaseline = async (id, scope = {}) => {
 };
 
 const upsertBaselines = async (players, scope = {}) => {
-  const userId = normalizeUserId(scope?.userId);
+  const { userId, teamId } = resolveScope(scope);
   const rows = Array.isArray(players) ? players : [];
   const normalizedEntries = [];
   const errors = [];
@@ -678,12 +840,12 @@ const upsertBaselines = async (players, scope = {}) => {
     throw createCosmosUnavailableError('Cannot save baselines: Cosmos is not configured.');
   }
 
-  const container = userId ? await getCoachContainer() : await getContainer();
+  const container = userId || teamId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cannot save baselines: Cosmos container unavailable.');
   }
 
-  const existingOrderById = await fetchExistingOrderIndexMap(container, userId ? { userId } : {});
+  const existingOrderById = await fetchExistingOrderIndexMap(container, userId || teamId ? { userId, teamId } : {});
   const maxFromExisting = getMaxOrderIndex(
     [...existingOrderById.values()].map((entry) =>
       entry && typeof entry === 'object' ? normalizeOrderIndex(entry.orderIndex) : normalizeOrderIndex(entry)
@@ -710,13 +872,14 @@ const upsertBaselines = async (players, scope = {}) => {
       nextOrderIndex += 1;
       normalized.orderIndex = nextOrderIndex;
     }
-    if (userId) {
+    if (userId || teamId) {
       const existingDocId = existingOrder && typeof existingOrder === 'object' ? normalizeId(existingOrder.docId) : '';
       const existingCreatedAt =
         existingOrder && typeof existingOrder === 'object' ? normalizeIsoTimestamp(existingOrder.createdAt) : undefined;
       normalized.baselineId = normalized.id;
       normalized.playerId = normalized.id;
       normalized.userId = userId;
+      normalized.teamId = teamId;
       normalized.id = existingDocId || randomUUID();
       normalized.createdAt = existingCreatedAt || normalizeIsoTimestamp(normalized.createdAt);
       normalized.updatedAt = new Date().toISOString();
@@ -729,7 +892,7 @@ const upsertBaselines = async (players, scope = {}) => {
     await Promise.all(
       batch.map((item) =>
         container.items.upsert(item, {
-          partitionKey: userId ? userId : item.id,
+          partitionKey: userId || item.userId || item.id,
         })
       )
     );
@@ -811,30 +974,27 @@ const setBaselineActive = async (id, active, scope = {}) => patchBaseline(id, { 
 
 const resetBaselines = async (options = {}) => {
   const shouldSeed = options.seed !== false;
-  const userId = normalizeUserId(options.userId);
+  const { userId, teamId } = resolveScope(options);
 
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cannot reset baselines: Cosmos is not configured.');
   }
 
-  const container = userId ? await getCoachContainer() : await getContainer();
+  const container = userId || teamId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cannot reset baselines: Cosmos container unavailable.');
   }
 
-  const queryText = userId
-    ? 'SELECT c.id FROM c WHERE c.type = @type AND c.userId = @userId'
+  const scopeFilter = buildScopeFilter({ userId, teamId });
+  const queryText = scopeFilter.query
+    ? `SELECT c.id FROM c WHERE c.type = @type AND ${scopeFilter.query}`
     : 'SELECT c.id FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type)';
-  const queryParams = userId
-    ? [
-        { name: '@type', value: 'playerBaseline' },
-        { name: '@userId', value: userId },
-      ]
-    : [{ name: '@type', value: 'playerBaseline' }];
+  const queryParams = [{ name: '@type', value: 'playerBaseline' }, ...scopeFilter.parameters];
   const { resources } = await container.items
     .query({
       query: queryText,
       parameters: queryParams,
+      ...(scopeFilter.partitionKey ? { partitionKey: scopeFilter.partitionKey } : {}),
     })
     .fetchAll();
   const ids = (Array.isArray(resources) ? resources : [])
@@ -848,7 +1008,7 @@ const resetBaselines = async (options = {}) => {
 
   let seeded = 0;
   if (shouldSeed) {
-    const result = await upsertBaselines(buildDefaultBaselines(), userId ? { userId } : {});
+    const result = await upsertBaselines(buildDefaultBaselines(), userId || teamId ? { userId, teamId } : {});
     seeded = result.count;
   }
 
@@ -882,6 +1042,8 @@ const getCosmosDiagnostics = () => {
     account,
     databaseId: config.databaseId,
     containerId: config.containerId,
+    coachContainerId: config.coachContainerId || DEFAULT_COACH_CONTAINER,
+    usersContainerId: config.usersContainerId || DEFAULT_USERS_CONTAINER,
     missing,
     initialized: Boolean(cachedContainer),
     initError: initError ? String(initError.message || initError) : null,
@@ -889,27 +1051,24 @@ const getCosmosDiagnostics = () => {
 };
 
 const getBaselineCount = async (scope = {}) => {
-  const userId = normalizeUserId(scope?.userId);
+  const { userId, teamId } = resolveScope(scope);
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cannot count baselines: Cosmos is not configured.');
   }
-  const container = userId ? await getCoachContainer() : await getContainer();
+  const container = userId || teamId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cannot count baselines: Cosmos container unavailable.');
   }
-  const queryText = userId
-    ? 'SELECT VALUE COUNT(1) FROM c WHERE c.type = @type AND c.userId = @userId'
+  const scopeFilter = buildScopeFilter({ userId, teamId });
+  const queryText = scopeFilter.query
+    ? `SELECT VALUE COUNT(1) FROM c WHERE c.type = @type AND ${scopeFilter.query}`
     : 'SELECT VALUE COUNT(1) FROM c WHERE c.type = @type';
-  const parameters = userId
-    ? [
-        { name: '@type', value: 'playerBaseline' },
-        { name: '@userId', value: userId },
-      ]
-    : [{ name: '@type', value: 'playerBaseline' }];
+  const parameters = [{ name: '@type', value: 'playerBaseline' }, ...scopeFilter.parameters];
   const result = await container.items
     .query({
       query: queryText,
       parameters,
+      ...(scopeFilter.partitionKey ? { partitionKey: scopeFilter.partitionKey } : {}),
     })
     .fetchAll();
   const count = Array.isArray(result.resources) ? Number(result.resources[0] || 0) : 0;
@@ -923,6 +1082,9 @@ module.exports = {
   isCosmosConfigured,
   getContainer,
   getCoachContainer,
+  getUsersContainer,
+  ensureCoachUserProfile,
+  backfillBaselinesTeamId,
   getAllBaselines,
   getRosterBaselines,
   getBaseline,

@@ -21,6 +21,22 @@ export default function AuthPage({
   onCopySwaCommand,
   copiedSwaCommand = false,
 }: AuthPageProps) {
+  const handleTryDemoClick = React.useCallback(() => {
+    onTryDemo();
+    try {
+      if (typeof window !== 'undefined' && typeof window.history?.pushState === 'function') {
+        window.history.pushState(null, '', '/demo');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+        return;
+      }
+    } catch {
+      // Fall back to hard navigation below.
+    }
+    if (typeof window !== 'undefined') {
+      window.location.assign('/demo');
+    }
+  }, [onTryDemo]);
+
   return (
     <div className="auth-page-shell">
       <div className="auth-page-overlay" aria-hidden="true" />
@@ -51,7 +67,7 @@ export default function AuthPage({
 
         <button
           type="button"
-          onClick={onTryDemo}
+          onClick={handleTryDemoClick}
           className="auth-page-button auth-page-button-secondary"
         >
           Try Demo

@@ -1,7 +1,10 @@
 [
   {
     "id": "Babar Azam",
+    "baselineId": "Babar Azam",
     "type": "playerBaseline",
+    "userId": "",
+    "teamId": "",
     "name": "Babar Azam",
     "role": "BAT",
     "sleep": 7,
@@ -18,7 +21,10 @@
   },
   {
     "id": "R. Khan",
+    "baselineId": "R. Khan",
     "type": "playerBaseline",
+    "userId": "",
+    "teamId": "",
     "name": "R. Khan",
     "role": "SPIN",
     "sleep": 7.1,

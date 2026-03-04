@@ -54,6 +54,7 @@ const riskEndpoint = resolveApiUrl('/agents/risk');
 const tacticalEndpoint = resolveApiUrl('/agents/tactical');
 const orchestrateEndpoint = apiOrchestrateUrl;
 const baselinesEndpoint = resolveApiUrl('/baselines');
+const usersEnsureEndpoint = resolveApiUrl('/users/ensure');
 const copilotChatEndpoint = resolveApiUrl('/api/copilot-chat');
 const analysisExistsEndpoint = (analysisId: string): string =>
   resolveApiUrl(`/analysis/${encodeURIComponent(String(analysisId || '').trim())}/exists`);
@@ -205,10 +206,16 @@ async function requestText(
   if (!response.ok) {
     devWarn('[API] Non-2xx response', { url, status: response.status });
     const snippet = summarizeErrorText(responseText);
+    let message = snippet
+      ? `HTTP ${response.status}: ${snippet}`
+      : `HTTP ${response.status} ${response.statusText || ''}`.trim();
+    if (response.status === 401) {
+      message = 'Authentication required. Please sign in with Microsoft.';
+    } else if (response.status === 403) {
+      message = 'Access denied for this coach workspace.';
+    }
     throw new ApiClientError({
-      message: snippet
-        ? `HTTP ${response.status}: ${snippet}`
-        : `HTTP ${response.status} ${response.statusText || ''}`.trim(),
+      message,
       kind: 'http',
       url,
       status: response.status,
@@ -595,6 +602,61 @@ export interface AnalysisExistsResponse {
   ok?: boolean;
   exists?: boolean;
   analysisId?: string;
+}
+
+export interface CoachUserProfile {
+  ok?: boolean;
+  id?: string;
+  userId: string;
+  teamId: string;
+  name?: string | null;
+  email?: string | null;
+  role?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export async function ensureCoachUserProfile(signal?: AbortSignal): Promise<CoachUserProfile> {
+  if (isDemoModeEnabled()) {
+    return {
+      ok: true,
+      id: 'demo-local',
+      userId: 'demo-local',
+      teamId: 'demo-local-team',
+      name: 'Demo Coach',
+      email: 'demo@local',
+      role: 'coach',
+    };
+  }
+  const raw = await postJson<unknown>(usersEnsureEndpoint, {}, signal);
+  if (!raw || typeof raw !== 'object') {
+    throw new ApiClientError({
+      message: 'Invalid coach profile response.',
+      kind: 'parse',
+      url: usersEnsureEndpoint,
+    });
+  }
+  const record = raw as Record<string, unknown>;
+  const userId = String(record.userId || '').trim();
+  const teamId = String(record.teamId || '').trim();
+  if (!userId || !teamId) {
+    throw new ApiClientError({
+      message: 'Coach profile is missing user/team scope.',
+      kind: 'parse',
+      url: usersEnsureEndpoint,
+    });
+  }
+  return {
+    ok: typeof record.ok === 'boolean' ? record.ok : true,
+    id: typeof record.id === 'string' ? record.id : undefined,
+    userId,
+    teamId,
+    name: typeof record.name === 'string' ? record.name : null,
+    email: typeof record.email === 'string' ? record.email : null,
+    role: typeof record.role === 'string' ? record.role : null,
+    createdAt: typeof record.createdAt === 'string' ? record.createdAt : null,
+    updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : null,
+  };
 }
 
 export async function checkAnalysisExists(

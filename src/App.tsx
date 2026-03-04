@@ -52,6 +52,7 @@ import {
   checkHealth,
   checkAnalysisExists,
   deleteBaseline,
+  ensureCoachUserProfile,
   getBaselineByPlayerId,
   getBaselinesWithMeta,
   postFatigueAgent,
@@ -1037,6 +1038,16 @@ const writeStoredActivePlayerId = (playerId: string): void => {
   }
 };
 
+const isAuthPath = (value: unknown): boolean => {
+  const path = String(value || '').toLowerCase();
+  return path === '/auth' || path.startsWith('/auth/');
+};
+
+const isDemoPath = (value: unknown): boolean => {
+  const path = String(value || '').toLowerCase();
+  return path === '/demo' || path.startsWith('/demo/');
+};
+
 const toRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 
@@ -1427,11 +1438,10 @@ const SWA_CLI_COMMAND = 'swa start http://localhost:5173 --api-location http://l
 
 export default function App() {
   const initialStoredMatchMode = useMemo(() => readStoredMatchMode(), []);
+  const initialPath = useMemo(() => (typeof window === 'undefined' ? '/' : String(window.location.pathname || '')), []);
   const isAuthPathOnLoad = useMemo(() => {
-    if (typeof window === 'undefined') return false;
-    const path = String(window.location.pathname || '').toLowerCase();
-    return path === '/auth' || path.startsWith('/auth/');
-  }, []);
+    return isAuthPath(initialPath);
+  }, [initialPath]);
   const [demoMode, setDemoMode] = useState<boolean>(() => isDemoModeEnabled());
   const [authStatus, setAuthStatus] = useState<AuthStatus>(() => (isDemoModeEnabled() ? 'authenticated' : 'checking'));
   const [authUser, setAuthUser] = useState<{ userId: string; name?: string; email?: string } | null>(
@@ -1444,10 +1454,11 @@ export default function App() {
           }
         : null
   );
+  const [, setCoachTeamId] = useState<string | null>(null);
   const [showSplash, setShowSplash] = useState(() => !isAuthPathOnLoad);
   const [authLocalHint, setAuthLocalHint] = useState<string | null>(null);
   const [copiedSwaCommand, setCopiedSwaCommand] = useState(false);
-  const [page, setPage] = useState<Page>('landing');
+  const [page, setPage] = useState<Page>(() => (isDemoPath(initialPath) ? 'dashboard' : 'landing'));
   const [matchContext, setMatchContext] = useState<MatchContext>({
     matchMode: initialStoredMatchMode ?? 'BOWLING',
     format: 'T20',
@@ -1562,16 +1573,29 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || showSplash) return;
-    const path = String(window.location.pathname || '').toLowerCase();
-    const onAuthPath = path === '/auth' || path.startsWith('/auth/');
+    const path = String(window.location.pathname || '');
+    const onAuthPath = isAuthPath(path);
+    const onDemoPath = isDemoPath(path);
+    if (onDemoPath && !demoMode) {
+      setDemoModeEnabled(true);
+      setDemoMode(true);
+      setAuthStatus('authenticated');
+      setAuthUser({
+        userId: 'demo-local',
+        name: 'Demo Coach',
+        email: 'demo@local',
+      });
+      setPage('dashboard');
+      return;
+    }
     if (!isAppUnlocked && !onAuthPath) {
       window.history.replaceState(null, '', '/auth');
       return;
     }
     if (isAppUnlocked && onAuthPath) {
-      window.history.replaceState(null, '', '/');
+      window.history.replaceState(null, '', demoMode ? '/demo' : '/');
     }
-  }, [isAppUnlocked, showSplash]);
+  }, [demoMode, isAppUnlocked, showSplash]);
 
   useEffect(() => {
     if (isAppUnlocked) {
@@ -1590,6 +1614,7 @@ export default function App() {
         name: 'Demo Coach',
         email: 'demo@local',
       });
+      setCoachTeamId('demo-local-team');
       return () => {
         cancelled = true;
       };
@@ -1597,6 +1622,7 @@ export default function App() {
 
     setAuthStatus('checking');
     setAuthUser(null);
+    setCoachTeamId(null);
     void getUser().then((user) => {
       if (cancelled) return;
       if (user.isAuthenticated && user.userId) {
@@ -1609,12 +1635,45 @@ export default function App() {
       } else {
         setAuthStatus('unauthenticated');
         setAuthUser(null);
+        setCoachTeamId(null);
       }
     });
     return () => {
       cancelled = true;
     };
   }, [demoMode, showSplash]);
+
+  useEffect(() => {
+    if (!isAppUnlocked) {
+      setCoachTeamId(null);
+      return;
+    }
+    if (demoMode) {
+      setCoachTeamId('demo-local-team');
+      return;
+    }
+    if (!authUser?.userId) return;
+
+    let cancelled = false;
+    void ensureCoachUserProfile().then((profile) => {
+      if (cancelled) return;
+      setCoachTeamId(profile.teamId);
+    }).catch((error) => {
+      if (cancelled) return;
+      const isAuthError = error instanceof ApiClientError && (error.status === 401 || error.status === 403);
+      if (isAuthError) {
+        console.warn('[auth] profile ensure blocked', { status: error.status, url: error.url });
+        setBaselineWarning('Sign in again to load your team workspace.');
+      } else {
+        console.error('[auth] profile ensure failed', error);
+        setBaselineWarning('Could not load coach workspace. Team data may be unavailable.');
+      }
+      setCoachTeamId(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser?.userId, demoMode, isAppUnlocked]);
 
   const handleContinueWithMicrosoft = useCallback(() => {
     setDemoModeEnabled(false);
@@ -1637,7 +1696,15 @@ export default function App() {
     setCopiedSwaCommand(false);
     setDemoModeEnabled(true);
     setDemoMode(true);
+    setCoachTeamId('demo-local-team');
     setPage('dashboard');
+    if (typeof window !== 'undefined') {
+      try {
+        window.history.pushState(null, '', '/demo');
+      } catch {
+        window.location.assign('/demo');
+      }
+    }
   }, []);
 
   const handleSignOut = useCallback(() => {
@@ -1645,6 +1712,7 @@ export default function App() {
     setDemoMode(false);
     setAuthStatus('unauthenticated');
     setAuthUser(null);
+    setCoachTeamId(null);
     if (typeof window !== 'undefined') {
       window.location.assign(getMicrosoftLogoutUrl());
     }
@@ -3615,7 +3683,9 @@ export default function App() {
                  backgroundSize: '60px 60px' 
                }} 
           />
-          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-emerald-500/50 to-transparent opacity-50"></div>
+          {isAppUnlocked && (
+            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-emerald-500/50 to-transparent opacity-50"></div>
+          )}
         </div>
       )}
 

@@ -26,6 +26,8 @@ try {
 }
 const {
   deleteBaseline,
+  backfillBaselinesTeamId,
+  ensureCoachUserProfile,
   getAllBaselines,
   getBaseline,
   getBaselineCount,
@@ -1202,6 +1204,11 @@ const getCoachIdentity = (req) => {
 const requireCoachIdentity = (req, res) => {
   const identity = getCoachIdentity(req);
   if (!identity?.isAuthenticated || !normalizeId(identity.userId)) {
+    console.warn("[auth] 401 unauthorized", {
+      path: req.path,
+      method: req.method,
+      source: identity?.authSource || "none",
+    });
     res.status(401).json({
       ok: false,
       error: "unauthorized",
@@ -1214,12 +1221,56 @@ const requireCoachIdentity = (req, res) => {
 const blockDemoWriteIfNeeded = (req, res) => {
   if (!isDemoHeaderEnabled(req)) return false;
   if (!["POST", "PUT", "PATCH", "DELETE"].includes(String(req.method || "").toUpperCase())) return false;
+  console.warn("[auth] 403 demo_read_only", {
+    path: req.path,
+    method: req.method,
+  });
   res.status(403).json({
     ok: false,
     error: "demo_read_only",
     message: "Demo mode is read-only and does not write to Cosmos.",
   });
   return true;
+};
+
+const teamBackfillCache = new Set();
+
+const ensureCoachScope = async (identity) => {
+  const profile = await ensureCoachUserProfile({
+    userId: normalizeId(identity.userId),
+    email: identity.email || "",
+    name: identity.name || "",
+  });
+  const teamId = normalizeId(profile?.teamId);
+  const userId = normalizeId(identity.userId);
+  if (!teamId || !userId) {
+    const error = new Error("coach profile missing team scope");
+    error.code = "PROFILE_SCOPE_INVALID";
+    throw error;
+  }
+  const backfillKey = `${userId}:${teamId}`;
+  if (!teamBackfillCache.has(backfillKey)) {
+    try {
+      const result = await backfillBaselinesTeamId({ userId, teamId });
+      if (isDevServerLogEnabled() && (result?.updated || 0) > 0) {
+        console.log("[baselines] team_backfill", {
+          userId,
+          teamId,
+          updated: result.updated,
+        });
+      }
+    } catch (error) {
+      if (isDevServerLogEnabled()) {
+        console.warn("[baselines] team_backfill_failed", error instanceof Error ? error.message : String(error));
+      }
+    }
+    teamBackfillCache.add(backfillKey);
+  }
+  return {
+    userId,
+    teamId,
+    profile,
+  };
 };
 
 const toCopilotHistory = (value) => {
@@ -1570,6 +1621,7 @@ app.get("/api/health", async (_req, res) => {
     routes: [
       "/api/health",
       "/api/me",
+      "/api/users/ensure",
       "/api/baselines",
       "/api/players",
       "/api/roster",
@@ -1606,6 +1658,38 @@ app.get("/api/me", (req, res) => {
     name: identity.name || null,
     email: identity.email || null,
   });
+});
+
+app.post("/api/users/ensure", async (req, res) => {
+  try {
+    const identity = requireCoachIdentity(req, res);
+    if (!identity) return;
+    const scope = await ensureCoachScope(identity);
+    if (isDevServerLogEnabled()) {
+      console.log("[users][ensure]", {
+        userId: scope.userId,
+        teamId: scope.teamId,
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      id: scope.profile.id,
+      userId: scope.userId,
+      email: scope.profile.email || null,
+      name: scope.profile.name || null,
+      teamId: scope.teamId,
+      role: scope.profile.role || "coach",
+      createdAt: scope.profile.createdAt || null,
+      updatedAt: scope.profile.updatedAt || null,
+    });
+  } catch (error) {
+    console.error("[users][ensure] failed", error instanceof Error ? error.message : String(error));
+    return res.status(500).json({
+      ok: false,
+      error: "profile_ensure_failed",
+      message: "Failed to load coach profile.",
+    });
+  }
 });
 
 const cosmosHealthHandler = async (_req, res) => {
@@ -1671,12 +1755,27 @@ const readBaselinesPayload = async (req, res) => {
   if (!identity) {
     return { ok: false, aborted: true };
   }
+  let coachScope;
+  try {
+    coachScope = await ensureCoachScope(identity);
+  } catch (error) {
+    console.error("[baselines] scope_resolve_failed", error instanceof Error ? error.message : String(error));
+    return {
+      ok: false,
+      status: 500,
+      body: {
+        ok: false,
+        error: "profile_scope_unavailable",
+        message: "Unable to resolve coach team scope.",
+      },
+      where: "ensureCoachScope",
+    };
+  }
   const readiness = await ensureCosmosBaselinesReady();
   if (!readiness.ok) {
     return { ok: false, status: readiness.status, body: readiness.body, where: "ensureCosmosBaselinesReady" };
   }
-  const coachUserId = normalizeId(identity.userId);
-  const players = await getAllBaselines({ userId: coachUserId });
+  const players = await getAllBaselines({ userId: coachScope.userId, teamId: coachScope.teamId });
   const diagnostics = getCosmosDiagnostics();
   return {
     ok: true,
@@ -1688,7 +1787,8 @@ const readBaselinesPayload = async (req, res) => {
       db: diagnostics.databaseId,
       container: process.env.COSMOS_COACH_CONTAINER || "playersByCoach",
       count: players.length,
-      userId: coachUserId,
+      userId: coachScope.userId,
+      teamId: coachScope.teamId,
     },
   };
 };
@@ -1705,6 +1805,7 @@ app.get("/api/baselines", async (req, res) => {
       database: result.diagnostics?.db || null,
       container: result.diagnostics?.container || null,
       userId: result.diagnostics?.userId || null,
+      teamId: result.diagnostics?.teamId || null,
       count: result.diagnostics?.count || 0,
     });
     return res.status(200).json(result.body);
@@ -1752,18 +1853,19 @@ app.get(["/api/roster", "/roster"], async (req, res) => {
   try {
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const readiness = await ensureCosmosBaselinesReady();
     if (!readiness.ok) {
       return res.status(readiness.status).json(readiness.body);
     }
-    const coachUserId = normalizeId(identity.userId);
-    const players = await getRosterBaselines({ userId: coachUserId });
+    const players = await getRosterBaselines({ userId: scope.userId, teamId: scope.teamId });
     const diagnostics = getCosmosDiagnostics();
     console.log("[roster] GET", {
       account: diagnostics.account || null,
       database: diagnostics.databaseId,
       container: process.env.COSMOS_COACH_CONTAINER || "playersByCoach",
-      userId: coachUserId,
+      userId: scope.userId,
+      teamId: scope.teamId,
       count: players.length,
     });
     return res.status(200).json({
@@ -1781,6 +1883,7 @@ app.get("/api/baselines/:id", async (req, res) => {
   try {
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const readiness = await ensureCosmosBaselinesReady();
     if (!readiness.ok) {
       return res.status(readiness.status).json(readiness.body);
@@ -1789,7 +1892,7 @@ app.get("/api/baselines/:id", async (req, res) => {
     if (!id) {
       return res.status(400).json({ error: "id is required." });
     }
-    const baseline = await getBaseline(id, { userId: normalizeId(identity.userId) });
+    const baseline = await getBaseline(id, { userId: scope.userId, teamId: scope.teamId });
     if (!baseline) {
       return res.status(404).json({ error: `Baseline ${id} not found.` });
     }
@@ -1806,6 +1909,7 @@ const saveBaselinesHandler = async (req, res) => {
     if (blockDemoWriteIfNeeded(req, res)) return;
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const readiness = await ensureCosmosBaselinesReady();
     if (!readiness.ok) {
       return res.status(readiness.status).json(readiness.body);
@@ -1818,9 +1922,8 @@ const saveBaselinesHandler = async (req, res) => {
       });
     }
 
-    const coachUserId = normalizeId(identity.userId);
-    await upsertBaselines(normalized.players, { userId: coachUserId });
-    const players = await getAllBaselines({ userId: coachUserId });
+    await upsertBaselines(normalized.players, { userId: scope.userId, teamId: scope.teamId });
+    const players = await getAllBaselines({ userId: scope.userId, teamId: scope.teamId });
     return res.status(200).json({ success: true, ok: true, players });
   } catch (error) {
     console.error("Baselines PUT error", error);
@@ -1846,6 +1949,7 @@ app.patch("/api/baselines/:id", async (req, res) => {
     if (blockDemoWriteIfNeeded(req, res)) return;
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const readiness = await ensureCosmosBaselinesReady();
     if (!readiness.ok) {
       return res.status(readiness.status).json(readiness.body);
@@ -1881,7 +1985,7 @@ app.patch("/api/baselines/:id", async (req, res) => {
       ...(hasActive ? { active: req.body.active } : {}),
       ...(hasInRoster ? { inRoster: nextInRoster } : {}),
       },
-      { userId: normalizeId(identity.userId) }
+      { userId: scope.userId, teamId: scope.teamId }
     );
     if (process.env.NODE_ENV !== "production") {
       console.log("[baselines] patch", { id, status: 200, hasActive, hasInRoster });
@@ -1911,6 +2015,7 @@ app.delete("/api/baselines/:id", async (req, res) => {
     if (blockDemoWriteIfNeeded(req, res)) return;
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const readiness = await ensureCosmosBaselinesReady();
     if (!readiness.ok) {
       return res.status(readiness.status).json(readiness.body);
@@ -1920,7 +2025,7 @@ app.delete("/api/baselines/:id", async (req, res) => {
       return res.status(400).json({ error: "id is required." });
     }
 
-    await deleteBaseline(id, { userId: normalizeId(identity.userId) });
+    await deleteBaseline(id, { userId: scope.userId, teamId: scope.teamId });
     return res.status(200).json({ ok: true });
   } catch (error) {
     console.error("Baselines DELETE error", error);
@@ -1941,17 +2046,17 @@ const resetBaselinesHandler = async (_req, res) => {
     if (blockDemoWriteIfNeeded(_req, res)) return;
     const identity = requireCoachIdentity(_req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const readiness = await ensureCosmosBaselinesReady();
     if (!readiness.ok) {
       return res.status(readiness.status).json(readiness.body);
     }
-    const coachUserId = normalizeId(identity.userId);
-    const result = await resetBaselines({ seed: true, userId: coachUserId });
+    const result = await resetBaselines({ seed: true, userId: scope.userId, teamId: scope.teamId });
     return res.status(200).json({
       ok: true,
       deleted: result.deleted,
       seeded: result.seeded,
-      players: await getAllBaselines({ userId: coachUserId }),
+      players: await getAllBaselines({ userId: scope.userId, teamId: scope.teamId }),
     });
   } catch (error) {
     console.error("Baselines reset error", error);
@@ -2001,11 +2106,12 @@ app.get("/api/players/:id", async (req, res) => {
   try {
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
     if (!id) {
       return res.status(400).json({ ok: false, error: "invalid_id", message: "id is required." });
     }
-    const player = await getBaseline(id, { userId: normalizeId(identity.userId) });
+    const player = await getBaseline(id, { userId: scope.userId, teamId: scope.teamId });
     if (!player) {
       return res.status(404).json({ ok: false, error: "not_found", message: `Player ${id} not found.` });
     }
@@ -2021,6 +2127,7 @@ app.put("/api/players/:id", async (req, res) => {
     if (blockDemoWriteIfNeeded(req, res)) return;
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
 
     const readiness = await ensureCosmosBaselinesReady();
     if (!readiness.ok) {
@@ -2051,8 +2158,8 @@ app.put("/api/players/:id", async (req, res) => {
       });
     }
 
-    await upsertBaselines([validateResult.value], { userId: normalizeId(identity.userId) });
-    const updated = await getBaseline(id, { userId: normalizeId(identity.userId) });
+    await upsertBaselines([validateResult.value], { userId: scope.userId, teamId: scope.teamId });
+    const updated = await getBaseline(id, { userId: scope.userId, teamId: scope.teamId });
     return res.status(200).json({ ok: true, player: updated });
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "VALIDATION_ERROR") {
@@ -2072,11 +2179,12 @@ app.delete("/api/players/:id", async (req, res) => {
     if (blockDemoWriteIfNeeded(req, res)) return;
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
+    const scope = await ensureCoachScope(identity);
     const id = normalizeBaselineId(decodeURIComponent(String(req.params.id || "")));
     if (!id) {
       return res.status(400).json({ ok: false, error: "invalid_id", message: "id is required." });
     }
-    await deleteBaseline(id, { userId: normalizeId(identity.userId) });
+    await deleteBaseline(id, { userId: scope.userId, teamId: scope.teamId });
     return res.status(200).json({ ok: true });
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error ? Number(error.code) : undefined;
@@ -2246,10 +2354,18 @@ const orchestrateHandler = async (req, res) => {
   try {
     const rawPayload = isRecord(req.body) ? req.body : {};
     const identity = getCoachIdentity(req);
-    const baselineScope =
-      identity?.isAuthenticated && normalizeId(identity.userId)
-        ? { userId: normalizeId(identity.userId) }
-        : {};
+    let baselineScope = {};
+    if (identity?.isAuthenticated && normalizeId(identity.userId)) {
+      try {
+        const scope = await ensureCoachScope(identity);
+        baselineScope = { userId: scope.userId, teamId: scope.teamId };
+      } catch (scopeError) {
+        console.warn(
+          `[orchestrate:${traceId}] scope resolution skipped`,
+          scopeError instanceof Error ? scopeError.message : String(scopeError)
+        );
+      }
+    }
     let payload = rawPayload;
     try {
       payload = await applyStoredBaselineToPayload(rawPayload, baselineScope);
