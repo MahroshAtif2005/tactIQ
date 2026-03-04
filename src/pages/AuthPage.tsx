@@ -6,7 +6,6 @@ interface AuthPageProps {
   isChecking?: boolean;
   onContinueWithMicrosoft: () => void;
   onTryDemo: () => void;
-  showDemo?: boolean;
   isLocalDev?: boolean;
   localHint?: string | null;
   onCopySwaCommand?: () => void;
@@ -17,7 +16,6 @@ export default function AuthPage({
   isChecking,
   onContinueWithMicrosoft,
   onTryDemo,
-  showDemo = false,
   isLocalDev = false,
   localHint = null,
   onCopySwaCommand,
@@ -51,15 +49,13 @@ export default function AuthPage({
           {isChecking ? 'Checking session…' : 'Continue with Microsoft'}
         </button>
 
-        {showDemo && (
-          <button
-            type="button"
-            onClick={onTryDemo}
-            className="auth-page-button auth-page-button-secondary"
-          >
-            Try Demo
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={onTryDemo}
+          className="auth-page-button auth-page-button-secondary"
+        >
+          Try Demo
+        </button>
 
         {localHint && (
           <div className="auth-page-local-hint" role="status" aria-live="polite">

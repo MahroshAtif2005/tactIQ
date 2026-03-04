@@ -1637,6 +1637,7 @@ export default function App() {
     setCopiedSwaCommand(false);
     setDemoModeEnabled(true);
     setDemoMode(true);
+    setPage('dashboard');
   }, []);
 
   const handleSignOut = useCallback(() => {
@@ -3748,7 +3749,6 @@ export default function App() {
             isChecking={authStatus === 'checking'}
             onContinueWithMicrosoft={handleContinueWithMicrosoft}
             onTryDemo={handleTryDemoMode}
-            showDemo={canUseLocalDemo}
             isLocalDev={isLocalAuthHost}
             localHint={authLocalHint}
             onCopySwaCommand={handleCopySwaCommand}

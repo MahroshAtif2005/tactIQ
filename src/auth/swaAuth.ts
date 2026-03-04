@@ -6,7 +6,8 @@ export interface AuthUser {
 }
 
 const SWA_ME_URL = '/.auth/me';
-export const DEMO_MODE_STORAGE_KEY = 'tactiq:demo';
+export const DEMO_MODE_STORAGE_KEY = 'tactiq_demo';
+const LEGACY_DEMO_MODE_STORAGE_KEY = 'tactiq:demo';
 
 interface ClientPrincipalClaim {
   typ?: string;
@@ -60,7 +61,9 @@ const toAuthUser = (principal: ClientPrincipal | null): AuthUser => {
 export const isDemoModeEnabled = (): boolean => {
   if (typeof window === 'undefined') return false;
   try {
-    return String(window.localStorage.getItem(DEMO_MODE_STORAGE_KEY) || '').trim() === 'true';
+    const primary = String(window.localStorage.getItem(DEMO_MODE_STORAGE_KEY) || '').trim() === 'true';
+    const legacy = String(window.localStorage.getItem(LEGACY_DEMO_MODE_STORAGE_KEY) || '').trim() === 'true';
+    return primary || legacy;
   } catch {
     return false;
   }
@@ -71,8 +74,10 @@ export const setDemoModeEnabled = (enabled: boolean): void => {
   try {
     if (enabled) {
       window.localStorage.setItem(DEMO_MODE_STORAGE_KEY, 'true');
+      window.localStorage.setItem(LEGACY_DEMO_MODE_STORAGE_KEY, 'true');
     } else {
       window.localStorage.removeItem(DEMO_MODE_STORAGE_KEY);
+      window.localStorage.removeItem(LEGACY_DEMO_MODE_STORAGE_KEY);
     }
   } catch {
     // Ignore storage failures in restricted browser modes.
@@ -112,4 +117,3 @@ export const getMicrosoftLoginUrl = (): string =>
 
 export const getMicrosoftLogoutUrl = (): string =>
   '/.auth/logout?post_logout_redirect_uri=/auth';
-

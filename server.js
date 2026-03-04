@@ -1821,7 +1821,7 @@ const saveBaselinesHandler = async (req, res) => {
     const coachUserId = normalizeId(identity.userId);
     await upsertBaselines(normalized.players, { userId: coachUserId });
     const players = await getAllBaselines({ userId: coachUserId });
-    return res.status(200).json({ ok: true, players });
+    return res.status(200).json({ success: true, ok: true, players });
   } catch (error) {
     console.error("Baselines PUT error", error);
     if (error && typeof error === "object" && "code" in error && error.code === "VALIDATION_ERROR") {
