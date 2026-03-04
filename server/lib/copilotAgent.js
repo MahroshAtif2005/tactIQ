@@ -83,7 +83,7 @@ const buildSystemPrompt = () => [
   'If a value is missing, include one short Assumption line and continue with tactical guidance.',
   'Output format is mandatory: "Recommendation:" (1 sentence), "Reasoning:" (2 bullets), "Projection:" (1 bullet), "Caution:" (1 bullet), optional "Assumption:".',
   'Never mention backend internals, code, tools, or model details.',
-  'Keep replies concise, decisive, coach-friendly, and tactical (no long paragraphs).',
+  'Keep replies concise, decisive, coach-friendly, and tactical (max ~120 words).',
   'When possible, cite only concrete values that already exist in the provided context.',
 ].join(' ');
 
@@ -297,8 +297,8 @@ const runMatchCopilot = async ({ createAzureClient, contextSnapshot, coachOutput
   try {
     const request = client.chat.completions.create({
       model: deployment,
-      temperature: 0.15,
-      max_tokens: 420,
+      temperature: 0.5,
+      max_tokens: 300,
       messages,
     });
 

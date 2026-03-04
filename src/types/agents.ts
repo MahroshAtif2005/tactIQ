@@ -186,6 +186,7 @@ export interface SuggestedRotationPayload {
 
 export interface OrchestrateResponse {
   ok?: boolean;
+  analysisId?: string;
   combinedBriefing?: string;
   fatigue?: FatigueAgentResponse;
   risk?: RiskAgentResponse;
@@ -284,6 +285,7 @@ export interface OrchestrateResponse {
   errors: Array<{ agent: 'fatigue' | 'risk' | 'tactical'; message: string }>;
   meta: {
     requestId: string;
+    analysisId?: string;
     mode: 'auto' | 'full';
     executedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
     modelRouting: {

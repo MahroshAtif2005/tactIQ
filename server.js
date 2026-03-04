@@ -38,6 +38,16 @@ const {
   upsertBaselines,
   validateAndNormalizeBaseline,
 } = require("./server/db/cosmos");
+const { runMatchCopilot } = require("./server/lib/copilotAgent");
+const {
+  appendCopilotMessage,
+  countCopilotUserMessages,
+  findLatestAnalysisBundleByScope,
+  getAnalysisBundle,
+  getLatestAnalysisBundle,
+  listCopilotMessages,
+  saveAnalysisBundle,
+} = require("./server/lib/copilotStore");
 
 const rootEnvPath = path.resolve(__dirname, ".env");
 const agentFrameworkEnvPath = path.resolve(__dirname, "server/agent-framework/.env");
@@ -91,10 +101,18 @@ applyEnvAlias("COSMOS_CONTAINER", [
 const getAzureDeployment = () =>
   [
     process.env.AZURE_OPENAI_DEPLOYMENT,
+    process.env.AZURE_OPENAI_CHAT_DEPLOYMENT,
     process.env.AZURE_OPENAI_MODEL,
     process.env.AOAI_DEPLOYMENT_STRONG,
     process.env.AOAI_DEPLOYMENT_FAST,
     process.env.AOAI_DEPLOYMENT_FALLBACK,
+  ].find(isNonEmptyEnv) || "";
+const getCopilotDeployment = () =>
+  [
+    process.env.AZURE_OPENAI_MINI_DEPLOYMENT,
+    process.env.AZURE_OPENAI_COPILOT_DEPLOYMENT,
+    process.env.AOAI_DEPLOYMENT_FAST,
+    process.env.AZURE_OPENAI_DEPLOYMENT,
   ].find(isNonEmptyEnv) || "";
 const getAzureApiVersion = () =>
   String(process.env.AZURE_OPENAI_API_VERSION || process.env.OPENAI_API_VERSION || "2024-02-15-preview");
@@ -213,6 +231,7 @@ const hasAnyKeys = (value) => isRecord(value) && Object.keys(value).length > 0;
 const getMissingOrchestrateFields = (payload) =>
   ["telemetry", "matchContext", "players"].filter((field) => payload[field] === undefined || payload[field] === null);
 const normalizePlayerId = (value) => String(value || "").trim().toUpperCase();
+const normalizeId = (value) => String(value || "").trim();
 const normalizeBaselineId = (value) => String(value || "").trim();
 const parseNumber = (value, fallback) => {
   const parsed = Number(value);
@@ -315,6 +334,27 @@ const createAzureClient = () => {
   const endpoint = normalizeEndpoint(process.env.AZURE_OPENAI_ENDPOINT || "");
   const apiKey = String(process.env.AZURE_OPENAI_API_KEY || "");
   const deployment = String(getAzureDeployment() || "");
+  const apiVersion = getAzureApiVersion();
+  return {
+    endpoint,
+    apiKey,
+    deployment,
+    apiVersion,
+    client: new OpenAI({
+      apiKey,
+      baseURL: buildDeploymentBaseUrl(endpoint, deployment),
+      defaultQuery: { "api-version": apiVersion },
+      defaultHeaders: { "api-key": apiKey },
+    }),
+  };
+};
+const createCopilotAzureClient = () => {
+  if (!OpenAI) {
+    throw new Error("openai package is not installed");
+  }
+  const endpoint = normalizeEndpoint(process.env.AZURE_OPENAI_ENDPOINT || "");
+  const apiKey = String(process.env.AZURE_OPENAI_API_KEY || "");
+  const deployment = String(getCopilotDeployment() || getAzureDeployment() || "");
   const apiVersion = getAzureApiVersion();
   return {
     endpoint,
@@ -1140,6 +1180,78 @@ const ensureBackendLoaded = (res) => {
   return false;
 };
 
+const isDevServerLogEnabled = () =>
+  process.env.NODE_ENV !== "production" || String(process.env.DEBUG || "").trim() === "1";
+const COPILOT_RATE_WINDOW_MS = 2000;
+const copilotLastRequestByKey = new Map();
+
+const toCopilotHistory = (value) => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      const role = String(entry?.role || "").trim().toLowerCase() === "assistant" ? "assistant" : "user";
+      const content = String(entry?.content || "").replace(/\s+/g, " ").trim();
+      if (!content) return null;
+      return { role, content };
+    })
+    .filter(Boolean)
+    .slice(-8);
+};
+
+const buildMatchSnapshotForCopilot = (payload) => {
+  const context = normalizeFullMatchContext(payload?.context);
+  if (context.ok) return context.value;
+  return {
+    telemetry: isRecord(payload?.telemetry) ? payload.telemetry : {},
+    matchContext: isRecord(payload?.matchContext) ? payload.matchContext : {},
+    players: isRecord(payload?.players) ? payload.players : {},
+  };
+};
+
+const buildCoachOutputForCopilot = (result) => ({
+  strategicAnalysis: result?.strategicAnalysis || {},
+  tacticalRecommendation: result?.strategicAnalysis?.tacticalRecommendation || result?.tactical || {},
+  combinedDecision: result?.combinedDecision || result?.finalDecision || {},
+  combinedBriefing: String(result?.combinedBriefing || "").trim(),
+  fatigue: result?.fatigue || result?.agentResults?.fatigue?.output || {},
+  risk: result?.risk || result?.agentResults?.risk?.output || {},
+  tactical: result?.tactical || result?.agentResults?.tactical?.output || {},
+});
+
+const persistOrchestrateBundle = async ({ analysisId, payload, result, mode, traceId }) => {
+  const bundlePayload = {
+    analysisId: normalizeId(analysisId) || randomUUID(),
+    timestamp: new Date().toISOString(),
+    matchId: normalizeId(payload?.matchId || payload?.matchContext?.matchId || payload?.context?.match?.matchId),
+    sessionId: normalizeId(payload?.sessionId || payload?.matchContext?.sessionId || payload?.context?.match?.sessionId),
+    matchContextSnapshot: buildMatchSnapshotForCopilot(payload),
+    coachOutput: buildCoachOutputForCopilot(result),
+    routingMeta: {
+      mode: mode === "full" ? "full" : "auto",
+      traceId: normalizeId(traceId),
+      executedAgents: Array.isArray(result?.meta?.executedAgents) ? result.meta.executedAgents : [],
+      selectedAgents: Array.isArray(result?.routerDecision?.selectedAgents) ? result.routerDecision.selectedAgents : [],
+      source: result?.source || "server",
+    },
+  };
+  try {
+    const saved = await saveAnalysisBundle(bundlePayload);
+    if (isDevServerLogEnabled()) {
+      console.log("[copilot][bundle_saved]", {
+        analysisId: saved.analysisId,
+        storage: saved.storage,
+        mode: bundlePayload.routingMeta.mode,
+      });
+    }
+    return saved.analysisId;
+  } catch (error) {
+    if (isDevServerLogEnabled()) {
+      console.warn("[copilot][bundle_save_failed]", error instanceof Error ? error.message : String(error));
+    }
+    return bundlePayload.analysisId;
+  }
+};
+
 const toNum = (value, fallback) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -1429,6 +1541,8 @@ app.get("/api/health", async (_req, res) => {
       "/api/agents/risk",
       "/api/agents/tactical",
       "/api/orchestrate",
+      "/api/copilot-chat",
+      "/api/analysis/:id/exists",
       "/api/messages",
     ],
     aoai: aoai.ok
@@ -1920,6 +2034,7 @@ app.post("/api/agents/tactical", async (req, res) => {
 const orchestrateHandler = async (req, res) => {
   const startedAt = Date.now();
   const traceId = randomUUID();
+  const analysisId = randomUUID();
   if (!ensureBackendLoaded(res)) return;
 
   try {
@@ -1957,6 +2072,13 @@ const orchestrateHandler = async (req, res) => {
         30000,
         "orchestrate-full"
       );
+      const persistedAnalysisId = await persistOrchestrateBundle({
+        analysisId,
+        payload: validated.value,
+        result,
+        mode: "full",
+        traceId,
+      });
       const routedAgents = Array.isArray(result?.routerDecision?.selectedAgents)
         ? result.routerDecision.selectedAgents
         : ["fatigue", "risk", "tactical"];
@@ -1977,6 +2099,7 @@ const orchestrateHandler = async (req, res) => {
       return res.status(200).json({
         ...result,
         ok: true,
+        analysisId: persistedAnalysisId,
         traceId: String(result?.traceId || traceId),
         timingsMs: {
           ...(isRecord(result?.timingsMs) ? result.timingsMs : {}),
@@ -1985,6 +2108,7 @@ const orchestrateHandler = async (req, res) => {
         meta: {
           ...existingMeta,
           requestId: String(existingMeta.requestId || traceId),
+          analysisId: persistedAnalysisId,
           mode: "full",
           timingsMs: {
             ...existingMetaTimings,
@@ -1999,6 +2123,13 @@ const orchestrateHandler = async (req, res) => {
       30000,
       "orchestrate"
     );
+    const persistedAnalysisId = await persistOrchestrateBundle({
+      analysisId,
+      payload: validated.value,
+      result,
+      mode: requestMode,
+      traceId,
+    });
     const routedAgents = Array.isArray(result?.routerDecision?.selectedAgents)
       ? result.routerDecision.selectedAgents
       : ["tactical"];
@@ -2019,6 +2150,7 @@ const orchestrateHandler = async (req, res) => {
     return res.status(200).json({
       ...result,
       ok: true,
+      analysisId: persistedAnalysisId,
       traceId: String(result?.traceId || traceId),
       timingsMs: {
         ...(isRecord(result?.timingsMs) ? result.timingsMs : {}),
@@ -2027,6 +2159,7 @@ const orchestrateHandler = async (req, res) => {
       meta: {
         ...existingMeta,
         requestId: String(existingMeta.requestId || traceId),
+        analysisId: persistedAnalysisId,
         timingsMs: {
           ...existingMetaTimings,
           total: totalMs,
@@ -2048,8 +2181,40 @@ const orchestrateHandler = async (req, res) => {
     const mode = String(req?.body?.mode || "auto").toLowerCase() === "full" ? "full" : "auto";
     const errorMessage = sanitizeErrorMessage(error);
     const combinedBriefing = `Combined analysis completed with orchestrate fallback: ${errorMessage}`;
+    const fallbackPayload = isRecord(req?.body) ? req.body : {};
+    const fallbackResult = {
+      combinedBriefing,
+      combinedDecision: {
+        immediateAction: "Continue with monitored plan",
+        suggestedAdjustments: [combinedBriefing],
+        confidence: 0.55,
+        rationale: "orchestrate_exception",
+      },
+      strategicAnalysis: {
+        tacticalRecommendation: {
+          nextAction: "Continue with monitored plan",
+          why: "orchestrate_exception",
+          ifIgnored: "Increase monitoring and reassess on next over.",
+          alternatives: [],
+        },
+      },
+      meta: {
+        executedAgents: [],
+      },
+      routerDecision: {
+        selectedAgents: ["fatigue", "risk", "tactical"],
+      },
+    };
+    const persistedFallbackAnalysisId = await persistOrchestrateBundle({
+      analysisId,
+      payload: fallbackPayload,
+      result: fallbackResult,
+      mode,
+      traceId,
+    });
     return res.status(200).json({
       ok: true,
+      analysisId: persistedFallbackAnalysisId,
       traceId,
       combinedBriefing,
       warnings: [combinedBriefing],
@@ -2099,6 +2264,7 @@ const orchestrateHandler = async (req, res) => {
       timingsMs: { total: totalMs },
       meta: {
         requestId: traceId,
+        analysisId: persistedFallbackAnalysisId,
         mode,
         executedAgents: [],
         modelRouting: {
@@ -2118,6 +2284,186 @@ app.post("/orchestrate", orchestrateHandler);
 app.post("/api/orchestrate", orchestrateHandler);
 app.post("/orchestrate-probe", orchestrateHandler);
 app.post("/api/orchestrate-probe", orchestrateHandler);
+
+const copilotChatHandler = async (req, res) => {
+  const startedAt = Date.now();
+  const rawBody = isRecord(req.body) ? req.body : {};
+  if (typeof rawBody.message !== "string" || rawBody.message.trim().length === 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "invalid_request",
+      message: "message must be a non-empty string",
+    });
+  }
+  const message = rawBody.message.trim();
+  const requestedAnalysisId = normalizeId(rawBody.analysisId);
+  const matchId = normalizeId(rawBody.matchId || rawBody?.matchContext?.matchId || rawBody?.scope?.matchId);
+  const sessionId = normalizeId(rawBody.sessionId || rawBody?.matchContext?.sessionId || rawBody?.scope?.sessionId);
+
+  let recovered = false;
+  let analysisIdUsed = requestedAnalysisId;
+  let bundle = requestedAnalysisId ? await getAnalysisBundle(requestedAnalysisId) : null;
+
+  if (!bundle && (sessionId || matchId)) {
+    const scopedBundle = await findLatestAnalysisBundleByScope({ matchId, sessionId });
+    if (scopedBundle) {
+      bundle = scopedBundle;
+      analysisIdUsed = normalizeId(scopedBundle.analysisId);
+      recovered = true;
+    }
+  }
+
+  if (!bundle && requestedAnalysisId) {
+    const latestBundle = await getLatestAnalysisBundle();
+    if (latestBundle) {
+      bundle = latestBundle;
+      analysisIdUsed = normalizeId(latestBundle.analysisId);
+      recovered = true;
+    }
+  }
+
+  if (!bundle || !normalizeId(bundle.analysisId)) {
+    if (isDevServerLogEnabled()) {
+      console.warn("[copilot][analysis_required]", {
+        requestedAnalysisId: requestedAnalysisId || null,
+        sessionId: sessionId || null,
+        matchId: matchId || null,
+      });
+    }
+    return res.status(409).json({
+      ok: false,
+      error: "analysis_required",
+      message: "Run Coach Analysis first.",
+      needsAnalysis: true,
+    });
+  }
+
+  analysisIdUsed = normalizeId(bundle.analysisId);
+  const rateKey = `${analysisIdUsed}:${String(req.ip || "").trim() || "anon"}`;
+  const now = Date.now();
+  const lastRequestAt = copilotLastRequestByKey.get(rateKey) || 0;
+  if (now - lastRequestAt < COPILOT_RATE_WINDOW_MS) {
+    return res.status(429).json({
+      ok: false,
+      error: "rate_limited",
+      message: "Please wait a moment before sending another Copilot message.",
+      retryAfterMs: COPILOT_RATE_WINDOW_MS - (now - lastRequestAt),
+      analysisIdUsed,
+      recovered,
+    });
+  }
+  copilotLastRequestByKey.set(rateKey, now);
+
+  if (isDevServerLogEnabled()) {
+    console.log("[copilot][chat_request]", {
+      requestedAnalysisId: requestedAnalysisId || null,
+      analysisIdUsed,
+      found: Boolean(bundle),
+      recovered,
+      matchId: matchId || null,
+      sessionId: sessionId || null,
+    });
+  }
+
+  const userMessages = await countCopilotUserMessages(analysisIdUsed);
+  if (userMessages >= 10) {
+    return res.status(429).json({
+      ok: false,
+      error: "limit_reached",
+      message: "Copilot session message limit reached.",
+      analysisIdUsed,
+      recovered,
+      messagesUsed: userMessages,
+    });
+  }
+
+  const priorHistory = await listCopilotMessages(analysisIdUsed, 8);
+  const clientHistory = toCopilotHistory(rawBody.history);
+  const mergedHistory = [...priorHistory, ...clientHistory]
+    .map((entry) => ({
+      role: entry.role === "assistant" ? "assistant" : "user",
+      content: String(entry.content || "").replace(/\s+/g, " ").trim(),
+    }))
+    .filter((entry) => entry.content.length > 0)
+    .slice(-8);
+
+  const contextSnapshot = isRecord(bundle.matchContextSnapshot)
+    ? bundle.matchContextSnapshot
+    : buildMatchSnapshotForCopilot(rawBody);
+  const coachOutput = isRecord(bundle.coachOutput) ? bundle.coachOutput : {};
+
+  try {
+    const reply = await runMatchCopilot({
+      createAzureClient: createCopilotAzureClient,
+      contextSnapshot,
+      coachOutput,
+      history: mergedHistory,
+      userMessage: message,
+    });
+
+    await appendCopilotMessage({
+      analysisId: analysisIdUsed,
+      role: "user",
+      content: message,
+    });
+    await appendCopilotMessage({
+      analysisId: analysisIdUsed,
+      role: "assistant",
+      content: reply,
+    });
+
+    const messagesUsed = await countCopilotUserMessages(analysisIdUsed);
+    if (isDevServerLogEnabled()) {
+      console.log("[copilot][chat_reply]", {
+        analysisIdUsed,
+        recovered,
+        messagesUsed,
+        latencyMs: Date.now() - startedAt,
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      reply,
+      analysisIdUsed,
+      recovered,
+      messagesUsed,
+    });
+  } catch (error) {
+    if (isDevServerLogEnabled()) {
+      console.error("[copilot][chat_error]", {
+        analysisIdUsed,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return res.status(500).json({
+      ok: false,
+      error: "copilot_failed",
+      message: "Copilot chat failed. Please try again.",
+      analysisIdUsed,
+      recovered,
+    });
+  }
+};
+
+app.post("/api/copilot-chat", copilotChatHandler);
+app.post("/copilot-chat", copilotChatHandler);
+app.get("/api/analysis/:id/exists", async (req, res) => {
+  const analysisId = normalizeId(req.params.id);
+  if (!analysisId) {
+    return res.status(400).json({ ok: false, error: "invalid_analysis_id" });
+  }
+  const bundle = await getAnalysisBundle(analysisId);
+  if (!bundle) {
+    return res.status(404).json({ ok: false, exists: false, analysisId });
+  }
+  return res.status(200).json({
+    ok: true,
+    exists: true,
+    analysisId,
+    createdAt: bundle.createdAt || bundle.timestamp || null,
+    updatedAt: bundle.updatedAt || bundle.timestamp || null,
+  });
+});
 
 app.post("/api/messages", async (req, res) => {
   if (!isBotEnabled) {

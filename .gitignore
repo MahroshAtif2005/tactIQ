@@ -6,4 +6,5 @@ dist/
 api/local.settings.json
 api/.env.local
 server/agent-framework/.env
-
+server/data/analysisStore.json
+server/.cache/analysis.json

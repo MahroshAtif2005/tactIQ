@@ -53,6 +53,7 @@ const riskEndpoint = resolveApiUrl('/agents/risk');
 const tacticalEndpoint = resolveApiUrl('/agents/tactical');
 const orchestrateEndpoint = apiOrchestrateUrl;
 const baselinesEndpoint = resolveApiUrl('/baselines');
+const copilotChatEndpoint = resolveApiUrl('/api/copilot-chat');
 
 interface ApiClientErrorOptions {
   message: string;
@@ -543,6 +544,44 @@ export async function postAgentFrameworkOrchestrate(
   const raw = await postJson<unknown>(apiAgentFrameworkMessagesUrl, activity, signal);
   const payloadFromBot = extractAgentFrameworkPayload(raw);
   return normalizeOrchestrateResponse(payloadFromBot);
+}
+
+export interface CopilotChatHistoryTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface CopilotChatRequest {
+  analysisId?: string;
+  message: string;
+  history?: CopilotChatHistoryTurn[];
+  matchContextSnapshot?: Record<string, unknown>;
+  telemetry?: Record<string, unknown>;
+  matchContext?: Record<string, unknown>;
+  players?: Record<string, unknown>;
+  coachOutput?: Record<string, unknown>;
+  matchId?: string;
+  sessionId?: string;
+}
+
+export interface CopilotChatResponse {
+  ok?: boolean;
+  reply: string;
+  analysisIdUsed?: string;
+  recovered?: boolean;
+  messagesUsed?: number;
+  suggestedQuestions?: string[];
+  error?: string;
+  message?: string;
+  needsAnalysis?: boolean;
+  retryAfterMs?: number;
+}
+
+export async function postCopilotChat(
+  payload: CopilotChatRequest,
+  signal?: AbortSignal
+): Promise<CopilotChatResponse> {
+  return postJson<CopilotChatResponse>(copilotChatEndpoint, payload, signal);
 }
 
 export interface BaselinesResponse {

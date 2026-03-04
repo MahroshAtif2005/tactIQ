@@ -60,6 +60,7 @@ import {
   resetBaselines,
   saveBaselines,
 } from './lib/apiClient';
+import CopilotChatPanel from './components/CopilotChatPanel';
 import { getRosterIds, removeFromRosterSession, ROSTER_STORAGE_KEY, setBaselineDraftCache, setRosterIds } from './lib/rosterStorage';
 import { buildMatchContext, summarizeMatchContext } from './lib/buildMatchContext';
 import { Baseline, BaselineRole } from './types/baseline';
@@ -210,6 +211,7 @@ interface AgentFeedStatus {
 }
 
 interface OrchestrateMetaView {
+  analysisId?: string;
   mode: 'auto' | 'full';
   executedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
   usedFallbackAgents: Array<'fatigue' | 'risk' | 'tactical'>;
@@ -2623,7 +2625,17 @@ export default function App() {
         risk: buildModelRouterEntry('risk'),
         tactical: buildModelRouterEntry('tactical'),
       };
+      const analysisIdFromResult = String(result.analysisId || result.meta?.analysisId || '').trim();
+      if (analysisIdFromResult && typeof window !== 'undefined') {
+        try {
+          window.localStorage.setItem(COPILOT_ANALYSIS_ID_STORAGE_KEY, analysisIdFromResult);
+          window.localStorage.setItem(COPILOT_ANALYSIS_AT_STORAGE_KEY, String(Date.now()));
+        } catch {
+          // Ignore local storage failures in restricted browser modes.
+        }
+      }
       setOrchestrateMeta({
+        analysisId: analysisIdFromResult || undefined,
         mode: result.meta.mode,
         executedAgents: result.meta.executedAgents,
         usedFallbackAgents: result.meta.usedFallbackAgents || [],
@@ -4718,6 +4730,9 @@ function Dashboard({
   agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedBriefing, combinedDecision, finalRecommendation, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, setAgentWarning, setAgentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleRest, handleMarkUnfit,
   recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, isLoadingRosterPlayers, rosterMutationError, onGoToBaselines, onBack
 }: DashboardProps) {
+  const COPILOT_ANALYSIS_ID_STORAGE_KEY = 'tactiq:lastAnalysisId';
+  const COPILOT_ANALYSIS_AT_STORAGE_KEY = 'tactiq:lastAnalysisAt';
+  const COPILOT_ANALYSIS_TTL_MS = 2 * 60 * 60 * 1000;
   const [arTelemetryView, setArTelemetryView] = useState<'batting' | 'bowling'>('batting');
   const [strainIndex, setStrainIndex] = useState(0);
   const [isResettingBaselines, setIsResettingBaselines] = useState(false);
@@ -4725,6 +4740,28 @@ function Dashboard({
   const [substitutionRecommendation, setSubstitutionRecommendation] = useState<string | null>(null);
   const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
   const [showCoachInsights, setShowCoachInsights] = useState(false);
+  const [copilotSessionAnalysisId, setCopilotSessionAnalysisId] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      const storedId = String(window.localStorage.getItem(COPILOT_ANALYSIS_ID_STORAGE_KEY) || '').trim();
+      const storedAt = Number(window.localStorage.getItem(COPILOT_ANALYSIS_AT_STORAGE_KEY) || 0);
+      if (!storedId) return '';
+      if (!Number.isFinite(storedAt) || storedAt <= 0) {
+        window.localStorage.removeItem(COPILOT_ANALYSIS_ID_STORAGE_KEY);
+        window.localStorage.removeItem(COPILOT_ANALYSIS_AT_STORAGE_KEY);
+        return '';
+      }
+      if (Date.now() - storedAt > COPILOT_ANALYSIS_TTL_MS) {
+        window.localStorage.removeItem(COPILOT_ANALYSIS_ID_STORAGE_KEY);
+        window.localStorage.removeItem(COPILOT_ANALYSIS_AT_STORAGE_KEY);
+        return '';
+      }
+      return storedId;
+    } catch {
+      return '';
+    }
+  });
+  const [copilotResetToken, setCopilotResetToken] = useState(0);
   const [showRouterSignals, setShowRouterSignals] = useState(false);
   const [showRawTelemetry, setShowRawTelemetry] = useState(false);
   const [briefCopied, setBriefCopied] = useState(false);
@@ -4791,6 +4828,21 @@ function Dashboard({
     setRotateBowlerSuggestion(null);
   }, [activePlayer?.id]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (copilotSessionAnalysisId) {
+        window.localStorage.setItem(COPILOT_ANALYSIS_ID_STORAGE_KEY, copilotSessionAnalysisId);
+        window.localStorage.setItem(COPILOT_ANALYSIS_AT_STORAGE_KEY, String(Date.now()));
+      } else {
+        window.localStorage.removeItem(COPILOT_ANALYSIS_ID_STORAGE_KEY);
+        window.localStorage.removeItem(COPILOT_ANALYSIS_AT_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore local storage failures in restricted browser modes.
+    }
+  }, [copilotSessionAnalysisId]);
+
   const rosterPlayers = players.filter((p: Player) => p.inRoster !== false);
   const totalCount = rosterPlayers.length;
   const hasRosterPlayers = rosterPlayers.length > 0;
@@ -4824,6 +4876,8 @@ function Dashboard({
     setSubstitutionRecommendation(null);
     setShowRouterSignals(false);
     setShowCoachInsights(false);
+    setCopilotSessionAnalysisId('');
+    setCopilotResetToken((value) => value + 1);
     onDismissAnalysis?.();
   };
 
@@ -5094,6 +5148,149 @@ function Dashboard({
   const boundaryEvents = activePlayer?.boundaryEvents || [];
   const foursCount = boundaryEvents.filter((event) => event === '4').length;
   const sixesCount = boundaryEvents.filter((event) => event === '6').length;
+  const copilotSuggestedQuestions = useMemo(
+    () => [
+      'How do we lower no-ball risk immediately?',
+      'Safest plan for next over?',
+      'Plan the next 2 overs',
+      'Compare Archer vs Starc next 2 overs with fatigue trend',
+    ],
+    []
+  );
+  const copilotFallbackContext = useMemo(
+    () => ({
+      matchContextSnapshot: {
+        telemetry: {
+          playerId: String(activePlayer?.id || currentTelemetry.playerId || ''),
+          playerName: String(activePlayer?.name || currentTelemetry.playerName || ''),
+          role: String(activePlayer?.role || currentTelemetry.role || ''),
+          fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
+          strainIndex: safeNum(activePlayer?.strainIndex, currentTelemetry.strainIndex),
+          injuryRisk: String(activePlayer?.injuryRisk || 'Low').toUpperCase(),
+          noBallRisk: String(activePlayer?.noBallRisk || 'Low').toUpperCase(),
+          oversBowled: safeNum(activePlayer?.overs, 0),
+          heartRateRecovery: String(activePlayer?.hrRecovery || 'Good'),
+        },
+        matchContext: {
+          matchMode: matchContext.matchMode,
+          format: matchContext.format,
+          phase: matchContext.phase,
+          score: matchState.runs,
+          wickets: matchState.wickets,
+          target: typeof matchState.target === 'number' ? matchState.target : undefined,
+          oversRemaining: Number((Math.max(0, totalBallsFromOvers(matchState.totalOvers) - Math.max(0, matchState.ballsBowled)) / 6).toFixed(1)),
+          currentRunRate,
+          requiredRunRate,
+        },
+        players: {
+          bowler: String(activePlayer?.name || currentTelemetry.playerName || ''),
+          bench: players.filter((player) => player.inRoster !== false).map((player) => player.name).slice(0, 8),
+        },
+      },
+      telemetry: {
+        playerId: String(activePlayer?.id || currentTelemetry.playerId || ''),
+        playerName: String(activePlayer?.name || currentTelemetry.playerName || ''),
+        role: String(activePlayer?.role || currentTelemetry.role || ''),
+        fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
+        strainIndex: safeNum(activePlayer?.strainIndex, currentTelemetry.strainIndex),
+        injuryRisk: String(activePlayer?.injuryRisk || 'Low').toUpperCase(),
+        noBallRisk: String(activePlayer?.noBallRisk || 'Low').toUpperCase(),
+        oversBowled: safeNum(activePlayer?.overs, 0),
+      },
+      matchContext: {
+        matchMode: matchContext.matchMode,
+        format: matchContext.format,
+        phase: matchContext.phase,
+        score: matchState.runs,
+        wickets: matchState.wickets,
+        target: typeof matchState.target === 'number' ? matchState.target : undefined,
+      },
+      players: {
+        bowler: String(activePlayer?.name || currentTelemetry.playerName || ''),
+        bench: players.filter((player) => player.inRoster !== false).map((player) => player.name).slice(0, 8),
+      },
+      coachOutput: {
+        strategicAnalysis: strategicAnalysis || combinedAnalysis || {},
+        tacticalRecommendation: tacticalAnalysis || strategicAnalysis?.tacticalRecommendation || {},
+        combinedDecision: combinedDecision || {},
+        combinedBriefing: combinedBriefing || '',
+      },
+    }),
+    [
+      activePlayer?.fatigue,
+      activePlayer?.hrRecovery,
+      activePlayer?.id,
+      activePlayer?.injuryRisk,
+      activePlayer?.name,
+      activePlayer?.noBallRisk,
+      activePlayer?.overs,
+      activePlayer?.role,
+      activePlayer?.strainIndex,
+      combinedAnalysis,
+      combinedBriefing,
+      combinedDecision,
+      currentRunRate,
+      currentTelemetry.fatigueIndex,
+      currentTelemetry.playerId,
+      currentTelemetry.playerName,
+      currentTelemetry.role,
+      currentTelemetry.strainIndex,
+      matchContext.format,
+      matchContext.matchMode,
+      matchContext.phase,
+      matchState.ballsBowled,
+      matchState.runs,
+      matchState.target,
+      matchState.totalOvers,
+      matchState.wickets,
+      players,
+      requiredRunRate,
+      strategicAnalysis,
+      tacticalAnalysis,
+    ]
+  );
+  const effectiveCopilotAnalysisId = useMemo(() => {
+    const metaRecord = (orchestrateMeta && typeof orchestrateMeta === 'object'
+      ? (orchestrateMeta as unknown as Record<string, unknown>)
+      : null);
+    const candidates = [
+      metaRecord?.analysisId,
+      copilotSessionAnalysisId,
+    ];
+    for (const candidate of candidates) {
+      const value = String(candidate || '').trim();
+      if (value.length > 0) return value;
+    }
+    return '';
+  }, [copilotSessionAnalysisId, orchestrateMeta]);
+  const copilotAnalysisReady = effectiveCopilotAnalysisId.length > 0;
+  const copilotResetKey = `${activePlayer?.id || 'none'}-${copilotResetToken}`;
+
+  useEffect(() => {
+    if (!(analysisActive || showCoachInsights)) return;
+    const fromMeta = String(
+      (orchestrateMeta && typeof orchestrateMeta === 'object'
+        ? (orchestrateMeta as unknown as Record<string, unknown>).analysisId
+        : '') ||
+      ''
+    ).trim();
+    if (fromMeta.length > 0) {
+      setCopilotSessionAnalysisId((prev) => (prev === fromMeta ? prev : fromMeta));
+    } else if (import.meta.env.DEV) {
+      // no-op path for debugging local state transitions.
+      console.log('[copilot][analysis_id_missing_in_meta]');
+    }
+  }, [analysisActive, orchestrateMeta, showCoachInsights]);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    console.log('[copilot][gate]', {
+      analysisActive,
+      showCoachInsights,
+      telemetryView,
+      effectiveCopilotAnalysisId,
+    });
+  }, [analysisActive, showCoachInsights, telemetryView, effectiveCopilotAnalysisId]);
 
   useEffect(() => {
     if (!isBatsmanActive || !activePlayer) {
@@ -7561,6 +7758,16 @@ function Dashboard({
                         />
                       </div>
                     )}
+                    <div className="md:col-span-2 mt-3">
+                      <CopilotChatPanel
+                        analysisReady={copilotAnalysisReady}
+                        analysisId={effectiveCopilotAnalysisId}
+                        resetKey={copilotResetKey}
+                        suggestedQuestions={copilotSuggestedQuestions}
+                        fallbackContext={copilotFallbackContext}
+                        onAnalysisIdSync={setCopilotSessionAnalysisId}
+                      />
+                    </div>
                   </div>
                   </motion.div>
                 ) : (
@@ -7796,6 +8003,16 @@ function Dashboard({
                       />
                     </div>
                   )}
+                  <div className="mt-3">
+                    <CopilotChatPanel
+                      analysisReady={copilotAnalysisReady}
+                      analysisId={effectiveCopilotAnalysisId}
+                      resetKey={copilotResetKey}
+                      suggestedQuestions={copilotSuggestedQuestions}
+                      fallbackContext={copilotFallbackContext}
+                      onAnalysisIdSync={setCopilotSessionAnalysisId}
+                    />
+                  </div>
                   </motion.div>
                 )}
               </AnimatePresence>

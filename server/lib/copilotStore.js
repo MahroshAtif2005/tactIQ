@@ -1,4 +1,6 @@
 const { randomUUID } = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 let CosmosClient = null;
 try {
@@ -10,12 +12,32 @@ try {
 
 const memoryAnalysisBundles = new Map();
 const memoryChatsByAnalysis = new Map();
+const MAX_ANALYSIS_BUNDLES = 50;
+const MAX_CHAT_TURNS_PER_ANALYSIS = 120;
+const STORE_DIR = path.resolve(__dirname, "../.cache");
+const STORE_FILE = path.join(STORE_DIR, "analysis.json");
+let diskLoaded = false;
+let saveTimer = null;
 
 const normalizeId = (value) => String(value || "").trim();
+const isDevDebugEnabled = () =>
+  process.env.NODE_ENV !== "production" || String(process.env.DEBUG || "").trim() === "1";
 const toIso = (value) => {
   const parsed = Date.parse(String(value || ""));
   if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
   return new Date().toISOString();
+};
+const redactSecrets = (value) => {
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactSecrets(entry));
+  }
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (/(api[_-]?key|token|secret|authorization|password)/i.test(key)) continue;
+    output[key] = redactSecrets(entry);
+  }
+  return output;
 };
 
 const getConfig = () => {
@@ -117,6 +139,82 @@ const toMemoryChat = (turn) => {
 const sortByCreatedAt = (rows) =>
   [...rows].sort((a, b) => Date.parse(String(a.createdAt || 0)) - Date.parse(String(b.createdAt || 0)));
 
+const trimMemoryBundles = () => {
+  const ordered = [...memoryAnalysisBundles.values()].sort((a, b) => pickBundleTimestamp(b) - pickBundleTimestamp(a));
+  if (ordered.length <= MAX_ANALYSIS_BUNDLES) return;
+  const keepIds = new Set(ordered.slice(0, MAX_ANALYSIS_BUNDLES).map((entry) => entry.analysisId));
+  for (const key of [...memoryAnalysisBundles.keys()]) {
+    if (keepIds.has(key)) continue;
+    memoryAnalysisBundles.delete(key);
+    memoryChatsByAnalysis.delete(key);
+  }
+};
+
+const trimChatRows = (analysisId) => {
+  const rows = getMemoryChatRows(analysisId);
+  if (rows.length <= MAX_CHAT_TURNS_PER_ANALYSIS) return;
+  setMemoryChatRows(analysisId, rows.slice(-MAX_CHAT_TURNS_PER_ANALYSIS));
+};
+
+const saveToDiskDebounced = () => {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(STORE_DIR, { recursive: true });
+      const payload = {
+        updatedAt: new Date().toISOString(),
+        analysisBundles: [...memoryAnalysisBundles.values()].map((entry) => redactSecrets(entry)),
+        chatsByAnalysis: Object.fromEntries(
+          [...memoryChatsByAnalysis.entries()].map(([analysisId, rows]) => [
+            analysisId,
+            rows.map((row) => redactSecrets(row)),
+          ])
+        ),
+      };
+      fs.writeFileSync(STORE_FILE, JSON.stringify(payload, null, 2), "utf8");
+    } catch (error) {
+      if (isDevDebugEnabled()) {
+        console.warn("[copilot-store] failed writing local analysis store", error instanceof Error ? error.message : String(error));
+      }
+    }
+  }, 180);
+};
+
+const loadFromDisk = () => {
+  if (diskLoaded) return;
+  diskLoaded = true;
+  try {
+    if (!fs.existsSync(STORE_FILE)) return;
+    const raw = fs.readFileSync(STORE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    const analysisRows = Array.isArray(parsed?.analysisBundles) ? parsed.analysisBundles : [];
+    const chatsByAnalysis = parsed?.chatsByAnalysis && typeof parsed.chatsByAnalysis === "object" ? parsed.chatsByAnalysis : {};
+
+    for (const row of analysisRows) {
+      const normalized = toMemoryBundle(row);
+      memoryAnalysisBundles.set(normalized.analysisId, normalized);
+    }
+    for (const [analysisId, rows] of Object.entries(chatsByAnalysis)) {
+      if (!Array.isArray(rows)) continue;
+      const normalizedRows = rows.map((row) => toMemoryChat({ ...row, analysisId })).filter((entry) => entry.content);
+      if (normalizedRows.length > 0) {
+        setMemoryChatRows(analysisId, normalizedRows.slice(-MAX_CHAT_TURNS_PER_ANALYSIS));
+      }
+    }
+    trimMemoryBundles();
+    if (isDevDebugEnabled()) {
+      console.log("[copilot-store] loaded local analysis store", {
+        file: STORE_FILE,
+        analyses: memoryAnalysisBundles.size,
+      });
+    }
+  } catch (error) {
+    if (isDevDebugEnabled()) {
+      console.warn("[copilot-store] failed reading local analysis store", error instanceof Error ? error.message : String(error));
+    }
+  }
+};
+
 const getMemoryChatRows = (analysisId) => {
   const rows = memoryChatsByAnalysis.get(analysisId);
   return Array.isArray(rows) ? rows : [];
@@ -127,8 +225,11 @@ const setMemoryChatRows = (analysisId, rows) => {
 };
 
 const saveAnalysisBundle = async (bundleInput) => {
+  loadFromDisk();
   const bundle = toMemoryBundle(bundleInput || {});
   memoryAnalysisBundles.set(bundle.analysisId, bundle);
+  trimMemoryBundles();
+  saveToDiskDebounced();
   const containers = await ensureContainers();
   if (!containers) {
     return { analysisId: bundle.analysisId, storage: "memory", bundle };
@@ -143,6 +244,7 @@ const saveAnalysisBundle = async (bundleInput) => {
 };
 
 const getAnalysisBundle = async (analysisIdInput) => {
+  loadFromDisk();
   const analysisId = normalizeId(analysisIdInput);
   if (!analysisId) return null;
   const cached = memoryAnalysisBundles.get(analysisId);
@@ -161,6 +263,7 @@ const getAnalysisBundle = async (analysisIdInput) => {
 };
 
 const appendCopilotMessage = async (turnInput) => {
+  loadFromDisk();
   const analysisId = normalizeId(turnInput?.analysisId);
   if (!analysisId) throw new Error("analysisId is required");
   const normalized = toMemoryChat({ ...turnInput, analysisId });
@@ -168,6 +271,8 @@ const appendCopilotMessage = async (turnInput) => {
 
   const currentRows = getMemoryChatRows(analysisId);
   setMemoryChatRows(analysisId, [...currentRows, normalized]);
+  trimChatRows(analysisId);
+  saveToDiskDebounced();
 
   const containers = await ensureContainers();
   if (containers) {
@@ -181,6 +286,7 @@ const appendCopilotMessage = async (turnInput) => {
 };
 
 const listCopilotMessages = async (analysisIdInput, limit = 8) => {
+  loadFromDisk();
   const analysisId = normalizeId(analysisIdInput);
   if (!analysisId) return [];
 
@@ -208,6 +314,7 @@ const listCopilotMessages = async (analysisIdInput, limit = 8) => {
 };
 
 const countCopilotUserMessages = async (analysisIdInput) => {
+  loadFromDisk();
   const analysisId = normalizeId(analysisIdInput);
   if (!analysisId) return 0;
   const containers = await ensureContainers();
@@ -251,6 +358,7 @@ const bundleMatchesScope = (bundle, { matchId, sessionId }) => {
 };
 
 const findLatestAnalysisBundleByScope = async (scopeInput) => {
+  loadFromDisk();
   const matchId = normalizeId(scopeInput?.matchId);
   const sessionId = normalizeId(scopeInput?.sessionId);
   if (!matchId && !sessionId) return null;
@@ -300,6 +408,34 @@ const findLatestAnalysisBundleByScope = async (scopeInput) => {
   return memoryLatest;
 };
 
+const getLatestAnalysisBundle = async () => {
+  loadFromDisk();
+  const memoryLatest =
+    [...memoryAnalysisBundles.values()].sort((a, b) => pickBundleTimestamp(b) - pickBundleTimestamp(a))[0] || null;
+  const containers = await ensureContainers();
+  if (!containers) return memoryLatest;
+
+  try {
+    const query = await containers.analysisContainer.items
+      .query({
+        query: "SELECT TOP 1 * FROM c WHERE c.type = @type ORDER BY c.timestamp DESC",
+        parameters: [{ name: "@type", value: "analysisBundle" }],
+      })
+      .fetchAll();
+    const row = Array.isArray(query.resources) && query.resources.length > 0 ? query.resources[0] : null;
+    if (!row) return memoryLatest;
+    const normalized = toMemoryBundle(row);
+    memoryAnalysisBundles.set(normalized.analysisId, normalized);
+    trimMemoryBundles();
+    saveToDiskDebounced();
+    return normalized;
+  } catch {
+    return memoryLatest;
+  }
+};
+
+loadFromDisk();
+
 module.exports = {
   saveAnalysisBundle,
   getAnalysisBundle,
@@ -307,4 +443,7 @@ module.exports = {
   listCopilotMessages,
   countCopilotUserMessages,
   findLatestAnalysisBundleByScope,
+  getLatestAnalysisBundle,
+  loadFromDisk,
+  saveToDiskDebounced,
 };
