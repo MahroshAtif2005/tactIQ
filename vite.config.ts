@@ -7,7 +7,7 @@ const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '')
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, process.cwd(), '');
-    const proxyTarget = trimTrailingSlashes(env.VITE_API_TARGET || 'http://localhost:8080');
+    const proxyTarget = trimTrailingSlashes(env.VITE_API_TARGET || 'http://localhost:7071');
 
     return {
     plugins: [react()],

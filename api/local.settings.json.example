@@ -3,6 +3,12 @@
   "Values": {
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "node",
+    "COSMOS_CONNECTION_STRING": "",
+    "COSMOS_ENDPOINT": "",
+    "COSMOS_KEY": "",
+    "COSMOS_DATABASE": "tactiq-db",
+    "COSMOS_CONTAINER_PLAYERS": "players",
+    "COSMOS_CONTAINER_USERS": "users",
     "AZURE_OPENAI_ENDPOINT": "",
     "AZURE_OPENAI_API_KEY": "",
     "AZURE_OPENAI_DEPLOYMENT": "",

@@ -79,7 +79,7 @@ The goal is not just to show numbers but to guide decisions.
 
 This project runs with:
 
-- **Backend (Express / Agent Framework):** http://localhost:8080  
+- **Backend (Azure Functions):** http://localhost:7071  
 - **Frontend (Vite):** http://localhost:5173  
 
 ---
@@ -90,7 +90,7 @@ From the project root:
 
 ```bash
 npm install
-npm --prefix server/agent-framework install
+npm --prefix api install
 ```
 
 ---
@@ -99,49 +99,47 @@ npm --prefix server/agent-framework install
 
 Edit:
 
-```
-server/agent-framework/.env
-```
-
-Make sure it matches:
-
 ```env
+# api/local.settings.json
 AZURE_OPENAI_API_KEY=your_key
 AZURE_OPENAI_ENDPOINT=https://tactiq-openai.openai.azure.com/
 AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
 AZURE_OPENAI_API_VERSION=2024-02-15-preview
 
-PORT=8080
-
+COSMOS_CONNECTION_STRING=your_connection_string
 COSMOS_ENDPOINT=https://tactiq-cosmos.documents.azure.com:443/
 COSMOS_KEY=your_key
-COSMOS_DB=tactiq-db
-COSMOS_CONTAINER=players
+COSMOS_DATABASE=tactiq-db
+COSMOS_CONTAINER_PLAYERS=players
+COSMOS_CONTAINER_USERS=users
 ```
 
 ---
 
 ## Start Backend (API)
 
-From project root:
+Terminal 1:
 
 ```bash
-node server.js
+cd api
+npm install
+func start
 ```
 
 Backend will run on:
 
 ```
-http://localhost:8080
+http://localhost:7071
 ```
 
 ---
 
 ## Start Frontend (Vite)
 
-In a new terminal:
+Terminal 2 (project root):
 
 ```bash
+npm install
 npm run dev
 ```
 
@@ -158,7 +156,8 @@ http://localhost:5173
 In the root `.env` file (frontend environment):
 
 ```env
-VITE_API_BASE_URL=http://localhost:8080
+VITE_API_BASE_URL=/api
+VITE_API_TARGET=http://localhost:7071
 ```
 
 Restart Vite after changing environment variables.
@@ -170,11 +169,14 @@ Restart Vite after changing environment variables.
 Test API connectivity:
 
 ```bash
+# Health check
+curl http://localhost:7071/api/health
+
 # Get baselines
-curl http://localhost:8080/api/baselines
+curl http://localhost:7071/api/baselines
 
 # Test orchestrate endpoint
-curl -X POST http://localhost:8080/api/orchestrate \
+curl -X POST http://localhost:7071/api/orchestrate \
   -H "Content-Type: application/json" \
   -d '{"context":{}}'
 ```
@@ -183,17 +185,17 @@ curl -X POST http://localhost:8080/api/orchestrate \
 
 ## Available Local API Endpoints
 
-- `POST http://localhost:8080/api/orchestrate`
-- `GET  http://localhost:8080/api/baselines`
-- `POST http://localhost:8080/api/baselines`
-- `DELETE http://localhost:8080/api/baselines/{playerId}`
-- `POST http://localhost:8080/api/baselines/reset`
+- `GET  http://localhost:7071/api/health`
+- `POST http://localhost:7071/api/orchestrate`
+- `GET  http://localhost:7071/api/baselines`
+- `POST http://localhost:7071/api/baselines`
+- `POST http://localhost:7071/api/users/ensure`
 
 ---
 
 ## Important Notes
 
-- Do **not** run any other service on port `8080` while the backend is running.
+- Do **not** run any other service on port `7071` while the backend is running.
 - If you modify `.env`, restart the backend and frontend.
 - Frontend calls backend via `VITE_API_BASE_URL`.
 
