@@ -51,6 +51,74 @@ const sanitizeHistory = (history) => {
     .slice(-8);
 };
 
+const dedupeList = (items) => {
+  const seen = new Set();
+  const output = [];
+  for (const item of items) {
+    const normalized = String(item || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(normalized);
+  }
+  return output;
+};
+
+const buildConversationSoFar = (history) => {
+  const rows = sanitizeHistory(history);
+  if (rows.length === 0) return 'None yet.';
+  return rows
+    .slice(-8)
+    .map((entry) => `${entry.role === 'assistant' ? 'Copilot' : 'User'}: ${clipText(entry.content, 220)}`)
+    .join('\n');
+};
+
+const buildTacticalContextSnippet = (coachOutput) => {
+  const tacticalRecommendation = isRecord(coachOutput?.tacticalRecommendation) ? coachOutput.tacticalRecommendation : {};
+  const combinedDecision = isRecord(coachOutput?.combinedDecision) ? coachOutput.combinedDecision : {};
+  const tactical = isRecord(coachOutput?.tactical) ? coachOutput.tactical : {};
+  const whyList = Array.isArray(tacticalRecommendation.why) ? tacticalRecommendation.why : [];
+  const nextOverPlan = Array.isArray(tactical.nextOverPlan) ? tactical.nextOverPlan : [];
+  const adjustments = Array.isArray(combinedDecision.suggestedAdjustments) ? combinedDecision.suggestedAdjustments : [];
+  const rawLines = [
+    tacticalRecommendation.nextAction,
+    tacticalRecommendation.recommendedMove,
+    tacticalRecommendation.assessment,
+    tacticalRecommendation.ifIgnored,
+    tacticalRecommendation.swapSuggestion,
+    combinedDecision.immediateAction,
+    tactical.suggestion,
+    nextOverPlan[0],
+    adjustments[0],
+    whyList[0],
+    whyList[1],
+  ];
+  const lines = dedupeList(rawLines.map((line) => clipText(line, 150))).slice(0, 5);
+  return lines.length > 0 ? lines.join('\n') : 'No tactical summary available.';
+};
+
+const toParagraphReply = (text) => {
+  const cleaned = String(text || '')
+    .replace(/\b(Recommendation|Reasoning|Projection|Caution|Assumption)\s*:\s*/gi, '')
+    .replace(/^\s*[-•*]\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+  const sentences = dedupeList(
+    cleaned
+      .split(/(?<=[.!?])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter(Boolean)
+  ).slice(0, 8);
+  if (sentences.length === 0) return clipText(cleaned, 1200);
+  const paragraphs = [];
+  for (let idx = 0; idx < sentences.length; idx += 2) {
+    paragraphs.push(sentences.slice(idx, idx + 2).join(' '));
+  }
+  return clipText(paragraphs.join('\n\n'), 1200);
+};
+
 const toLower = (value) => String(value || '').toLowerCase();
 const toUpper = (value) => String(value || '').trim().toUpperCase();
 const toFinite = (value) => {
@@ -73,18 +141,15 @@ const looksOutOfScope = (userMessage) => {
 };
 
 const buildSystemPrompt = () => [
-  'You are tactIQ Copilot for cricket coaching decisions.',
-  'You must answer ONLY from the current match snapshot and latest coach analysis provided.',
-  'If a question is outside match context, refuse briefly and steer back to match questions.',
-  'Best-effort reasoning is mandatory: infer from phase, workload trend, overs remaining, pressure, role, and risk labels.',
-  'Do not repeat the Tactical Recommendation panel verbatim; add fresh interpretation and implications.',
-  'Forward inference is required: include a short projection of what happens over the next 1-2 overs if tempo stays unchanged.',
-  'Never invent numbers or exact metrics that are not present in the provided snapshot.',
-  'If a value is missing, include one short Assumption line and continue with tactical guidance.',
-  'Output format is mandatory: "Recommendation:" (1 sentence), "Reasoning:" (2 bullets), "Projection:" (1 bullet), "Caution:" (1 bullet), optional "Assumption:".',
-  'Never mention backend internals, code, tools, or model details.',
-  'Keep replies concise, decisive, coach-friendly, and tactical (max ~120 words).',
-  'When possible, cite only concrete values that already exist in the provided context.',
+  'You are tactIQ Copilot: a cricket tactical coach having a conversation with a coach.',
+  'Use the provided match snapshot and analysis outputs only as background context.',
+  'Answer in a natural conversational style: 2–4 short paragraphs.',
+  'Do not use headings (e.g., Recommendation/Reasoning/Projection/Caution/Assumption).',
+  'Do not use bullet points or numbered lists.',
+  'Do not repeat raw stats, dashboard labels, or copy/paste the tactical agent output. Summarize implicitly and add your own reasoning.',
+  'Give one clear next action and why it makes sense, then what to watch for in the next over.',
+  'Only mention exact numbers if the user explicitly asks for them.',
+  'If a follow-up question is asked, use chat history + snapshot and stay consistent.',
 ].join(' ');
 
 const extractSignals = (contextSnapshot, coachOutput) => {
@@ -220,21 +285,19 @@ const buildBestEffortCopilotReply = ({ contextSnapshot, coachOutput, userMessage
   if (!Number.isFinite(signals.requiredRunRate) || !Number.isFinite(signals.currentRunRate)) assumptions.push('run-rate delta');
   if (asksRestAndReuse && !Number.isFinite(signals.recoveryMinutes)) assumptions.push('recovery timer');
 
-  return [
-    recommendation,
-    'Reasoning:',
-    `- ${reasoningOne}`,
-    `- ${reasoningTwo}`,
-    'Projection:',
-    `- ${projection}`,
-    'Caution:',
-    `- ${caution}`,
+  const recommendationParagraph = recommendation.replace(/^Recommendation:\s*/i, '').trim();
+  const reasoningParagraph = `${reasoningOne} ${reasoningTwo}`.trim();
+  const projectionParagraph = `${projection} ${caution}`.trim();
+  const assumptionParagraph =
     assumptions.length > 0
-      ? `Assumption: I don't have exact ${assumptions.join(', ')} in the current snapshot, but this plan uses available phase and risk signals.`
-      : '',
-  ]
-    .filter(Boolean)
-    .join('\n');
+      ? `I do not have exact ${assumptions.join(', ')} in this snapshot, so this guidance leans on current phase, workload trend, and risk signals.`
+      : '';
+
+  return toParagraphReply(
+    [recommendationParagraph, reasoningParagraph, projectionParagraph, assumptionParagraph]
+      .filter(Boolean)
+      .join('\n\n')
+  );
 };
 
 const shouldUseBestEffortFallback = (text) => {
@@ -245,12 +308,55 @@ const shouldUseBestEffortFallback = (text) => {
   if (/i don'?t have (that|this) information/.test(normalized)) return true;
   if (/not available in the current match state/.test(normalized)) return true;
   if (/don'?t have enough|insufficient|cannot determine/.test(normalized)) return true;
-  if (!/recommendation:/i.test(normalized)) return true;
-  if (!/reasoning:/i.test(normalized)) return true;
-  if (!/projection:/i.test(normalized)) return true;
-  if (!/caution:/i.test(normalized)) return true;
+  if (normalized.length < 40) return true;
+  const bulletCount = (String(text || '').match(/(^|\n)\s*[-•*]\s+/g) || []).length;
+  if (bulletCount >= 3) return true;
   if (/tactical recommendation:/i.test(normalized)) return true;
   return false;
+};
+
+const requiresParagraphRewrite = (text) => {
+  const source = String(text || '');
+  if (!source.trim()) return false;
+  if (/(^|\n)\s*(Recommendation|Reasoning|Projection|Caution|Assumption)\s*:/i.test(source)) return true;
+  if (/(^|\n)\s*[-•*]\s+/.test(source)) return true;
+  if (/(^|\n)\s*\d+\.\s+/.test(source)) return true;
+  return false;
+};
+
+const rewriteAsConversationalParagraphs = async ({ client, deployment, text }) => {
+  const original = String(text || '').trim();
+  if (!original) return '';
+  if (!requiresParagraphRewrite(original)) return original;
+  try {
+    const rewriteRequest = client.chat.completions.create({
+      model: deployment,
+      temperature: 0.35,
+      max_tokens: 260,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Rewrite the answer into 2–4 short paragraphs, no headings, no bullets, no stats repetition. Keep conversational cricket coaching tone.',
+        },
+        {
+          role: 'user',
+          content: `Original answer:\n${clipText(original, 1800)}`,
+        },
+      ],
+    });
+    let rewriteCompletion;
+    if (rewriteRequest && typeof rewriteRequest.withResponse === 'function') {
+      const wrapped = await rewriteRequest.withResponse();
+      rewriteCompletion = wrapped.data;
+    } else {
+      rewriteCompletion = await rewriteRequest;
+    }
+    const rewritten = extractModelText(rewriteCompletion?.choices?.[0]?.message?.content);
+    return rewritten || original;
+  } catch {
+    return original;
+  }
 };
 
 const runMatchCopilot = async ({ createAzureClient, contextSnapshot, coachOutput, history, userMessage }) => {
@@ -276,21 +382,19 @@ const runMatchCopilot = async ({ createAzureClient, contextSnapshot, coachOutput
     return buildBestEffortCopilotReply({ contextSnapshot, coachOutput, userMessage: prompt });
   }
   const snapshotPayload = compactJson(contextSnapshot, 5000);
-  const coachPayload = compactJson(coachOutput, 2600);
+  const tacticalContext = buildTacticalContextSnippet(coachOutput);
+  const conversationSoFar = buildConversationSoFar(sanitizedHistory);
 
   const messages = [
     { role: 'system', content: buildSystemPrompt() },
     {
       role: 'user',
       content:
-        `Current match snapshot (JSON): ${snapshotPayload}\n` +
-        `Latest coach output (JSON): ${coachPayload}\n` +
-        'Use only this information to answer follow-up questions.',
-    },
-    ...sanitizedHistory,
-    {
-      role: 'user',
-      content: `Question: ${prompt}`,
+        `Match snapshot:\n${snapshotPayload}\n\n` +
+        `Tactical agent output:\n${tacticalContext}\n\n` +
+        `User question:\n${prompt}\n\n` +
+        `Conversation so far:\n${conversationSoFar}\n\n` +
+        'Use this context for inference. Do not quote tactical output verbatim.',
     },
   ];
 
@@ -314,10 +418,12 @@ const runMatchCopilot = async ({ createAzureClient, contextSnapshot, coachOutput
     if (!text) {
       return buildBestEffortCopilotReply({ contextSnapshot, coachOutput, userMessage: prompt });
     }
-    if (shouldUseBestEffortFallback(text)) {
+    const maybeRewritten = await rewriteAsConversationalParagraphs({ client, deployment, text });
+    const paragraphReply = toParagraphReply(maybeRewritten);
+    if (shouldUseBestEffortFallback(paragraphReply)) {
       return buildBestEffortCopilotReply({ contextSnapshot, coachOutput, userMessage: prompt });
     }
-    return clipText(text, 1400);
+    return paragraphReply;
   } catch {
     return buildBestEffortCopilotReply({ contextSnapshot, coachOutput, userMessage: prompt });
   }

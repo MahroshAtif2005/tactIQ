@@ -5695,6 +5695,8 @@ function Dashboard({
   const showAnalysisFailureCard = Boolean(agentFailure && !hasAnyAnalysis && !hasTacticalGuidance);
   const showAnalysisFailureInline = Boolean(agentFailure && hasAnyAnalysis);
   const showAnalysisSkeleton = agentState === 'thinking' && !hasAnyAnalysis;
+  const shouldRenderCopilotUnderGraph =
+    shouldShowTelemetryGraph && agentState === 'done' && hasAnyAnalysis && copilotAnalysisReady;
   const agentStatusRows: Array<{ agent: AgentKey; label: string; state: AgentFeedState; detail: string }> = [
     { agent: 'fatigue', label: 'Fatigue Agent', state: agentFeedStatus.fatigue, detail: '' },
     { agent: 'risk', label: 'Risk Agent', state: agentFeedStatus.risk, detail: '' },
@@ -7797,19 +7799,21 @@ function Dashboard({
                         />
                       </div>
                     )}
-                    <div className="md:col-span-2 mt-3">
-                      <CopilotChatPanel
-                        analysisReady={copilotAnalysisReady}
-                        analysisId={effectiveCopilotAnalysisId}
-                        resetKey={copilotResetKey}
-                        suggestedQuestions={copilotSuggestedQuestions}
-                        fallbackContext={copilotFallbackContext}
-                        onAnalysisIdSync={(analysisId) => {
-                          setCopilotSessionAnalysisId(analysisId);
-                          setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
-                        }}
-                      />
-                    </div>
+                    {shouldRenderCopilotUnderGraph && (
+                      <div className="md:col-span-2 mt-3">
+                        <CopilotChatPanel
+                          analysisReady={copilotAnalysisReady}
+                          analysisId={effectiveCopilotAnalysisId}
+                          resetKey={copilotResetKey}
+                          suggestedQuestions={copilotSuggestedQuestions}
+                          fallbackContext={copilotFallbackContext}
+                          onAnalysisIdSync={(analysisId) => {
+                            setCopilotSessionAnalysisId(analysisId);
+                            setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
+                          }}
+                        />
+                      </div>
+                    )}
                   </div>
                   </motion.div>
                 ) : (
@@ -8045,19 +8049,21 @@ function Dashboard({
                       />
                     </div>
                   )}
-                  <div className="mt-3">
-                    <CopilotChatPanel
-                      analysisReady={copilotAnalysisReady}
-                      analysisId={effectiveCopilotAnalysisId}
-                      resetKey={copilotResetKey}
-                      suggestedQuestions={copilotSuggestedQuestions}
-                      fallbackContext={copilotFallbackContext}
-                      onAnalysisIdSync={(analysisId) => {
-                        setCopilotSessionAnalysisId(analysisId);
-                        setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
-                      }}
-                    />
-                  </div>
+                  {shouldRenderCopilotUnderGraph && (
+                    <div className="mt-3">
+                      <CopilotChatPanel
+                        analysisReady={copilotAnalysisReady}
+                        analysisId={effectiveCopilotAnalysisId}
+                        resetKey={copilotResetKey}
+                        suggestedQuestions={copilotSuggestedQuestions}
+                        fallbackContext={copilotFallbackContext}
+                        onAnalysisIdSync={(analysisId) => {
+                          setCopilotSessionAnalysisId(analysisId);
+                          setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
+                        }}
+                      />
+                    </div>
+                  )}
                   </motion.div>
                 )}
               </AnimatePresence>

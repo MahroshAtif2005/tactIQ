@@ -77,6 +77,17 @@ export default function CopilotChatPanel({
     () => (Array.isArray(suggestedQuestions) && suggestedQuestions.length > 0 ? suggestedQuestions.slice(0, 6) : DEFAULT_QUESTIONS),
     [suggestedQuestions]
   );
+  const copilotStyle: React.CSSProperties = {
+    background: 'linear-gradient(135deg, rgba(16,185,129,0.18) 0%, rgba(34,211,238,0.14) 55%, rgba(99,102,241,0.10) 100%)',
+    border: '1px solid rgba(16,185,129,0.22)',
+    boxShadow: '0 0 0 1px rgba(16,185,129,0.10), 0 10px 30px rgba(16,185,129,0.10)',
+    borderRadius: '16px',
+  };
+  const userStyle: React.CSSProperties = {
+    background: 'rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.10)',
+    borderRadius: '16px',
+  };
 
   useEffect(() => {
     setIsOpen(false);
@@ -222,18 +233,11 @@ export default function CopilotChatPanel({
               void sendMessage(question);
             }}
             disabled={!analysisReady || isSending || limitReached}
-            style={{
-              flex: '0 0 auto',
-              whiteSpace: 'nowrap',
-              borderRadius: '999px',
-              border: '1px solid rgba(255,255,255,0.14)',
-              background: 'rgba(255,255,255,0.06)',
-              color: 'rgba(255,255,255,0.92)',
-              padding: '7px 12px',
-              fontSize: '12px',
-              cursor: isSending || limitReached ? 'not-allowed' : 'pointer',
-              opacity: !analysisReady || isSending || limitReached ? 0.55 : 1,
-            }}
+            className={`flex-[0_0_auto] whitespace-nowrap rounded-full px-4 py-2 text-sm font-medium transition ${
+              !analysisReady || isSending || limitReached
+                ? 'bg-white/5 border border-white/10 text-slate-400 cursor-not-allowed opacity-55'
+                : 'bg-white/5 border border-white/10 text-slate-200 hover:text-white hover:bg-white/[0.08] hover:border-white/15 hover:shadow-[0_0_0_1px_rgba(99,102,241,0.25),0_0_18px_rgba(99,102,241,0.12)]'
+            }`}
           >
             {question}
           </button>
@@ -248,31 +252,36 @@ export default function CopilotChatPanel({
 
       {isOpen && (
         <div className="mt-2 rounded-xl border border-white/10 bg-slate-900/40 p-3">
-          <div ref={scrollRef} className="max-h-56 overflow-y-auto space-y-2 pr-1">
+          <div ref={scrollRef} className="max-h-56 overflow-y-auto space-y-3 pr-1 pb-6">
             {messages.length === 0 ? (
               <p className="text-[11px] text-slate-400">Ask about this match plan, workload, and next-over tactics.</p>
             ) : (
               messages.map((turn) => (
                 <div
                   key={turn.id}
-                  className={`rounded-lg px-3 py-2 text-[12px] leading-relaxed ${
-                    turn.role === 'user'
-                      ? 'bg-cyan-500/15 border border-cyan-400/30 text-cyan-50 ml-8'
-                      : 'bg-slate-800/80 border border-slate-700 text-slate-100 mr-8'
-                  }`}
+                  className={`text-[12px] p-4 ${turn.role === 'user' ? 'ml-8' : 'mr-8'}`}
+                  style={turn.role === 'assistant' ? copilotStyle : userStyle}
                 >
-                  {turn.content}
+                  {turn.role === 'assistant' && (
+                    <div style={{ fontSize: 11, letterSpacing: 2, fontWeight: 700, color: 'rgba(167,243,208,0.95)', marginBottom: 4 }}>COPILOT</div>
+                  )}
+                  <div style={{ color: 'rgba(255,255,255,0.92)', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    {turn.content}
+                  </div>
                 </div>
               ))
             )}
             {isSending && (
-              <div className="rounded-lg px-3 py-2 text-[12px] bg-slate-800/80 border border-slate-700 text-slate-300 mr-8">
-                Thinking…
+              <div className="text-[12px] mr-8" style={copilotStyle}>
+                <div className="p-4">
+                  <div style={{ fontSize: 11, letterSpacing: 2, fontWeight: 700, color: 'rgba(167,243,208,0.95)', marginBottom: 4 }}>COPILOT</div>
+                  <div style={{ color: 'rgba(255,255,255,0.92)', lineHeight: 1.65 }}>Thinking…</div>
+                </div>
               </div>
             )}
           </div>
 
-          <div className="mt-3 flex items-center gap-2">
+          <div className="flex items-center gap-2" style={{ marginTop: 18 }}>
             <input
               value={input}
               onChange={(event) => setInput(event.target.value)}
