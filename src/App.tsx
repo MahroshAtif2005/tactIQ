@@ -65,6 +65,14 @@ import CopilotChatPanel from './components/CopilotChatPanel';
 import { getRosterIds, removeFromRosterSession, ROSTER_STORAGE_KEY, setBaselineDraftCache, setRosterIds } from './lib/rosterStorage';
 import { buildMatchContext, summarizeMatchContext } from './lib/buildMatchContext';
 import { Baseline, BaselineRole } from './types/baseline';
+import AuthPage from './pages/AuthPage';
+import {
+  getMicrosoftLoginUrl,
+  getMicrosoftLogoutUrl,
+  getUser,
+  isDemoModeEnabled,
+  setDemoModeEnabled,
+} from './auth/swaAuth';
 import {
   clamp,
   computeInjuryRisk,
@@ -83,6 +91,7 @@ import {
 type Page = 'landing' | 'setup' | 'dashboard' | 'baselines';
 type TeamMode = 'BATTING' | 'BOWLING';
 type RunMode = 'auto' | 'full';
+type AuthStatus = 'checking' | 'authenticated' | 'unauthenticated';
 
 interface MatchContext {
   matchMode: TeamMode;
@@ -1412,12 +1421,32 @@ const RECOVERY_RATE_BY_HRR: Record<RecoveryLevel, number> = {
   Moderate: 0.02,
   Poor: 0.01,
 };
+const SWA_CLI_COMMAND = 'swa start http://localhost:5173 --api-location http://localhost:7071';
 
 // --- Main App Component ---
 
 export default function App() {
   const initialStoredMatchMode = useMemo(() => readStoredMatchMode(), []);
-  const [showSplash, setShowSplash] = useState(true);
+  const isAuthPathOnLoad = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    const path = String(window.location.pathname || '').toLowerCase();
+    return path === '/auth' || path.startsWith('/auth/');
+  }, []);
+  const [demoMode, setDemoMode] = useState<boolean>(() => isDemoModeEnabled());
+  const [authStatus, setAuthStatus] = useState<AuthStatus>(() => (isDemoModeEnabled() ? 'authenticated' : 'checking'));
+  const [authUser, setAuthUser] = useState<{ userId: string; name?: string; email?: string } | null>(
+    () =>
+      isDemoModeEnabled()
+        ? {
+            userId: 'demo-local',
+            name: 'Demo Coach',
+            email: 'demo@local',
+          }
+        : null
+  );
+  const [showSplash, setShowSplash] = useState(() => !isAuthPathOnLoad);
+  const [authLocalHint, setAuthLocalHint] = useState<string | null>(null);
+  const [copiedSwaCommand, setCopiedSwaCommand] = useState(false);
   const [page, setPage] = useState<Page>('landing');
   const [matchContext, setMatchContext] = useState<MatchContext>({
     matchMode: initialStoredMatchMode ?? 'BOWLING',
@@ -1471,6 +1500,15 @@ export default function App() {
   const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previousActivePlayerIdRef = useRef<string | null>(null);
   const baselineCacheRef = useRef<Map<string, Baseline>>(new Map());
+  const isAppUnlocked = demoMode || authStatus === 'authenticated';
+  const isLocalAuthHost = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    const host = String(window.location.hostname || '').toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1';
+  }, []);
+  const canUseLocalDemo = useMemo(() => {
+    return isLocalAuthHost;
+  }, [isLocalAuthHost]);
 
   useEffect(() => {
     matchRosterIdsRef.current = matchRosterIds;
@@ -1516,6 +1554,131 @@ export default function App() {
   }, [isProfileOpen]);
 
   useEffect(() => {
+    if (!canUseLocalDemo && demoMode) {
+      setDemoModeEnabled(false);
+      setDemoMode(false);
+    }
+  }, [canUseLocalDemo, demoMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || showSplash) return;
+    const path = String(window.location.pathname || '').toLowerCase();
+    const onAuthPath = path === '/auth' || path.startsWith('/auth/');
+    if (!isAppUnlocked && !onAuthPath) {
+      window.history.replaceState(null, '', '/auth');
+      return;
+    }
+    if (isAppUnlocked && onAuthPath) {
+      window.history.replaceState(null, '', '/');
+    }
+  }, [isAppUnlocked, showSplash]);
+
+  useEffect(() => {
+    if (isAppUnlocked) {
+      setAuthLocalHint(null);
+      setCopiedSwaCommand(false);
+    }
+  }, [isAppUnlocked]);
+
+  useEffect(() => {
+    if (showSplash) return;
+    let cancelled = false;
+    if (demoMode) {
+      setAuthStatus('authenticated');
+      setAuthUser({
+        userId: 'demo-local',
+        name: 'Demo Coach',
+        email: 'demo@local',
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setAuthStatus('checking');
+    setAuthUser(null);
+    void getUser().then((user) => {
+      if (cancelled) return;
+      if (user.isAuthenticated && user.userId) {
+        setAuthStatus('authenticated');
+        setAuthUser({
+          userId: user.userId,
+          ...(user.name ? { name: user.name } : {}),
+          ...(user.email ? { email: user.email } : {}),
+        });
+      } else {
+        setAuthStatus('unauthenticated');
+        setAuthUser(null);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [demoMode, showSplash]);
+
+  const handleContinueWithMicrosoft = useCallback(() => {
+    setDemoModeEnabled(false);
+    setDemoMode(false);
+    setCopiedSwaCommand(false);
+    if (isLocalAuthHost) {
+      setAuthLocalHint(
+        'Microsoft sign-in works on the deployed site or when running locally with the Azure SWA CLI. Use Demo locally, or run `swa start`.'
+      );
+      return;
+    }
+    setAuthLocalHint(null);
+    if (typeof window !== 'undefined') {
+      window.location.assign(getMicrosoftLoginUrl());
+    }
+  }, [isLocalAuthHost]);
+
+  const handleTryDemoMode = useCallback(() => {
+    setAuthLocalHint(null);
+    setCopiedSwaCommand(false);
+    setDemoModeEnabled(true);
+    setDemoMode(true);
+  }, []);
+
+  const handleSignOut = useCallback(() => {
+    setDemoModeEnabled(false);
+    setDemoMode(false);
+    setAuthStatus('unauthenticated');
+    setAuthUser(null);
+    if (typeof window !== 'undefined') {
+      window.location.assign(getMicrosoftLogoutUrl());
+    }
+  }, []);
+
+  const handleCopySwaCommand = useCallback(async () => {
+    if (typeof window === 'undefined') return;
+    try {
+      await window.navigator.clipboard.writeText(SWA_CLI_COMMAND);
+      setCopiedSwaCommand(true);
+      return;
+    } catch {
+      try {
+        const tempInput = document.createElement('textarea');
+        tempInput.value = SWA_CLI_COMMAND;
+        tempInput.setAttribute('readonly', 'true');
+        tempInput.style.position = 'fixed';
+        tempInput.style.opacity = '0';
+        document.body.appendChild(tempInput);
+        tempInput.focus();
+        tempInput.select();
+        document.execCommand('copy');
+        document.body.removeChild(tempInput);
+        setCopiedSwaCommand(true);
+      } catch {
+        setCopiedSwaCommand(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isAppUnlocked) {
+      setIsLoadingRosterPlayers(false);
+      return;
+    }
     const applyBaselinesToRoster = (rows: Baseline[], reason: 'mount' | 'event') => {
       const orderedRows = orderBaselinesForDisplay(rows);
       const previousRosterIds = matchRosterIdsRef.current;
@@ -1605,7 +1768,7 @@ export default function App() {
     return () => {
       window.removeEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
     };
-  }, []);
+  }, [isAppUnlocked]);
 
   useEffect(() => {
     const next = new Map(baselineCacheRef.current);
@@ -3467,7 +3630,7 @@ export default function App() {
             </div>
             
             <div className="flex items-center gap-6 relative">
-              {page !== 'landing' && (
+              {isAppUnlocked && page !== 'landing' && (
                 <>
                   <button type="button" 
                     onClick={() => navigateTo('dashboard')}
@@ -3509,6 +3672,20 @@ export default function App() {
                         <p className="text-[11px] text-slate-500">
                           Azure-Powered Multi-Agent Decision System
                         </p>
+                        {isAppUnlocked && (
+                          <div className="pt-2 mt-2 border-t border-white/10">
+                            <p className="text-[11px] text-slate-400 truncate">
+                              {demoMode ? 'Demo Coach' : authUser?.name || authUser?.email || authUser?.userId || 'Coach'}
+                            </p>
+                            <button
+                              type="button"
+                              onClick={handleSignOut}
+                              className="mt-2 w-full rounded-md border border-white/15 bg-white/[0.04] text-slate-200 text-xs font-medium py-1.5 hover:bg-white/[0.08] transition-colors"
+                            >
+                              {demoMode ? 'Exit Demo' : 'Sign out'}
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </motion.div>
                   )}
@@ -3566,85 +3743,98 @@ export default function App() {
       </AnimatePresence>
 
       <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col dashboard-main-offset">
-        <AnimatePresence mode="wait">
-          {page === 'landing' && (
-            <LandingPage key="landing" onStart={() => navigateTo('setup')} />
-          )}
-          {page === 'setup' && (
-            <MatchSetup 
-              key="setup" 
-              context={matchContext} 
-              setContext={setMatchContext} 
-              onNext={() => navigateTo('dashboard')} 
-              onBack={() => navigateTo('landing')}
-            />
-          )}
-          {page === 'dashboard' && (
-            <Dashboard 
-              key="dashboard"
-              matchContext={matchContext}
-              runMode={runMode}
-              teamMode={matchContext.matchMode}
-              setTeamMode={(mode) => {
-                teamModeLockedRef.current = true;
-                setMatchContext((prev) => ({ ...prev, matchMode: mode }));
-              }}
-              matchState={matchState}
-              players={players}
-              activePlayer={activePlayer}
-              setActivePlayerId={setActivePlayerId}
-              updatePlayer={updatePlayer}
-              updateMatchState={updateMatchState}
-              deleteRosterPlayer={deleteRosterPlayer}
-              movePlayerToSub={movePlayerToSub}
-              agentState={agentState}
-              agentWarning={agentWarning}
-              agentFailure={agentFailure}
-              setAgentWarning={setAgentWarning}
-              setAgentFailure={setAgentFailure}
-              aiAnalysis={aiAnalysis}
-              riskAnalysis={riskAnalysis}
-              tacticalAnalysis={tacticalAnalysis}
-              strategicAnalysis={strategicAnalysis}
-              combinedAnalysis={combinedAnalysis}
-              combinedBriefing={combinedBriefing}
-              combinedDecision={combinedDecision}
-              finalRecommendation={finalRecommendation}
-              orchestrateMeta={orchestrateMeta}
-              routerDecision={routerDecision}
-              agentFeedStatus={agentFeedStatus}
-              analysisActive={analysisActive}
-              runAgent={runAgent}
-              onDismissAnalysis={dismissAnalysis}
-              handleAddOver={handleAddOver}
-              handleDecreaseOver={handleDecreaseOver}
-              handleRest={handleRest}
-              handleMarkUnfit={handleMarkUnfit}
-              recoveryMode={recoveryMode}
-              setRecoveryMode={setRecoveryMode}
-              manualRecovery={manualRecovery}
-              setManualRecovery={setManualRecovery}
-              isLoadingRosterPlayers={isLoadingRosterPlayers}
-              rosterMutationError={rosterMutationError}
-              onGoToBaselines={() => navigateTo('baselines')}
-              onBack={() => navigateTo('setup')}
-            />
-          )}
-          {page === 'baselines' && (
-            <Baselines 
-              key="baselines"
-              baselineSource={baselineSource}
-              baselineWarning={baselineWarning}
-              onBaselinesSynced={handleBaselinesSynced}
-              matchRosterIds={matchRosterIds}
-              onMatchRosterIdsChange={applyMatchRosterIds}
-              onBack={() => navigateTo('dashboard')}
-            />
-          )}
-        </AnimatePresence>
+        {!showSplash && !isAppUnlocked ? (
+          <AuthPage
+            isChecking={authStatus === 'checking'}
+            onContinueWithMicrosoft={handleContinueWithMicrosoft}
+            onTryDemo={handleTryDemoMode}
+            showDemo={canUseLocalDemo}
+            isLocalDev={isLocalAuthHost}
+            localHint={authLocalHint}
+            onCopySwaCommand={handleCopySwaCommand}
+            copiedSwaCommand={copiedSwaCommand}
+          />
+        ) : (
+          <AnimatePresence mode="wait">
+            {page === 'landing' && (
+              <LandingPage key="landing" onStart={() => navigateTo('setup')} />
+            )}
+            {page === 'setup' && (
+              <MatchSetup 
+                key="setup" 
+                context={matchContext} 
+                setContext={setMatchContext} 
+                onNext={() => navigateTo('dashboard')} 
+                onBack={() => navigateTo('landing')}
+              />
+            )}
+            {page === 'dashboard' && (
+              <Dashboard 
+                key="dashboard"
+                matchContext={matchContext}
+                runMode={runMode}
+                teamMode={matchContext.matchMode}
+                setTeamMode={(mode) => {
+                  teamModeLockedRef.current = true;
+                  setMatchContext((prev) => ({ ...prev, matchMode: mode }));
+                }}
+                matchState={matchState}
+                players={players}
+                activePlayer={activePlayer}
+                setActivePlayerId={setActivePlayerId}
+                updatePlayer={updatePlayer}
+                updateMatchState={updateMatchState}
+                deleteRosterPlayer={deleteRosterPlayer}
+                movePlayerToSub={movePlayerToSub}
+                agentState={agentState}
+                agentWarning={agentWarning}
+                agentFailure={agentFailure}
+                setAgentWarning={setAgentWarning}
+                setAgentFailure={setAgentFailure}
+                aiAnalysis={aiAnalysis}
+                riskAnalysis={riskAnalysis}
+                tacticalAnalysis={tacticalAnalysis}
+                strategicAnalysis={strategicAnalysis}
+                combinedAnalysis={combinedAnalysis}
+                combinedBriefing={combinedBriefing}
+                combinedDecision={combinedDecision}
+                finalRecommendation={finalRecommendation}
+                orchestrateMeta={orchestrateMeta}
+                routerDecision={routerDecision}
+                agentFeedStatus={agentFeedStatus}
+                analysisActive={analysisActive}
+                runAgent={runAgent}
+                onDismissAnalysis={dismissAnalysis}
+                handleAddOver={handleAddOver}
+                handleDecreaseOver={handleDecreaseOver}
+                handleRest={handleRest}
+                handleMarkUnfit={handleMarkUnfit}
+                recoveryMode={recoveryMode}
+                setRecoveryMode={setRecoveryMode}
+                manualRecovery={manualRecovery}
+                setManualRecovery={setManualRecovery}
+                isLoadingRosterPlayers={isLoadingRosterPlayers}
+                rosterMutationError={rosterMutationError}
+                onGoToBaselines={() => navigateTo('baselines')}
+                onBack={() => navigateTo('setup')}
+              />
+            )}
+            {page === 'baselines' && (
+              <Baselines 
+                key="baselines"
+                baselineSource={baselineSource}
+                baselineWarning={baselineWarning}
+                onBaselinesSynced={handleBaselinesSynced}
+                matchRosterIds={matchRosterIds}
+                onMatchRosterIdsChange={applyMatchRosterIds}
+                onBack={() => navigateTo('dashboard')}
+              />
+            )}
+          </AnimatePresence>
+        )}
       </main>
       
-      {page !== 'landing' && (
+      {isAppUnlocked && page !== 'landing' && (
         <footer className="py-6 text-center text-xs text-slate-600 border-t border-white/5 bg-[#020408]">
           <p>© 2026 TactIQ. Enterprise Sports Analytics.</p>
         </footer>

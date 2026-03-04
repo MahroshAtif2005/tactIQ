@@ -1,5 +1,6 @@
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse } from '../types/agents';
 import { Baseline, PlayerBaseline } from '../types/baseline';
+import { isDemoModeEnabled } from '../auth/swaAuth';
 
 export type ApiClientErrorKind = 'network' | 'timeout' | 'cors' | 'http' | 'parse';
 export type AgentFrameworkMode = 'route' | 'all';
@@ -152,7 +153,11 @@ async function requestText(
 
   let response: Response;
   try {
-    response = await fetch(url, { ...init, signal });
+    const requestHeaders = new Headers(init.headers || {});
+    if (isDemoModeEnabled()) {
+      requestHeaders.set('x-tactiq-demo', 'true');
+    }
+    response = await fetch(url, { ...init, headers: requestHeaders, signal });
   } catch (error) {
     if (timeoutId) clearTimeout(timeoutId);
     if (parentSignal && abortRelay) {
@@ -684,7 +689,97 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
   };
 };
 
+const DEMO_BASELINES_STORAGE_KEY = 'tactiq:demoBaselines';
+const DEFAULT_DEMO_BASELINES: Baseline[] = [
+  {
+    id: 'J. Archer',
+    playerId: 'J. Archer',
+    name: 'J. Archer',
+    role: 'FAST',
+    sleepHoursToday: 7.5,
+    recoveryMinutes: 45,
+    fatigueLimit: 6,
+    controlBaseline: 80,
+    speed: 9,
+    power: 0,
+    sleep: 7.5,
+    recovery: 45,
+    control: 80,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 1,
+  },
+  {
+    id: 'R. Khan',
+    playerId: 'R. Khan',
+    name: 'R. Khan',
+    role: 'SPIN',
+    sleepHoursToday: 7.1,
+    recoveryMinutes: 40,
+    fatigueLimit: 6,
+    controlBaseline: 86,
+    speed: 8,
+    power: 0,
+    sleep: 7.1,
+    recovery: 40,
+    control: 86,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 2,
+  },
+  {
+    id: 'M. Starc',
+    playerId: 'M. Starc',
+    name: 'M. Starc',
+    role: 'FAST',
+    sleepHoursToday: 6.8,
+    recoveryMinutes: 50,
+    fatigueLimit: 6,
+    controlBaseline: 79,
+    speed: 9,
+    power: 0,
+    sleep: 6.8,
+    recovery: 50,
+    control: 79,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 3,
+  },
+];
+
+const cloneDemoBaselines = (rows: Baseline[]): Baseline[] => rows.map((entry) => ({ ...entry }));
+
+const readDemoBaselines = (): Baseline[] => {
+  if (typeof window === 'undefined') return cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+  try {
+    const raw = window.localStorage.getItem(DEMO_BASELINES_STORAGE_KEY);
+    if (!raw) return cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+    const parsed = JSON.parse(raw);
+    const rows = Array.isArray(parsed) ? parsed : [];
+    const normalized = rows.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
+    return normalized.length > 0 ? normalized : cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+  } catch {
+    return cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+  }
+};
+
+const writeDemoBaselines = (rows: Baseline[]): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(DEMO_BASELINES_STORAGE_KEY, JSON.stringify(rows));
+  } catch {
+    // Ignore storage failures in restricted browser modes.
+  }
+};
+
 export async function getBaselinesWithMeta(signal?: AbortSignal): Promise<BaselinesResponse> {
+  if (isDemoModeEnabled()) {
+    const baselines = readDemoBaselines();
+    return { baselines, source: 'fallback', warning: 'Demo mode: local data only (no Cosmos writes).' };
+  }
   const raw = await getJson<unknown>(baselinesEndpoint, signal);
   if (Array.isArray(raw)) {
     const baselines = raw.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
@@ -714,6 +809,9 @@ export async function getBaselines(signal?: AbortSignal): Promise<Baseline[]> {
 export async function getBaselineByPlayerId(playerId: string, signal?: AbortSignal): Promise<Baseline | null> {
   const normalizedId = String(playerId || '').trim();
   if (!normalizedId) return null;
+  if (isDemoModeEnabled()) {
+    return readDemoBaselines().find((row) => String(row.id || '').trim() === normalizedId) || null;
+  }
   const id = encodeURIComponent(normalizedId);
   const url = `${baselinesEndpoint}/${id}`;
   const raw = await getJson<unknown>(url, signal);
@@ -726,6 +824,11 @@ export async function getBaselineByPlayerId(playerId: string, signal?: AbortSign
 }
 
 export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal): Promise<Baseline[]> {
+  if (isDemoModeEnabled()) {
+    const normalized = baselines.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
+    writeDemoBaselines(normalized);
+    return normalized;
+  }
   const players: PlayerBaseline[] = baselines.map((row) => ({
     id: String(row.id || row.playerId || '').trim(),
     type: 'playerBaseline',
@@ -756,6 +859,13 @@ export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal)
 }
 
 export async function deleteBaseline(playerId: string, signal?: AbortSignal): Promise<void> {
+  if (isDemoModeEnabled()) {
+    const normalizedId = String(playerId || '').trim();
+    if (!normalizedId) return;
+    const remaining = readDemoBaselines().filter((row) => String(row.id || '').trim() !== normalizedId);
+    writeDemoBaselines(remaining);
+    return;
+  }
   const id = encodeURIComponent(String(playerId || '').trim());
   await deleteJson<{ ok: boolean }>(`${baselinesEndpoint}/${id}`, signal);
 }
@@ -781,6 +891,20 @@ export async function updateBaseline(
       url: `${baselinesEndpoint}/:id`,
       status: 400,
     });
+  }
+  if (isDemoModeEnabled()) {
+    const rows = readDemoBaselines();
+    const nextRows = rows.map((row) => {
+      if (String(row.id || '').trim() !== normalizedId) return row;
+      return {
+        ...row,
+        ...(typeof patch.active === 'boolean' ? { active: patch.active, isActive: patch.active } : {}),
+        ...(typeof patch.inRoster === 'boolean' ? { inRoster: patch.inRoster } : {}),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    writeDemoBaselines(nextRows);
+    return nextRows.find((row) => String(row.id || '').trim() === normalizedId) || null;
   }
   const id = encodeURIComponent(normalizedId);
   const payload: Record<string, unknown> = {};
@@ -816,6 +940,10 @@ export async function updateBaseline(
 }
 
 export async function resetBaselines(signal?: AbortSignal): Promise<void> {
+  if (isDemoModeEnabled()) {
+    writeDemoBaselines(cloneDemoBaselines(DEFAULT_DEMO_BASELINES));
+    return;
+  }
   await postJson<{ ok: boolean; deleted: number }>(`${baselinesEndpoint}/reset`, {}, signal);
 }
 

@@ -1,8 +1,10 @@
 const fs = require('fs');
 const path = require('path');
+const { randomUUID } = require('crypto');
 
 const DEFAULT_DATABASE = 'tactiq-db';
 const DEFAULT_CONTAINER = 'players';
+const DEFAULT_COACH_CONTAINER = 'playersByCoach';
 const FALLBACK_BASELINES_PATH =
   process.env.BASELINE_FALLBACK_FILE ||
   path.resolve(process.cwd(), 'server/data/baselines.json');
@@ -75,6 +77,8 @@ const DEFAULT_SEED_BASELINES = [
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const normalizeId = (value) => String(value || '').trim();
+const normalizeUserId = (value) => String(value || '').trim();
+const normalizeBaselineKey = (value) => String(value || '').trim().toLowerCase();
 const normalizeOrderIndex = (value) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
@@ -152,7 +156,7 @@ const validateAndNormalizeBaseline = (raw, options = {}) => {
   const errors = [];
   const payload = isRecord(raw) ? raw : {};
 
-  const id = normalizeId(payload.id || payload.playerId || payload.name);
+  const id = normalizeId(payload.baselineId || payload.playerId || payload.id || payload.name);
   if (!id && strict) {
     errors.push('id is required');
   }
@@ -161,7 +165,9 @@ const validateAndNormalizeBaseline = (raw, options = {}) => {
 
   const normalized = {
     id: id || 'Unknown Player',
+    baselineId: id || 'Unknown Player',
     type: 'playerBaseline',
+    userId: normalizeUserId(payload.userId),
     name: String(payload.name || id || 'Unknown Player').trim() || 'Unknown Player',
     role,
     sleep: parseNumericField(
@@ -292,6 +298,12 @@ const getConfig = () => ({
     process.env.COSMOS_CONTAINER_ID,
     process.env.COSMOS_CONTAINER_PLAYERS
   ),
+  coachContainerId: firstNonEmptyEnv(
+    process.env.COSMOS_COACH_CONTAINER,
+    process.env.COSMOS_CONTAINER_BY_COACH,
+    process.env.COSMOS_CONTAINER_PLAYERS_BY_COACH,
+    DEFAULT_COACH_CONTAINER
+  ),
 });
 
 const parseCosmosAccount = (config) => {
@@ -345,7 +357,9 @@ const isCosmosConfigured = () => {
 };
 
 let cachedContainer = null;
+let cachedCoachContainer = null;
 let initPromise = null;
+let coachInitPromise = null;
 let initError = null;
 let cosmosCtor = null;
 
@@ -394,6 +408,38 @@ const getContainer = async () => {
   return initPromise;
 };
 
+const getCoachContainer = async () => {
+  logCosmosEnvOnce();
+  if (!isCosmosConfigured()) return null;
+  if (cachedCoachContainer) return cachedCoachContainer;
+  if (coachInitPromise) return coachInitPromise;
+
+  coachInitPromise = (async () => {
+    const CosmosClient = loadCosmosClientCtor();
+    if (!CosmosClient) return null;
+
+    const { connectionString, endpoint, key, databaseId, coachContainerId } = getConfig();
+    const client = connectionString
+      ? new CosmosClient(connectionString)
+      : new CosmosClient({ endpoint, key });
+
+    const { database } = await client.databases.createIfNotExists({ id: databaseId });
+    const { container } = await database.containers.createIfNotExists({
+      id: coachContainerId || DEFAULT_COACH_CONTAINER,
+      partitionKey: { paths: ['/userId'] },
+    });
+
+    cachedCoachContainer = container;
+    return container;
+  })().catch((error) => {
+    initError = error;
+    logCosmosConnectFail(error);
+    return null;
+  });
+
+  return coachInitPromise;
+};
+
 const chunk = (items, size) => {
   const batches = [];
   for (let index = 0; index < items.length; index += size) {
@@ -402,23 +448,33 @@ const chunk = (items, size) => {
   return batches;
 };
 
-const getAllBaselines = async () => {
+const getAllBaselines = async (scope = {}) => {
+  const userId = normalizeUserId(scope?.userId);
   logCosmosEnvOnce();
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: missing configuration.');
   }
 
-  const container = await getContainer();
+  const container = userId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: container not initialized.');
   }
 
   let resources;
   try {
+    const queryText = userId
+      ? 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId'
+      : 'SELECT * FROM c WHERE c.type = @type';
+    const parameters = userId
+      ? [
+          { name: '@type', value: 'playerBaseline' },
+          { name: '@userId', value: userId },
+        ]
+      : [{ name: '@type', value: 'playerBaseline' }];
     const result = await container.items
       .query({
-        query: 'SELECT * FROM c WHERE c.type = @type',
-        parameters: [{ name: '@type', value: 'playerBaseline' }],
+        query: queryText,
+        parameters,
       })
       .fetchAll();
     resources = result.resources;
@@ -433,24 +489,33 @@ const getAllBaselines = async () => {
   return sortBaselines(normalized);
 };
 
-const getRosterBaselines = async () => {
+const getRosterBaselines = async (scope = {}) => {
+  const userId = normalizeUserId(scope?.userId);
   logCosmosEnvOnce();
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: missing configuration.');
   }
 
-  const container = await getContainer();
+  const container = userId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cosmos baselines are unavailable: container not initialized.');
   }
 
   let resources;
   try {
+    const queryText = userId
+      ? 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true)'
+      : 'SELECT * FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type) AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true)';
+    const parameters = userId
+      ? [
+          { name: '@type', value: 'playerBaseline' },
+          { name: '@userId', value: userId },
+        ]
+      : [{ name: '@type', value: 'playerBaseline' }];
     const result = await container.items
       .query({
-        query:
-          'SELECT * FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type) AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true)',
-        parameters: [{ name: '@type', value: 'playerBaseline' }],
+        query: queryText,
+        parameters,
       })
       .fetchAll();
     resources = result.resources;
@@ -465,20 +530,36 @@ const getRosterBaselines = async () => {
   return sortBaselines(normalized.filter((item) => item.inRoster === true));
 };
 
-const fetchExistingOrderIndexMap = async (container) => {
+const fetchExistingOrderIndexMap = async (container, scope = {}) => {
+  const userId = normalizeUserId(scope?.userId);
   if (!container) return new Map();
   try {
+    const queryText = userId
+      ? 'SELECT c.id, c.baselineId, c.playerId, c.orderIndex, c.createdAt FROM c WHERE c.type = @type AND c.userId = @userId'
+      : 'SELECT c.id, c.orderIndex FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type)';
+    const parameters = userId
+      ? [
+          { name: '@type', value: 'playerBaseline' },
+          { name: '@userId', value: userId },
+        ]
+      : [{ name: '@type', value: 'playerBaseline' }];
     const result = await container.items
       .query({
-        query: 'SELECT c.id, c.orderIndex FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type)',
-        parameters: [{ name: '@type', value: 'playerBaseline' }],
+        query: queryText,
+        parameters,
       })
       .fetchAll();
     const map = new Map();
     (Array.isArray(result.resources) ? result.resources : []).forEach((row) => {
-      const id = normalizeId(row?.id);
-      if (!id) return;
-      map.set(id.toLowerCase(), normalizeOrderIndex(row?.orderIndex));
+      const key = userId
+        ? normalizeBaselineKey(row?.baselineId || row?.playerId || row?.name || row?.id)
+        : normalizeBaselineKey(row?.id);
+      if (!key) return;
+      map.set(key, {
+        orderIndex: normalizeOrderIndex(row?.orderIndex),
+        docId: normalizeId(row?.id),
+        createdAt: normalizeIsoTimestamp(row?.createdAt),
+      });
     });
     return map;
   } catch (error) {
@@ -496,11 +577,39 @@ const getMaxOrderIndex = (values) => {
   return max;
 };
 
-const getBaseline = async (id) => {
+const getBaseline = async (id, scope = {}) => {
+  const userId = normalizeUserId(scope?.userId);
   const normalizedId = normalizeId(id);
   if (!normalizedId) return null;
 
-  if (!isCosmosConfigured()) {
+  if (!isCosmosConfigured() || userId) {
+    if (userId) {
+      const container = await getCoachContainer();
+      if (!container) {
+        throw createCosmosUnavailableError('Cosmos baselines are unavailable: coach container not initialized.');
+      }
+      try {
+        const result = await container.items
+          .query({
+            query:
+              'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id)',
+            parameters: [
+              { name: '@type', value: 'playerBaseline' },
+              { name: '@userId', value: userId },
+              { name: '@id', value: normalizedId },
+            ],
+          })
+          .fetchAll();
+        const resource = Array.isArray(result.resources) ? result.resources[0] : null;
+        if (!resource) return null;
+        return validateAndNormalizeBaseline(resource, { strict: false }).value;
+      } catch (error) {
+        const statusCode = Number(error?.code || error?.statusCode);
+        if (statusCode === 404) return null;
+        throw error;
+      }
+    }
+
     const lowered = normalizedId.toLowerCase();
     return cloneFallbackBaselines().find((item) => normalizeId(item.id).toLowerCase() === lowered) || null;
   }
@@ -522,7 +631,8 @@ const getBaseline = async (id) => {
   }
 };
 
-const upsertBaselines = async (players) => {
+const upsertBaselines = async (players, scope = {}) => {
+  const userId = normalizeUserId(scope?.userId);
   const rows = Array.isArray(players) ? players : [];
   const normalizedEntries = [];
   const errors = [];
@@ -558,7 +668,7 @@ const upsertBaselines = async (players) => {
 
   const dedupedById = new Map();
   normalizedEntries.forEach((entry) => {
-    const key = normalizeId(entry.value.id).toLowerCase();
+    const key = normalizeBaselineKey(entry.value.id);
     if (!key) return;
     dedupedById.set(key, entry);
   });
@@ -568,29 +678,48 @@ const upsertBaselines = async (players) => {
     throw createCosmosUnavailableError('Cannot save baselines: Cosmos is not configured.');
   }
 
-  const container = await getContainer();
+  const container = userId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cannot save baselines: Cosmos container unavailable.');
   }
 
-  const existingOrderById = await fetchExistingOrderIndexMap(container);
-  const maxFromExisting = getMaxOrderIndex([...existingOrderById.values()]);
+  const existingOrderById = await fetchExistingOrderIndexMap(container, userId ? { userId } : {});
+  const maxFromExisting = getMaxOrderIndex(
+    [...existingOrderById.values()].map((entry) =>
+      entry && typeof entry === 'object' ? normalizeOrderIndex(entry.orderIndex) : normalizeOrderIndex(entry)
+    )
+  );
   const maxFromIncoming = getMaxOrderIndex(
     dedupedEntries.map((entry) => (entry.hasIncomingOrderIndex ? entry.incomingOrderIndex : 0))
   );
   let nextOrderIndex = Math.max(maxFromExisting, maxFromIncoming);
 
   const itemsToUpsert = dedupedEntries.map((entry) => {
-    const key = normalizeId(entry.value.id).toLowerCase();
+    const key = normalizeBaselineKey(entry.value.id);
     const existingOrder = existingOrderById.get(key);
     const normalized = { ...entry.value };
+    const existingOrderValue =
+      existingOrder && typeof existingOrder === 'object'
+        ? normalizeOrderIndex(existingOrder.orderIndex)
+        : normalizeOrderIndex(existingOrder);
     if (entry.hasIncomingOrderIndex) {
       normalized.orderIndex = entry.incomingOrderIndex;
-    } else if (hasPositiveOrderIndex(existingOrder)) {
-      normalized.orderIndex = normalizeOrderIndex(existingOrder);
+    } else if (hasPositiveOrderIndex(existingOrderValue)) {
+      normalized.orderIndex = existingOrderValue;
     } else {
       nextOrderIndex += 1;
       normalized.orderIndex = nextOrderIndex;
+    }
+    if (userId) {
+      const existingDocId = existingOrder && typeof existingOrder === 'object' ? normalizeId(existingOrder.docId) : '';
+      const existingCreatedAt =
+        existingOrder && typeof existingOrder === 'object' ? normalizeIsoTimestamp(existingOrder.createdAt) : undefined;
+      normalized.baselineId = normalized.id;
+      normalized.playerId = normalized.id;
+      normalized.userId = userId;
+      normalized.id = existingDocId || randomUUID();
+      normalized.createdAt = existingCreatedAt || normalizeIsoTimestamp(normalized.createdAt);
+      normalized.updatedAt = new Date().toISOString();
     }
     return normalized;
   });
@@ -600,7 +729,7 @@ const upsertBaselines = async (players) => {
     await Promise.all(
       batch.map((item) =>
         container.items.upsert(item, {
-          partitionKey: item.id,
+          partitionKey: userId ? userId : item.id,
         })
       )
     );
@@ -609,7 +738,7 @@ const upsertBaselines = async (players) => {
   return { count: itemsToUpsert.length };
 };
 
-const deleteBaseline = async (id) => {
+const deleteBaseline = async (id, scope = {}) => {
   const normalizedId = normalizeId(id);
   if (!normalizedId) {
     const error = new Error('id is required');
@@ -617,11 +746,11 @@ const deleteBaseline = async (id) => {
     throw error;
   }
 
-  await patchBaseline(normalizedId, { active: false, inRoster: false });
+  await patchBaseline(normalizedId, { active: false, inRoster: false }, scope);
   return { ok: true, softDeleted: true };
 };
 
-const patchBaseline = async (id, patch) => {
+const patchBaseline = async (id, patch, scope = {}) => {
   const normalizedId = normalizeId(id);
   if (!normalizedId) {
     const error = new Error('id is required');
@@ -650,7 +779,7 @@ const patchBaseline = async (id, patch) => {
     throw error;
   }
 
-  const existing = await getBaseline(normalizedId);
+  const existing = await getBaseline(normalizedId, scope);
   if (!existing) {
     const error = new Error(`Baseline ${normalizedId} not found.`);
     error.code = 404;
@@ -674,28 +803,38 @@ const patchBaseline = async (id, patch) => {
     throw error;
   }
 
-  await upsertBaselines([normalized.value]);
-  return (await getBaseline(normalizedId)) || normalized.value;
+  await upsertBaselines([normalized.value], scope);
+  return (await getBaseline(normalizedId, scope)) || normalized.value;
 };
 
-const setBaselineActive = async (id, active) => patchBaseline(id, { active });
+const setBaselineActive = async (id, active, scope = {}) => patchBaseline(id, { active }, scope);
 
 const resetBaselines = async (options = {}) => {
   const shouldSeed = options.seed !== false;
+  const userId = normalizeUserId(options.userId);
 
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cannot reset baselines: Cosmos is not configured.');
   }
 
-  const container = await getContainer();
+  const container = userId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cannot reset baselines: Cosmos container unavailable.');
   }
 
+  const queryText = userId
+    ? 'SELECT c.id FROM c WHERE c.type = @type AND c.userId = @userId'
+    : 'SELECT c.id FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type)';
+  const queryParams = userId
+    ? [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: userId },
+      ]
+    : [{ name: '@type', value: 'playerBaseline' }];
   const { resources } = await container.items
     .query({
-      query: 'SELECT c.id FROM c WHERE (NOT IS_DEFINED(c.type) OR c.type = @type)',
-      parameters: [{ name: '@type', value: 'playerBaseline' }],
+      query: queryText,
+      parameters: queryParams,
     })
     .fetchAll();
   const ids = (Array.isArray(resources) ? resources : [])
@@ -704,12 +843,12 @@ const resetBaselines = async (options = {}) => {
 
   const batches = chunk(ids, 10);
   for (const batch of batches) {
-    await Promise.all(batch.map((id) => container.item(id, id).delete()));
+    await Promise.all(batch.map((id) => container.item(id, userId || id).delete()));
   }
 
   let seeded = 0;
   if (shouldSeed) {
-    const result = await upsertBaselines(buildDefaultBaselines());
+    const result = await upsertBaselines(buildDefaultBaselines(), userId ? { userId } : {});
     seeded = result.count;
   }
 
@@ -749,18 +888,28 @@ const getCosmosDiagnostics = () => {
   };
 };
 
-const getBaselineCount = async () => {
+const getBaselineCount = async (scope = {}) => {
+  const userId = normalizeUserId(scope?.userId);
   if (!isCosmosConfigured()) {
     throw createCosmosUnavailableError('Cannot count baselines: Cosmos is not configured.');
   }
-  const container = await getContainer();
+  const container = userId ? await getCoachContainer() : await getContainer();
   if (!container) {
     throw createCosmosUnavailableError('Cannot count baselines: Cosmos container unavailable.');
   }
+  const queryText = userId
+    ? 'SELECT VALUE COUNT(1) FROM c WHERE c.type = @type AND c.userId = @userId'
+    : 'SELECT VALUE COUNT(1) FROM c WHERE c.type = @type';
+  const parameters = userId
+    ? [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: userId },
+      ]
+    : [{ name: '@type', value: 'playerBaseline' }];
   const result = await container.items
     .query({
-      query: 'SELECT VALUE COUNT(1) FROM c WHERE c.type = @type',
-      parameters: [{ name: '@type', value: 'playerBaseline' }],
+      query: queryText,
+      parameters,
     })
     .fetchAll();
   const count = Array.isArray(result.resources) ? Number(result.resources[0] || 0) : 0;
@@ -773,6 +922,7 @@ module.exports = {
   validateAndNormalizeBaseline,
   isCosmosConfigured,
   getContainer,
+  getCoachContainer,
   getAllBaselines,
   getRosterBaselines,
   getBaseline,

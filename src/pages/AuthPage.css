@@ -1,0 +1,214 @@
+.auth-page-shell {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: calc(100vh - 5rem);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: hidden;
+}
+
+.auth-page-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 100% at 84% 0%, rgba(0, 194, 122, 0.14) 0%, rgba(0, 194, 122, 0) 48%),
+    radial-gradient(90% 90% at 8% 100%, rgba(0, 163, 255, 0.16) 0%, rgba(0, 163, 255, 0) 56%);
+}
+
+.auth-page-card {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 420px);
+  border-radius: 18px;
+  border: 1px solid rgba(46, 255, 170, 0.12);
+  background: rgba(8, 12, 18, 0.55);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.55);
+  padding: 24px;
+}
+
+.auth-page-icon-wrap {
+  margin-bottom: 16px;
+}
+
+.auth-page-icon-inner {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(46, 255, 170, 0.22);
+  background: rgba(0, 194, 122, 0.08);
+  box-shadow: 0 0 24px rgba(0, 194, 122, 0.16);
+}
+
+.auth-page-icon {
+  width: 24px;
+  height: 24px;
+  color: rgba(92, 255, 180, 0.95);
+}
+
+.auth-page-title {
+  margin: 0;
+  font-size: 1.75rem;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: rgba(255, 255, 255, 0.97);
+}
+
+.auth-page-title-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.auth-page-local-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(46, 255, 170, 0.22);
+  background: rgba(46, 255, 170, 0.08);
+  color: rgba(167, 243, 208, 0.95);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 4px 10px;
+}
+
+.auth-page-subtitle {
+  margin: 10px 0 0;
+  font-size: 0.94rem;
+  line-height: 1.5;
+  color: rgba(226, 232, 240, 0.9);
+}
+
+.auth-page-microcopy {
+  margin: 8px 0 0;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: rgba(148, 163, 184, 0.9);
+}
+
+.auth-page-button {
+  width: 100%;
+  min-height: 46px;
+  margin-top: 18px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 12px 16px;
+  transition: transform 160ms ease, box-shadow 160ms ease, background-color 160ms ease, border-color 160ms ease,
+    filter 160ms ease;
+  cursor: pointer;
+}
+
+.auth-page-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.74;
+}
+
+.auth-page-button:focus-visible {
+  outline: none;
+}
+
+.auth-page-button-primary {
+  background: linear-gradient(90deg, #00c27a 0%, #00a3ff 100%);
+  color: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 10px 30px rgba(0, 194, 122, 0.25);
+}
+
+.auth-page-button-primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+  box-shadow: 0 14px 34px rgba(0, 194, 122, 0.3);
+}
+
+.auth-page-button-primary:focus-visible {
+  box-shadow: 0 0 0 2px rgba(0, 12, 24, 0.95), 0 0 0 4px rgba(46, 255, 170, 0.45), 0 12px 30px rgba(0, 194, 122, 0.3);
+}
+
+.auth-page-button-secondary {
+  margin-top: 10px;
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.02);
+  color: rgba(226, 232, 240, 0.96);
+}
+
+.auth-page-button-secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.24);
+  transform: translateY(-1px);
+}
+
+.auth-page-button-secondary:focus-visible {
+  box-shadow: 0 0 0 2px rgba(0, 12, 24, 0.95), 0 0 0 4px rgba(255, 255, 255, 0.24);
+}
+
+.auth-page-footer {
+  margin: 14px 0 0;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: rgba(148, 163, 184, 0.9);
+}
+
+.auth-page-local-hint {
+  margin-top: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  background: rgba(15, 23, 42, 0.45);
+  padding: 10px 12px;
+}
+
+.auth-page-local-hint-text {
+  margin: 0;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  color: rgba(203, 213, 225, 0.92);
+}
+
+.auth-page-local-hint-copy {
+  margin-top: 8px;
+  border: 0;
+  background: transparent;
+  color: rgba(94, 234, 212, 0.95);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.auth-page-local-hint-copy:hover {
+  color: rgba(153, 246, 228, 0.96);
+}
+
+.auth-page-local-hint-copy:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(94, 234, 212, 0.38);
+  border-radius: 4px;
+}
+
+@media (max-width: 640px) {
+  .auth-page-shell {
+    padding: 18px;
+  }
+
+  .auth-page-card {
+    padding: 22px;
+    border-radius: 16px;
+  }
+
+  .auth-page-title {
+    font-size: 1.55rem;
+  }
+}
