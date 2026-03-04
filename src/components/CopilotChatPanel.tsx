@@ -163,6 +163,9 @@ export default function CopilotChatPanel({
         setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
       }
     } catch (sendError) {
+      if (sendError instanceof ApiClientError && sendError.status === 409) {
+        onAnalysisIdSync?.('');
+      }
       if (import.meta.env.DEV) {
         console.error('[copilot] send failed', sendError);
       }

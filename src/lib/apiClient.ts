@@ -54,6 +54,8 @@ const tacticalEndpoint = resolveApiUrl('/agents/tactical');
 const orchestrateEndpoint = apiOrchestrateUrl;
 const baselinesEndpoint = resolveApiUrl('/baselines');
 const copilotChatEndpoint = resolveApiUrl('/api/copilot-chat');
+const analysisExistsEndpoint = (analysisId: string): string =>
+  resolveApiUrl(`/analysis/${encodeURIComponent(String(analysisId || '').trim())}/exists`);
 
 interface ApiClientErrorOptions {
   message: string;
@@ -582,6 +584,38 @@ export async function postCopilotChat(
   signal?: AbortSignal
 ): Promise<CopilotChatResponse> {
   return postJson<CopilotChatResponse>(copilotChatEndpoint, payload, signal);
+}
+
+export interface AnalysisExistsResponse {
+  ok?: boolean;
+  exists?: boolean;
+  analysisId?: string;
+}
+
+export async function checkAnalysisExists(
+  analysisId: string,
+  signal?: AbortSignal
+): Promise<boolean> {
+  const normalizedId = String(analysisId || '').trim();
+  if (!normalizedId) return false;
+  const url = analysisExistsEndpoint(normalizedId);
+  try {
+    const { status, text, headers } = await requestText(
+      url,
+      {
+        method: 'GET',
+        signal,
+      },
+      { timeoutMs: 6000 }
+    );
+    const raw = parseJsonResponse<AnalysisExistsResponse>(text, url, status, headers);
+    return Boolean(raw?.exists);
+  } catch (error) {
+    if (error instanceof ApiClientError && error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 export interface BaselinesResponse {

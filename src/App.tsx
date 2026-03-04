@@ -50,6 +50,7 @@ import {
   apiHealthUrl,
   apiOrchestrateUrl,
   checkHealth,
+  checkAnalysisExists,
   deleteBaseline,
   getBaselineByPlayerId,
   getBaselinesWithMeta,
@@ -4761,6 +4762,7 @@ function Dashboard({
       return '';
     }
   });
+  const [copilotVerifiedAnalysisId, setCopilotVerifiedAnalysisId] = useState('');
   const [copilotResetToken, setCopilotResetToken] = useState(0);
   const [showRouterSignals, setShowRouterSignals] = useState(false);
   const [showRawTelemetry, setShowRawTelemetry] = useState(false);
@@ -5249,20 +5251,20 @@ function Dashboard({
       tacticalAnalysis,
     ]
   );
-  const effectiveCopilotAnalysisId = useMemo(() => {
+  const metaCopilotAnalysisId = useMemo(() => {
     const metaRecord = (orchestrateMeta && typeof orchestrateMeta === 'object'
       ? (orchestrateMeta as unknown as Record<string, unknown>)
       : null);
-    const candidates = [
-      metaRecord?.analysisId,
-      copilotSessionAnalysisId,
-    ];
+    return String(metaRecord?.analysisId || '').trim();
+  }, [orchestrateMeta]);
+  const effectiveCopilotAnalysisId = useMemo(() => {
+    const candidates = [metaCopilotAnalysisId, copilotVerifiedAnalysisId];
     for (const candidate of candidates) {
       const value = String(candidate || '').trim();
       if (value.length > 0) return value;
     }
     return '';
-  }, [copilotSessionAnalysisId, orchestrateMeta]);
+  }, [copilotVerifiedAnalysisId, metaCopilotAnalysisId]);
   const copilotAnalysisReady = effectiveCopilotAnalysisId.length > 0;
   const copilotResetKey = `${activePlayer?.id || 'none'}-${copilotResetToken}`;
 
@@ -5276,6 +5278,7 @@ function Dashboard({
     ).trim();
     if (fromMeta.length > 0) {
       setCopilotSessionAnalysisId((prev) => (prev === fromMeta ? prev : fromMeta));
+      setCopilotVerifiedAnalysisId((prev) => (prev === fromMeta ? prev : fromMeta));
     } else if (import.meta.env.DEV) {
       // no-op path for debugging local state transitions.
       console.log('[copilot][analysis_id_missing_in_meta]');
@@ -5283,14 +5286,50 @@ function Dashboard({
   }, [analysisActive, orchestrateMeta, showCoachInsights]);
 
   useEffect(() => {
+    const candidateId = String(copilotSessionAnalysisId || '').trim();
+    if (!candidateId) {
+      setCopilotVerifiedAnalysisId('');
+      return;
+    }
+    if (candidateId === metaCopilotAnalysisId) {
+      setCopilotVerifiedAnalysisId(candidateId);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const exists = await checkAnalysisExists(candidateId);
+        if (cancelled) return;
+        if (exists) {
+          setCopilotVerifiedAnalysisId(candidateId);
+          return;
+        }
+        setCopilotVerifiedAnalysisId('');
+        setCopilotSessionAnalysisId('');
+      } catch (error) {
+        if (cancelled) return;
+        if (import.meta.env.DEV) {
+          console.warn('[copilot][analysis_exists_check_failed]', error);
+        }
+        setCopilotVerifiedAnalysisId('');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [copilotSessionAnalysisId, metaCopilotAnalysisId]);
+
+  useEffect(() => {
     if (!import.meta.env.DEV) return;
     console.log('[copilot][gate]', {
       analysisActive,
       showCoachInsights,
       telemetryView,
+      metaCopilotAnalysisId,
+      copilotVerifiedAnalysisId,
       effectiveCopilotAnalysisId,
     });
-  }, [analysisActive, showCoachInsights, telemetryView, effectiveCopilotAnalysisId]);
+  }, [analysisActive, showCoachInsights, telemetryView, metaCopilotAnalysisId, copilotVerifiedAnalysisId, effectiveCopilotAnalysisId]);
 
   useEffect(() => {
     if (!isBatsmanActive || !activePlayer) {
@@ -7765,7 +7804,10 @@ function Dashboard({
                         resetKey={copilotResetKey}
                         suggestedQuestions={copilotSuggestedQuestions}
                         fallbackContext={copilotFallbackContext}
-                        onAnalysisIdSync={setCopilotSessionAnalysisId}
+                        onAnalysisIdSync={(analysisId) => {
+                          setCopilotSessionAnalysisId(analysisId);
+                          setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
+                        }}
                       />
                     </div>
                   </div>
@@ -8010,7 +8052,10 @@ function Dashboard({
                       resetKey={copilotResetKey}
                       suggestedQuestions={copilotSuggestedQuestions}
                       fallbackContext={copilotFallbackContext}
-                      onAnalysisIdSync={setCopilotSessionAnalysisId}
+                      onAnalysisIdSync={(analysisId) => {
+                        setCopilotSessionAnalysisId(analysisId);
+                        setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
+                      }}
                     />
                   </div>
                   </motion.div>
