@@ -5,9 +5,11 @@ const {
   saveBaselines,
   replaceBaselines,
   deleteBaselineById,
+  checkBaselineOwnership,
   resetBaselines,
   getStorageMode,
 } = require('../shared/store');
+const { jsonResponse, optionsResponse } = require('../shared/agentRuntime');
 
 const unauthorized = {
   ok: false,
@@ -15,17 +17,49 @@ const unauthorized = {
   message: 'Sign in with Microsoft to access baselines.',
 };
 
-const jsonResponse = (status, payload, headers = {}) => ({
-  status,
-  headers: {
-    'Content-Type': 'application/json; charset=utf-8',
-    ...headers,
-  },
-  body: JSON.stringify(payload),
-});
+const isDemoRequest = (req) =>
+  String(req?.headers?.['x-tactiq-demo'] || req?.headers?.['X-TACTIQ-DEMO'] || '')
+    .trim()
+    .toLowerCase() === 'true';
 
 module.exports = async function baselines(context, req) {
   try {
+    const method = String(req.method || 'GET').toUpperCase();
+    if (method === 'OPTIONS') {
+      context.res = optionsResponse('GET,POST,PATCH,DELETE,OPTIONS', {}, req);
+      return;
+    }
+    const baselineId = String(req?.params?.id || '').trim();
+    const isResetRoute = baselineId.toLowerCase() === 'reset';
+    if (isDemoRequest(req)) {
+      if (method === 'GET') {
+        if (baselineId && !isResetRoute) {
+          context.res = jsonResponse(404, {
+            ok: false,
+            error: 'not_found',
+            message: `Baseline '${baselineId}' not found in demo local mode.`,
+            source: 'demo-local',
+          });
+          return;
+        }
+        context.res = jsonResponse(200, {
+          ok: true,
+          items: [],
+          players: [],
+          source: 'demo-local',
+          warning: 'Demo mode uses localStorage only. Cosmos is bypassed.',
+        });
+        return;
+      }
+      context.res = jsonResponse(200, {
+        ok: true,
+        players: [],
+        source: 'demo-local',
+        warning: 'Demo mode uses localStorage only. Cosmos is bypassed.',
+      });
+      return;
+    }
+
     const identity = getIdentity(req);
     if (!identity) {
       context.log.warn('[baselines] 401 unauthorized');
@@ -43,9 +77,6 @@ module.exports = async function baselines(context, req) {
       return;
     }
 
-    const method = String(req.method || 'GET').toUpperCase();
-    const baselineId = String(req?.params?.id || '').trim();
-    const isResetRoute = baselineId.toLowerCase() === 'reset';
     if (method === 'GET') {
       const players = await listBaselines({ userId: user.userId, teamId: user.teamId });
       if (baselineId && !isResetRoute) {
@@ -112,6 +143,15 @@ module.exports = async function baselines(context, req) {
       const players = await listBaselines({ userId: user.userId, teamId: user.teamId });
       const target = players.find((row) => String(row.id || '').trim() === baselineId);
       if (!target) {
+        const ownership = await checkBaselineOwnership({ userId: user.userId, baselineId });
+        if (ownership.exists && !ownership.owned) {
+          context.res = jsonResponse(403, {
+            ok: false,
+            error: 'forbidden',
+            message: `Baseline '${baselineId}' belongs to a different user.`,
+          });
+          return;
+        }
         context.res = jsonResponse(404, {
           ok: false,
           error: 'not_found',
@@ -174,10 +214,11 @@ module.exports = async function baselines(context, req) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const isValidation = error && typeof error === 'object' && error.code === 'VALIDATION_ERROR';
+    const isForbidden = error && typeof error === 'object' && Number(error.code) === 403;
     context.log.error('[baselines] error', message);
-    context.res = jsonResponse(isValidation ? 400 : 500, {
+    context.res = jsonResponse(isForbidden ? 403 : isValidation ? 400 : 500, {
       ok: false,
-      error: isValidation ? 'validation_error' : 'baselines_failed',
+      error: isForbidden ? 'forbidden' : isValidation ? 'validation_error' : 'baselines_failed',
       message,
     });
   }

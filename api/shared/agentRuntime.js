@@ -1,7 +1,9 @@
 const path = require('path');
+const { getCorsHeaders, optionsJsonResponse } = require('../cors');
 
 const handlerCache = new Map();
 const loggedMissingConfigByRoute = new Set();
+const DEFAULT_CORS_ALLOW_METHODS = 'GET,POST,PATCH,DELETE,OPTIONS';
 
 const firstNonEmpty = (...values) => {
   for (const value of values) {
@@ -11,34 +13,108 @@ const firstNonEmpty = (...values) => {
   return '';
 };
 
-const applyEnvAlias = (target, aliases = []) => {
-  const current = firstNonEmpty(process.env[target]);
-  if (current) return;
-  const candidate = firstNonEmpty(...aliases.map((name) => process.env[name]));
-  if (candidate) {
-    process.env[target] = candidate;
-  }
+const AOAI_DEFAULT_API_VERSION = '2024-02-15-preview';
+const AOAI_ALIAS_MAP = {
+  endpoint: [
+    'AZURE_OPENAI_ENDPOINT',
+    'AZURE_OPENAI_BASE',
+    'AZURE_OPENAI_BASE_URL',
+    'AOAI_ENDPOINT',
+    'OPENAI_ENDPOINT',
+  ],
+  apiKey: [
+    'AZURE_OPENAI_API_KEY',
+    'AZURE_OPENAI_KEY',
+    'AOAI_API_KEY',
+    'OPENAI_API_KEY',
+  ],
+  deployment: [
+    'AZURE_OPENAI_DEPLOYMENT',
+    'AZURE_OPENAI_DEPLOYMENT_NAME',
+    'AOAI_DEPLOYMENT',
+    'AOAI_DEPLOYMENT_FAST',
+    'AOAI_DEPLOYMENT_STRONG',
+    'AZURE_OPENAI_MODEL',
+    'OPENAI_DEPLOYMENT',
+    'OPENAI_MODEL',
+  ],
+  apiVersion: [
+    'AZURE_OPENAI_API_VERSION',
+    'AOAI_API_VERSION',
+    'OPENAI_API_VERSION',
+  ],
 };
 
-applyEnvAlias('AZURE_OPENAI_API_KEY', ['AZURE_OPENAI_KEY']);
-applyEnvAlias('AZURE_OPENAI_DEPLOYMENT', ['AOAI_DEPLOYMENT_FAST']);
+const normalizeEndpoint = (value) => String(value || '').trim().replace(/\/+$/, '');
+
+const readAlias = (aliases = []) => firstNonEmpty(...aliases.map((name) => process.env[name]));
+
+const applyEnvAlias = (target, aliases = []) => {
+  const candidate = firstNonEmpty(process.env[target], ...aliases.map((name) => process.env[name]));
+  if (candidate) process.env[target] = candidate;
+};
+
+const resolveAoaiRuntimeConfig = () => {
+  const endpoint = normalizeEndpoint(readAlias(AOAI_ALIAS_MAP.endpoint));
+  const apiKey = readAlias(AOAI_ALIAS_MAP.apiKey);
+  const deployment = readAlias(AOAI_ALIAS_MAP.deployment);
+  const apiVersion = readAlias(AOAI_ALIAS_MAP.apiVersion) || AOAI_DEFAULT_API_VERSION;
+  const missing = [];
+  if (!endpoint) missing.push('AZURE_OPENAI_ENDPOINT');
+  if (!apiKey) missing.push('AZURE_OPENAI_API_KEY');
+  if (!deployment) missing.push('AZURE_OPENAI_DEPLOYMENT');
+
+  if (endpoint) process.env.AZURE_OPENAI_ENDPOINT = endpoint;
+  if (apiKey) process.env.AZURE_OPENAI_API_KEY = apiKey;
+  if (deployment) process.env.AZURE_OPENAI_DEPLOYMENT = deployment;
+  process.env.AZURE_OPENAI_API_VERSION = apiVersion;
+
+  return {
+    endpoint,
+    apiKey,
+    deployment,
+    apiVersion,
+    missing,
+    ok: missing.length === 0,
+  };
+};
+
 applyEnvAlias('COSMOS_DB', ['COSMOS_DATABASE']);
-applyEnvAlias('COSMOS_CONTAINER', ['COSMOS_CONTAINER_PLAYERS']);
+applyEnvAlias('COSMOS_CONTAINER_PLAYERS', ['COSMOS_CONTAINER']);
+resolveAoaiRuntimeConfig();
 
 const normalizePayload = (payload) => {
   if (payload === undefined) return { ok: true };
   return payload;
 };
 
-const jsonResponse = (status, payload, headers = {}) => ({
+const buildCorsHeaders = (overrides = {}, req = null) => ({
+  ...getCorsHeaders(req),
+  ...overrides,
+});
+
+const jsonResponse = (status, payload, headers = {}, req = null) => ({
   status,
   headers: {
+    ...buildCorsHeaders({}, req),
     'Content-Type': 'application/json; charset=utf-8',
     ...headers,
   },
   jsonBody: normalizePayload(payload),
   body: JSON.stringify(normalizePayload(payload)),
 });
+
+// Keep allowMethods argument for compatibility with existing calls, but enforce one global CORS policy.
+const optionsResponse = (_allowMethods = DEFAULT_CORS_ALLOW_METHODS, headers = {}, req = null) => {
+  const response = optionsJsonResponse(req);
+  return {
+    ...response,
+    headers: {
+      ...response.headers,
+      ...headers,
+    },
+  };
+};
 
 const normalizeBody = (req) => {
   if (req && typeof req.body === 'object' && req.body !== null) return req.body;
@@ -57,6 +133,28 @@ const normalizeBody = (req) => {
     }
   }
   return {};
+};
+
+const resolveAiExecution = (payload, llmState) => {
+  const modeToken = String(payload?.mode || '').trim().toLowerCase();
+  const requestedDataMode = String(payload?.dataMode || '').trim().toLowerCase();
+  const requestedLlmMode = String(payload?.llmMode || '').trim().toLowerCase();
+  const dataMode = requestedDataMode === 'demo' || modeToken === 'demo' ? 'demo' : 'live';
+  const llmMode = requestedLlmMode === 'rules' ? 'rules' : 'ai';
+  const forcedFallback = modeToken === 'fallback' || llmMode !== 'ai';
+  const aiEnabled = !forcedFallback && Boolean(llmState?.ok);
+  const reasons = [];
+  if (modeToken === 'fallback') reasons.push('mode=fallback');
+  if (llmMode !== 'ai') reasons.push('llm_mode_rules');
+  if (!llmState?.ok) reasons.push('missing_aoai_config', ...(Array.isArray(llmState?.missing) ? llmState.missing : []));
+  return {
+    modeToken,
+    dataMode,
+    llmMode,
+    forcedFallback,
+    aiEnabled,
+    reasons: Array.from(new Set(reasons.filter(Boolean))),
+  };
 };
 
 const toV4Request = (req) => {
@@ -130,8 +228,28 @@ const loadDistHandler = (relativePath, exportName, context) => {
   }
 
   try {
-    const absolutePath = path.resolve(__dirname, '..', relativePath);
-    const mod = require(absolutePath);
+    let restoreAppHttp = null;
+    try {
+      const azureFunctions = require('@azure/functions');
+      if (azureFunctions?.app && typeof azureFunctions.app.http === 'function') {
+        const originalHttp = azureFunctions.app.http;
+        azureFunctions.app.http = () => undefined;
+        restoreAppHttp = () => {
+          azureFunctions.app.http = originalHttp;
+        };
+      }
+    } catch {
+      // If patching fails, continue and let normal module loading errors surface.
+    }
+    let mod;
+    try {
+      const absolutePath = path.resolve(__dirname, '..', relativePath);
+      mod = require(absolutePath);
+    } finally {
+      if (typeof restoreAppHttp === 'function') {
+        restoreAppHttp();
+      }
+    }
     const handler = mod && mod[exportName];
     if (typeof handler !== 'function') {
       throw new Error(`Export ${exportName} missing from ${relativePath}`);
@@ -158,33 +276,39 @@ const tryInvokeDistHandler = async ({ context, req, relativePath, exportName }) 
 
 const getMissingRuntimeConfig = () => {
   const missing = [];
-  const endpoint = firstNonEmpty(process.env.AZURE_OPENAI_ENDPOINT);
-  const apiKey = firstNonEmpty(process.env.AZURE_OPENAI_API_KEY, process.env.AZURE_OPENAI_KEY);
-  const deployment = firstNonEmpty(
-    process.env.AZURE_OPENAI_DEPLOYMENT,
-    process.env.AOAI_DEPLOYMENT_FAST,
-    process.env.AZURE_OPENAI_MODEL
-  );
-  const apiVersion = firstNonEmpty(process.env.AZURE_OPENAI_API_VERSION);
-
-  if (!endpoint) missing.push('AZURE_OPENAI_ENDPOINT');
-  if (!apiKey) missing.push('AZURE_OPENAI_API_KEY|AZURE_OPENAI_KEY');
-  if (!deployment) missing.push('AZURE_OPENAI_DEPLOYMENT|AOAI_DEPLOYMENT_FAST');
-  if (!apiVersion) missing.push('AZURE_OPENAI_API_VERSION');
+  const aoai = resolveAoaiRuntimeConfig();
+  missing.push(...aoai.missing);
 
   const connectionString = firstNonEmpty(process.env.COSMOS_CONNECTION_STRING);
   const cosmosEndpoint = firstNonEmpty(process.env.COSMOS_ENDPOINT);
   const cosmosKey = firstNonEmpty(process.env.COSMOS_KEY);
   const cosmosDb = firstNonEmpty(process.env.COSMOS_DB, process.env.COSMOS_DATABASE);
-  const cosmosContainer = firstNonEmpty(process.env.COSMOS_CONTAINER, process.env.COSMOS_CONTAINER_PLAYERS);
+  const cosmosContainer = firstNonEmpty(process.env.COSMOS_CONTAINER_PLAYERS);
   const hasCosmosAuth = Boolean(connectionString || (cosmosEndpoint && cosmosKey));
   if (!hasCosmosAuth) {
     missing.push('COSMOS_CONNECTION_STRING|COSMOS_ENDPOINT+COSMOS_KEY');
   }
   if (!cosmosDb) missing.push('COSMOS_DB|COSMOS_DATABASE');
-  if (!cosmosContainer) missing.push('COSMOS_CONTAINER|COSMOS_CONTAINER_PLAYERS');
+  if (!cosmosContainer) missing.push('COSMOS_CONTAINER_PLAYERS');
 
   return missing;
+};
+
+const getMissingAzureRuntimeConfig = () => {
+  return resolveAoaiRuntimeConfig().missing;
+};
+
+const isLlmConfigured = () => {
+  const aoai = resolveAoaiRuntimeConfig();
+  return {
+    ok: aoai.ok,
+    missing: aoai.missing,
+    config: {
+      endpoint: aoai.endpoint,
+      deployment: aoai.deployment,
+      apiVersion: aoai.apiVersion,
+    },
+  };
 };
 
 const logMissingRuntimeConfig = (context, routeName, missing) => {
@@ -193,19 +317,20 @@ const logMissingRuntimeConfig = (context, routeName, missing) => {
   if (loggedMissingConfigByRoute.has(key)) return;
   loggedMissingConfigByRoute.add(key);
   if (typeof context?.log === 'function') {
+    const aoai = resolveAoaiRuntimeConfig();
     context.log(`[${routeName}] missing_config`, {
       missing,
       envPresence: {
-        endpoint: Boolean(firstNonEmpty(process.env.AZURE_OPENAI_ENDPOINT)),
-        apiKey: Boolean(firstNonEmpty(process.env.AZURE_OPENAI_API_KEY, process.env.AZURE_OPENAI_KEY)),
-        deployment: Boolean(firstNonEmpty(process.env.AZURE_OPENAI_DEPLOYMENT, process.env.AOAI_DEPLOYMENT_FAST)),
-        apiVersion: Boolean(firstNonEmpty(process.env.AZURE_OPENAI_API_VERSION)),
+        endpoint: Boolean(aoai.endpoint),
+        apiKey: Boolean(aoai.apiKey),
+        deployment: Boolean(aoai.deployment),
+        apiVersion: Boolean(aoai.apiVersion),
         cosmosAuth: Boolean(
           firstNonEmpty(process.env.COSMOS_CONNECTION_STRING) ||
           (firstNonEmpty(process.env.COSMOS_ENDPOINT) && firstNonEmpty(process.env.COSMOS_KEY))
         ),
         cosmosDb: Boolean(firstNonEmpty(process.env.COSMOS_DB, process.env.COSMOS_DATABASE)),
-        cosmosContainer: Boolean(firstNonEmpty(process.env.COSMOS_CONTAINER, process.env.COSMOS_CONTAINER_PLAYERS)),
+        cosmosContainer: Boolean(firstNonEmpty(process.env.COSMOS_CONTAINER_PLAYERS)),
       },
     });
   }
@@ -213,8 +338,13 @@ const logMissingRuntimeConfig = (context, routeName, missing) => {
 
 module.exports = {
   jsonResponse,
+  optionsResponse,
   normalizeBody,
+  resolveAiExecution,
   tryInvokeDistHandler,
   getMissingRuntimeConfig,
+  getMissingAzureRuntimeConfig,
+  isLlmConfigured,
+  resolveAoaiRuntimeConfig,
   logMissingRuntimeConfig,
 };

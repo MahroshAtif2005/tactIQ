@@ -79,8 +79,9 @@ The goal is not just to show numbers but to guide decisions.
 
 This project runs with:
 
-- **Backend (Azure Functions):** http://localhost:7071  
-- **Frontend (Vite):** http://localhost:5173  
+- **Backend (Azure Functions):** `http://localhost:7071`
+- **Frontend (Vite):** `http://localhost:5173`
+- **Frontend API base:** `/api` (same-origin). Vite proxies `/api` to Functions in local dev.
 
 ---
 
@@ -97,21 +98,18 @@ npm --prefix api install
 
 ## Configure Environment
 
-Edit:
+Set required keys in `api/local.settings.json` under `Values`:
 
-```env
-# api/local.settings.json
-AZURE_OPENAI_API_KEY=your_key
-AZURE_OPENAI_ENDPOINT=https://tactiq-openai.openai.azure.com/
-AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
-AZURE_OPENAI_API_VERSION=2024-02-15-preview
-
-COSMOS_CONNECTION_STRING=your_connection_string
-COSMOS_ENDPOINT=https://tactiq-cosmos.documents.azure.com:443/
-COSMOS_KEY=your_key
-COSMOS_DATABASE=tactiq-db
-COSMOS_CONTAINER_PLAYERS=players
-COSMOS_CONTAINER_USERS=users
+```json
+{
+  "Values": {
+    "AZURE_OPENAI_ENDPOINT": "https://<resource>.openai.azure.com/",
+    "AZURE_OPENAI_API_KEY": "<key>",
+    "AZURE_OPENAI_DEPLOYMENT": "<deployment-name>",
+    "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
+    "CORS_ALLOWED_ORIGINS": "http://localhost:5173"
+  }
+}
 ```
 
 ---
@@ -126,11 +124,7 @@ npm install
 func start
 ```
 
-Backend will run on:
-
-```
-http://localhost:7071
-```
+Backend runs on `http://localhost:7071`.
 
 ---
 
@@ -143,11 +137,7 @@ npm install
 npm run dev
 ```
 
-Frontend will run on:
-
-```
-http://localhost:5173
-```
+Frontend runs on `http://localhost:5173`.
 
 ---
 
@@ -157,10 +147,10 @@ In the root `.env` file (frontend environment):
 
 ```env
 VITE_API_BASE_URL=/api
-VITE_API_TARGET=http://localhost:7071
 ```
 
-Restart Vite after changing environment variables.
+In local dev, Vite proxy forwards `/api/*` to `http://localhost:7071/*`.
+In Azure Static Web Apps deployment, `/api/*` is routed by SWA to Functions.
 
 ---
 
@@ -197,7 +187,7 @@ curl -X POST http://localhost:7071/api/orchestrate \
 
 - Do **not** run any other service on port `7071` while the backend is running.
 - If you modify `.env`, restart the backend and frontend.
-- Frontend calls backend via `VITE_API_BASE_URL`.
+- Frontend should call `/api/*` only (same-origin); do not hardcode `http://localhost:7071` in browser calls.
 
 
                                      ARCHITECTURE (tactIQ)

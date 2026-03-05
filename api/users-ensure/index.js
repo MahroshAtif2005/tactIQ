@@ -1,15 +1,33 @@
 const { ensureUser, getIdentity } = require('../shared/store');
+const { jsonResponse, optionsResponse } = require('../shared/agentRuntime');
 
-const jsonResponse = (status, payload) => ({
-  status,
-  headers: {
-    'Content-Type': 'application/json; charset=utf-8',
-  },
-  body: JSON.stringify(payload),
-});
+const isDemoRequest = (req) =>
+  String(req?.headers?.['x-tactiq-demo'] || req?.headers?.['X-TACTIQ-DEMO'] || '')
+    .trim()
+    .toLowerCase() === 'true';
 
 module.exports = async function usersEnsure(context, req) {
   try {
+    const method = String(req?.method || 'POST').trim().toUpperCase();
+    if (method === 'OPTIONS') {
+      context.res = optionsResponse('POST,OPTIONS', {}, req);
+      return;
+    }
+    if (isDemoRequest(req)) {
+      context.res = jsonResponse(200, {
+        ok: true,
+        id: 'demo-local',
+        userId: 'demo-local',
+        teamId: 'demo-local-team',
+        name: 'Demo Coach',
+        email: 'demo@local',
+        role: 'coach',
+        source: 'demo-local',
+        warning: 'Demo mode uses localStorage only. Cosmos is bypassed.',
+      });
+      return;
+    }
+
     const identity = getIdentity(req);
     if (!identity) {
       context.log.warn('[users/ensure] 401 unauthorized');

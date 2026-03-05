@@ -1,15 +1,11 @@
 
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react-swc';
 import path from 'path';
+const API_PROXY_TARGET = 'http://localhost:7071';
 
-const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '');
-
-export default defineConfig(({ mode }) => {
-    const env = loadEnv(mode, process.cwd(), '');
-    const proxyTarget = trimTrailingSlashes(env.VITE_API_TARGET || 'http://localhost:7071');
-
-    return {
+export default defineConfig(() => {
+  return {
     plugins: [react()],
     resolve: {
       extensions: ['.js', '.jsx', '.ts', '.tsx', '.json'],
@@ -64,7 +60,7 @@ export default defineConfig(({ mode }) => {
       open: true,
       proxy: {
         '/api': {
-          target: proxyTarget,
+          target: API_PROXY_TARGET,
           changeOrigin: true,
           secure: false,
         },

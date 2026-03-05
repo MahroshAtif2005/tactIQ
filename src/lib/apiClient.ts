@@ -1,43 +1,41 @@
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse } from '../types/agents';
 import { Baseline, PlayerBaseline } from '../types/baseline';
 import { isDemoModeEnabled } from '../auth/swaAuth';
+import { ensureDemoRosterSeeded, resetDemoRosterToDefaults } from './rosterStorage';
 
 export type ApiClientErrorKind = 'network' | 'timeout' | 'cors' | 'http' | 'parse';
 export type AgentFrameworkMode = 'route' | 'all';
 
 const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, '');
 const ensureLeadingSlash = (value: string): string => (value.startsWith('/') ? value : `/${value}`);
+const ensureApiSuffix = (value: string): string => (/\/api$/i.test(value) ? value : `${value}/api`);
+const isAbsoluteHttpUrl = (value: string): boolean => /^https?:\/\//i.test(value);
+const API_BASE_LOGGED_KEY = '__TACTIQ_API_BASE_LOGGED__';
 
-const BASE = (String(import.meta.env.VITE_API_BASE_URL || '/api').trim() || '/api').replace(/\/+$/, '');
-export const BASE_URL = BASE || '/api';
-export const apiBaseUrl = BASE_URL;
-const baseEndsWithApi = /\/api$/i.test(BASE_URL);
+const envApiBaseRaw = String(import.meta.env.VITE_API_BASE_URL || '').trim();
+const defaultApiBase = '/api';
+const normalizedEnvBase = trimTrailingSlashes(envApiBaseRaw || defaultApiBase) || defaultApiBase;
+const baseCandidate = isAbsoluteHttpUrl(normalizedEnvBase)
+  ? normalizedEnvBase
+  : ensureLeadingSlash(normalizedEnvBase);
+export const API_BASE_URL = trimTrailingSlashes(
+  ensureApiSuffix(baseCandidate)
+);
+export const BASE_URL = API_BASE_URL;
+export const apiBaseUrl = API_BASE_URL;
+const DEMO_HEADER_ALLOWED = String(import.meta.env.VITE_DEMO || '').trim().toLowerCase() === 'true';
+if (typeof globalThis !== 'undefined' && !(globalThis as Record<string, unknown>)[API_BASE_LOGGED_KEY]) {
+  (globalThis as Record<string, unknown>)[API_BASE_LOGGED_KEY] = true;
+  console.info('[tactIQ] API_BASE_URL =', API_BASE_URL);
+}
 
-const joinUrl = (base: string, path: string): string => {
-  const normalizedBase = trimTrailingSlashes(String(base || '').trim());
-  const normalizedPath = ensureLeadingSlash(path);
-  if (!normalizedBase) return normalizedPath;
-
-  if (!/^https?:\/\//i.test(normalizedBase)) {
-    const relativeBase = ensureLeadingSlash(normalizedBase);
-    if (normalizedPath === relativeBase || normalizedPath.startsWith(`${relativeBase}/`)) {
-      return normalizedPath;
-    }
-    if (relativeBase === '/api' && normalizedPath.startsWith('/api/')) {
-      return normalizedPath;
-    }
-    return `${relativeBase}${normalizedPath}`;
-  }
-
-  return `${normalizedBase}${normalizedPath}`;
-};
 const normalizePathForBase = (path: string): string => {
   const normalizedPath = ensureLeadingSlash(path);
-  if (baseEndsWithApi && normalizedPath === '/api') return '/';
-  if (baseEndsWithApi && normalizedPath.startsWith('/api/')) return normalizedPath.slice(4);
+  if (normalizedPath === '/api') return '';
+  if (normalizedPath.startsWith('/api/')) return normalizedPath.slice(4);
   return normalizedPath;
 };
-const resolveApiUrl = (path: string): string => joinUrl(BASE_URL, normalizePathForBase(path));
+const resolveApiUrl = (path: string): string => `${API_BASE_URL}${normalizePathForBase(path)}`;
 export const apiHealthPath = '/health';
 export const apiLegacyHealthPath = '/health';
 export const apiOrchestratePath = '/orchestrate';
@@ -53,9 +51,10 @@ const fatigueEndpoint = resolveApiUrl('/agents/fatigue');
 const riskEndpoint = resolveApiUrl('/agents/risk');
 const tacticalEndpoint = resolveApiUrl('/agents/tactical');
 const orchestrateEndpoint = apiOrchestrateUrl;
+const aiStatusEndpoint = resolveApiUrl('/ai/status');
 const baselinesEndpoint = resolveApiUrl('/baselines');
 const usersEnsureEndpoint = resolveApiUrl('/users/ensure');
-const copilotChatEndpoint = resolveApiUrl('/api/copilot-chat');
+const copilotChatEndpoint = resolveApiUrl('/copilot-chat');
 const analysisExistsEndpoint = (analysisId: string): string =>
   resolveApiUrl(`/analysis/${encodeURIComponent(String(analysisId || '').trim())}/exists`);
 
@@ -154,8 +153,15 @@ async function requestText(
 
   let response: Response;
   try {
+    const method = String(init.method || 'GET').trim().toUpperCase();
     const requestHeaders = new Headers(init.headers || {});
-    if (isDemoModeEnabled()) {
+    if (!requestHeaders.has('Accept')) {
+      requestHeaders.set('Accept', 'application/json');
+    }
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+      requestHeaders.delete('Content-Type');
+    }
+    if (DEMO_HEADER_ALLOWED && isDemoModeEnabled()) {
       requestHeaders.set('x-tactiq-demo', 'true');
     }
     response = await fetch(url, { ...init, headers: requestHeaders, signal });
@@ -232,18 +238,17 @@ function parseJsonResponse<TResponse>(
   status: number,
   headers?: Headers
 ): TResponse {
-  const snippet = summarizeErrorText(text);
-  const contentType = String(headers?.get('content-type') || '').toLowerCase();
-  if (contentType && !contentType.includes('application/json')) {
+  if (String(text || '').trim().length === 0) {
     throw new ApiClientError({
-      message: `Expected JSON response (status ${status}) but received ${contentType || 'unknown'}${snippet ? `: ${snippet}` : '.'}`,
+      message: `Expected JSON response (status ${status}) but received an empty body.`,
       kind: 'parse',
       url,
       status,
       body: text,
     });
   }
-
+  const snippet = summarizeErrorText(text);
+  const contentType = String(headers?.get('content-type') || '').toLowerCase();
   if (looksLikeHtml(text)) {
     throw new ApiClientError({
       message: `Expected JSON response (status ${status}) but received HTML${snippet ? `: ${snippet}` : '.'}`,
@@ -256,10 +261,12 @@ function parseJsonResponse<TResponse>(
 
   try {
     return JSON.parse(text) as TResponse;
-  } catch (error) {
+  } catch (_error) {
     devWarn('[API] Invalid JSON response', { url, status });
     throw new ApiClientError({
-      message: `Invalid JSON response (status ${status})${snippet ? `: ${snippet}` : '.'}`,
+      message: contentType && !contentType.includes('application/json')
+        ? `Expected JSON response (status ${status}) but received ${contentType || 'unknown'}${snippet ? `: ${snippet}` : '.'}`
+        : `Invalid JSON response (status ${status})${snippet ? `: ${snippet}` : '.'}`,
       kind: 'parse',
       url,
       status,
@@ -346,34 +353,74 @@ function normalizeOrchestrateResponse(raw: unknown): OrchestrateResponse {
   const rawRecord = (raw && typeof raw === 'object') ? (raw as Record<string, unknown>) : {};
   const rawMode = rawRecord.mode;
   const mode: 'auto' | 'full' = rawMode === 'full' ? 'full' : 'auto';
+  const coachOutputRecord =
+    rawRecord.coachOutput && typeof rawRecord.coachOutput === 'object' && !Array.isArray(rawRecord.coachOutput)
+      ? (rawRecord.coachOutput as Record<string, unknown>)
+      : {};
   const message = typeof rawRecord.message === 'string'
     ? rawRecord.message
     : 'Orchestrator fallback response received.';
+  const summary = typeof rawRecord.summary === 'string'
+    ? rawRecord.summary
+    : typeof coachOutputRecord.summary === 'string'
+      ? coachOutputRecord.summary
+      : typeof coachOutputRecord.explanation === 'string'
+        ? coachOutputRecord.explanation
+        : message;
+  const tacticalRecommendation = typeof rawRecord.tacticalRecommendation === 'string'
+    ? rawRecord.tacticalRecommendation
+    : typeof coachOutputRecord.tacticalRecommendation === 'string'
+      ? coachOutputRecord.tacticalRecommendation
+      : typeof coachOutputRecord.recommendation === 'string'
+        ? coachOutputRecord.recommendation
+        : 'Continue with monitored plan';
+  const confidenceCandidate = Number(
+    rawRecord.confidence ??
+    coachOutputRecord.confidence ??
+    0.55
+  );
+  const confidence = Number.isFinite(confidenceCandidate)
+    ? (confidenceCandidate > 1 && confidenceCandidate <= 100 ? confidenceCandidate / 100 : confidenceCandidate)
+    : 0.55;
+  const fallbackAgentOutputs: Record<string, unknown> = {};
+  if (rawRecord.fatigue && typeof rawRecord.fatigue === 'object') fallbackAgentOutputs.fatigue = rawRecord.fatigue;
+  if (rawRecord.risk && typeof rawRecord.risk === 'object') fallbackAgentOutputs.risk = rawRecord.risk;
+  if (rawRecord.tactical && typeof rawRecord.tactical === 'object') fallbackAgentOutputs.tactical = rawRecord.tactical;
 
   return {
+    analysisBundleId: `normalized-${Date.now()}`,
+    summary,
+    tacticalRecommendation,
+    confidence: Math.max(0, Math.min(1, confidence)),
     combinedDecision: {
-      immediateAction: 'Continue with monitored plan',
-      suggestedAdjustments: [message],
-      confidence: 0.55,
-      rationale: 'Normalized from simplified orchestrator payload.',
+      immediateAction: tacticalRecommendation || 'Continue with monitored plan',
+      suggestedAdjustments: [summary || message].filter(Boolean),
+      confidence: Math.max(0, Math.min(1, confidence)),
+      rationale: summary || 'Normalized from simplified orchestrator payload.',
     },
     errors: [],
     agentResults: {
-      fatigue: { status: 'error', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
-      risk: { status: 'error', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
-      tactical: { status: 'error', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
+      fatigue: { status: 'fallback', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
+      risk: { status: 'fallback', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
+      tactical: { status: 'fallback', routedTo: 'rules', error: message, reason: 'normalized-simple-orchestrate-response' },
     },
+    agents: {
+      fatigue: { status: 'FALLBACK' },
+      risk: { status: 'FALLBACK' },
+      tactical: { status: 'FALLBACK' },
+    },
+    agentOutputs: fallbackAgentOutputs,
     meta: {
       requestId: `normalized-${Date.now()}`,
       mode,
-      executedAgents: [],
+      executedAgents: ['fatigue', 'risk', 'tactical'],
       modelRouting: {
         fatigueModel: 'fallback',
         riskModel: 'fallback',
         tacticalModel: 'fallback',
         fallbacksUsed: ['normalized-simple-orchestrate-response'],
       },
-      usedFallbackAgents: [],
+      usedFallbackAgents: ['fatigue', 'risk', 'tactical'],
       timingsMs: {
         total: 1,
       },
@@ -751,7 +798,9 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
   };
 };
 
-const DEMO_BASELINES_STORAGE_KEY = 'tactiq:demoBaselines';
+const DEMO_BASELINES_STORAGE_KEY = 'tactiq_demo_baselines_v1';
+const LEGACY_DEMO_BASELINES_STORAGE_KEY = 'tactiq:demoBaselines';
+const DEMO_SEEDED_STORAGE_KEY = 'tactiq_demo_seeded_v1';
 const DEFAULT_DEMO_BASELINES: Baseline[] = [
   {
     id: 'J. Archer',
@@ -810,6 +859,139 @@ const DEFAULT_DEMO_BASELINES: Baseline[] = [
     inRoster: true,
     orderIndex: 3,
   },
+  {
+    id: 'H. Ali',
+    playerId: 'H. Ali',
+    name: 'H. Ali',
+    role: 'FAST',
+    sleepHoursToday: 7.2,
+    recoveryMinutes: 42,
+    fatigueLimit: 6,
+    controlBaseline: 77,
+    speed: 8,
+    power: 0,
+    sleep: 7.2,
+    recovery: 42,
+    control: 77,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 4,
+  },
+  {
+    id: 'S. Khan',
+    playerId: 'S. Khan',
+    name: 'S. Khan',
+    role: 'SPIN',
+    sleepHoursToday: 7.4,
+    recoveryMinutes: 48,
+    fatigueLimit: 6,
+    controlBaseline: 84,
+    speed: 7,
+    power: 0,
+    sleep: 7.4,
+    recovery: 48,
+    control: 84,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 5,
+  },
+  {
+    id: 'B. Stokes',
+    playerId: 'B. Stokes',
+    name: 'B. Stokes',
+    role: 'AR',
+    sleepHoursToday: 7.0,
+    recoveryMinutes: 50,
+    fatigueLimit: 6,
+    controlBaseline: 76,
+    speed: 7,
+    power: 8,
+    sleep: 7.0,
+    recovery: 50,
+    control: 76,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 6,
+  },
+  {
+    id: 'V. Kohli',
+    playerId: 'V. Kohli',
+    name: 'V. Kohli',
+    role: 'BAT',
+    sleepHoursToday: 7.8,
+    recoveryMinutes: 55,
+    fatigueLimit: 7,
+    controlBaseline: 90,
+    speed: 6,
+    power: 8,
+    sleep: 7.8,
+    recovery: 55,
+    control: 90,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 7,
+  },
+  {
+    id: 'B. Azam',
+    playerId: 'B. Azam',
+    name: 'B. Azam',
+    role: 'BAT',
+    sleepHoursToday: 7.6,
+    recoveryMinutes: 52,
+    fatigueLimit: 7,
+    controlBaseline: 89,
+    speed: 6,
+    power: 7,
+    sleep: 7.6,
+    recovery: 52,
+    control: 89,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 8,
+  },
+  {
+    id: 'K. Williamson',
+    playerId: 'K. Williamson',
+    name: 'K. Williamson',
+    role: 'BAT',
+    sleepHoursToday: 7.7,
+    recoveryMinutes: 54,
+    fatigueLimit: 7,
+    controlBaseline: 88,
+    speed: 6,
+    power: 6,
+    sleep: 7.7,
+    recovery: 54,
+    control: 88,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 9,
+  },
+  {
+    id: 'G. Maxwell',
+    playerId: 'G. Maxwell',
+    name: 'G. Maxwell',
+    role: 'AR',
+    sleepHoursToday: 7.3,
+    recoveryMinutes: 47,
+    fatigueLimit: 6,
+    controlBaseline: 74,
+    speed: 6,
+    power: 9,
+    sleep: 7.3,
+    recovery: 47,
+    control: 74,
+    active: true,
+    isActive: true,
+    inRoster: true,
+    orderIndex: 10,
+  },
 ];
 
 const cloneDemoBaselines = (rows: Baseline[]): Baseline[] => rows.map((entry) => ({ ...entry }));
@@ -818,13 +1000,37 @@ const readDemoBaselines = (): Baseline[] => {
   if (typeof window === 'undefined') return cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
   try {
     const raw = window.localStorage.getItem(DEMO_BASELINES_STORAGE_KEY);
-    if (!raw) return cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
-    const parsed = JSON.parse(raw);
+    const legacyRaw = raw ? null : window.localStorage.getItem(LEGACY_DEMO_BASELINES_STORAGE_KEY);
+    const candidateRaw = raw || legacyRaw;
+    const seededFlag = String(window.localStorage.getItem(DEMO_SEEDED_STORAGE_KEY) || '').trim().toLowerCase() === 'true';
+    if (!candidateRaw) {
+      const seeded = cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+      writeDemoBaselines(seeded);
+      window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
+      return seeded;
+    }
+    const parsed = JSON.parse(candidateRaw);
     const rows = Array.isArray(parsed) ? parsed : [];
     const normalized = rows.map(normalizeBaseline).filter((entry): entry is Baseline => Boolean(entry));
-    return normalized.length > 0 ? normalized : cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+    if (normalized.length > 0 && seededFlag) {
+      if (legacyRaw) {
+        writeDemoBaselines(normalized);
+      }
+      return normalized;
+    }
+    const seeded = cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+    writeDemoBaselines(seeded);
+    window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
+    return seeded;
   } catch {
-    return cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+    const seeded = cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+    writeDemoBaselines(seeded);
+    try {
+      window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
+    } catch {
+      // Ignore storage failures in restricted browser modes.
+    }
+    return seeded;
   }
 };
 
@@ -832,14 +1038,28 @@ const writeDemoBaselines = (rows: Baseline[]): void => {
   if (typeof window === 'undefined') return;
   try {
     window.localStorage.setItem(DEMO_BASELINES_STORAGE_KEY, JSON.stringify(rows));
+    window.localStorage.removeItem(LEGACY_DEMO_BASELINES_STORAGE_KEY);
   } catch {
     // Ignore storage failures in restricted browser modes.
   }
 };
 
+export const ensureDemoBaselinesSeeded = (): Baseline[] => {
+  const rows = readDemoBaselines();
+  ensureDemoRosterSeeded();
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
+    } catch {
+      // Ignore storage failures in restricted browser modes.
+    }
+  }
+  return rows;
+};
+
 export async function getBaselinesWithMeta(signal?: AbortSignal): Promise<BaselinesResponse> {
   if (isDemoModeEnabled()) {
-    const baselines = readDemoBaselines();
+    const baselines = ensureDemoBaselinesSeeded();
     return { baselines, source: 'fallback', warning: 'Demo mode: local data only (no Cosmos writes).' };
   }
   const raw = await getJson<unknown>(baselinesEndpoint, signal);
@@ -850,8 +1070,22 @@ export async function getBaselinesWithMeta(signal?: AbortSignal): Promise<Baseli
 
   if (raw && typeof raw === 'object') {
     const record = raw as Record<string, unknown>;
+    if (record.ok === false) {
+      const message = typeof record.message === 'string' && record.message.trim().length > 0
+        ? record.message
+        : 'Failed to load baselines.';
+      throw new ApiClientError({
+        message,
+        kind: 'http',
+        url: baselinesEndpoint,
+        status: 500,
+        body: JSON.stringify(record),
+      });
+    }
     const rows = Array.isArray(record.players)
       ? record.players
+      : Array.isArray(record.items)
+        ? record.items
       : Array.isArray(record.baselines)
         ? record.baselines
         : [];
@@ -1003,7 +1237,24 @@ export async function updateBaseline(
 
 export async function resetBaselines(signal?: AbortSignal): Promise<void> {
   if (isDemoModeEnabled()) {
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.removeItem(DEMO_BASELINES_STORAGE_KEY);
+        window.localStorage.removeItem(LEGACY_DEMO_BASELINES_STORAGE_KEY);
+        window.localStorage.removeItem(DEMO_SEEDED_STORAGE_KEY);
+      } catch {
+        // Ignore storage failures in restricted browser modes.
+      }
+    }
     writeDemoBaselines(cloneDemoBaselines(DEFAULT_DEMO_BASELINES));
+    resetDemoRosterToDefaults();
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
+      } catch {
+        // Ignore storage failures in restricted browser modes.
+      }
+    }
     return;
   }
   await postJson<{ ok: boolean; deleted: number }>(`${baselinesEndpoint}/reset`, {}, signal);
@@ -1012,40 +1263,52 @@ export async function resetBaselines(signal?: AbortSignal): Promise<void> {
 export async function checkHealth(
   signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
-  const request = async (url: string) => requestText(
-    url,
-    {
-      method: 'GET',
-      signal,
-    },
-    { timeoutMs: 6000 }
-  );
+  const request = async (url: string) =>
+    requestText(
+      url,
+      {
+        method: 'GET',
+        signal,
+      },
+      { timeoutMs: 6000 }
+    );
 
-  let text: string;
+  let response: { status: number; text: string; headers: Headers };
   try {
-    ({ text } = await request(apiHealthUrl));
+    response = await request(apiHealthUrl);
   } catch (error) {
     if (error instanceof ApiClientError && error.status === 404 && apiHealthUrl !== apiLegacyHealthUrl) {
-      ({ text } = await request(apiLegacyHealthUrl));
+      response = await request(apiLegacyHealthUrl);
     } else {
       throw error;
     }
   }
 
-  if (!text.trim()) {
-    return { status: 'ok' };
-  }
-
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === 'object') {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // Health endpoint reachability is what matters for preflight.
-  }
-
-  return { status: 'ok', raw: text };
+  const parsed = parseJsonResponse<unknown>(response.text, apiHealthUrl, response.status, response.headers);
+  if (parsed && typeof parsed === 'object') return parsed as Record<string, unknown>;
+  return { ok: true };
 }
 
 export const getApiHealth = checkHealth;
+
+export interface AiStatusResponse {
+  ok?: boolean;
+  azureOpenAIConfigured: boolean;
+  missing?: string[];
+}
+
+export async function getAiStatus(signal?: AbortSignal): Promise<AiStatusResponse> {
+  const raw = await getJson<unknown>(aiStatusEndpoint, signal);
+  if (!raw || typeof raw !== 'object') {
+    return { ok: false, azureOpenAIConfigured: false };
+  }
+  const record = raw as Record<string, unknown>;
+  const missing = Array.isArray(record.missing)
+    ? record.missing.map((entry) => String(entry || '').trim()).filter(Boolean)
+    : undefined;
+  return {
+    ok: typeof record.ok === 'boolean' ? record.ok : true,
+    azureOpenAIConfigured: Boolean(record.azureOpenAIConfigured),
+    ...(missing && missing.length > 0 ? { missing } : {}),
+  };
+}

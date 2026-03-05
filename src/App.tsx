@@ -50,9 +50,10 @@ import {
   apiHealthUrl,
   apiOrchestrateUrl,
   checkHealth,
-  checkAnalysisExists,
   deleteBaseline,
+  ensureDemoBaselinesSeeded,
   ensureCoachUserProfile,
+  getAiStatus,
   getBaselineByPlayerId,
   getBaselinesWithMeta,
   postFatigueAgent,
@@ -63,7 +64,14 @@ import {
   saveBaselines,
 } from './lib/apiClient';
 import CopilotChatPanel from './components/CopilotChatPanel';
-import { getRosterIds, removeFromRosterSession, ROSTER_STORAGE_KEY, setBaselineDraftCache, setRosterIds } from './lib/rosterStorage';
+import {
+  DEMO_ROSTER_STORAGE_KEY,
+  getRosterIds,
+  removeFromRosterSession,
+  ROSTER_STORAGE_KEY,
+  setBaselineDraftCache,
+  setRosterIds,
+} from './lib/rosterStorage';
 import { buildMatchContext, summarizeMatchContext } from './lib/buildMatchContext';
 import { Baseline, BaselineRole } from './types/baseline';
 import AuthPage from './pages/AuthPage';
@@ -224,6 +232,7 @@ interface AgentFeedStatus {
 interface OrchestrateMetaView {
   analysisId?: string;
   mode: 'auto' | 'full';
+  responseMode?: 'demo' | 'live' | 'fallback';
   executedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
   usedFallbackAgents: Array<'fatigue' | 'risk' | 'tactical'>;
   routerFallbackMessage?: string;
@@ -250,6 +259,13 @@ interface SuggestedBowlerRecommendation {
 interface RunCoachAgentResult {
   response: OrchestrateResponse;
   suggestedBowler: SuggestedBowlerRecommendation | null;
+}
+
+interface CoachOutputView {
+  summary: string;
+  tacticalRecommendation: string;
+  confidence: number;
+  agentOutputs: Record<string, unknown>;
 }
 
 interface RouterDecisionView {
@@ -1050,6 +1066,8 @@ const isDemoPath = (value: unknown): boolean => {
 
 const toRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+const hasAnyKeys = (value: unknown): boolean =>
+  value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value as Record<string, unknown>).length > 0;
 
 const AGENT_KEYS: AgentKey[] = ['fatigue', 'risk', 'tactical'];
 
@@ -1432,7 +1450,7 @@ const RECOVERY_RATE_BY_HRR: Record<RecoveryLevel, number> = {
   Moderate: 0.02,
   Poor: 0.01,
 };
-const SWA_CLI_COMMAND = 'swa start http://localhost:5173 --api-location http://localhost:7071';
+const SWA_CLI_COMMAND = 'swa start http://localhost:5173 --api-location ./api';
 
 // --- Main App Component ---
 
@@ -1458,6 +1476,8 @@ export default function App() {
   const [showSplash, setShowSplash] = useState(() => !isAuthPathOnLoad);
   const [authLocalHint, setAuthLocalHint] = useState<string | null>(null);
   const [copiedSwaCommand, setCopiedSwaCommand] = useState(false);
+  const [azureOpenAIConfigured, setAzureOpenAIConfigured] = useState<boolean>(false);
+  const [aiStatusLoaded, setAiStatusLoaded] = useState<boolean>(false);
   const [page, setPage] = useState<Page>(() => (isDemoPath(initialPath) ? 'dashboard' : 'landing'));
   const [matchContext, setMatchContext] = useState<MatchContext>({
     matchMode: initialStoredMatchMode ?? 'BOWLING',
@@ -1492,6 +1512,8 @@ export default function App() {
   const [agentFeedStatus, setAgentFeedStatus] = useState<AgentFeedStatus>(() => getDefaultAgentFeedStatus());
   const [analysisActive, setAnalysisActive] = useState(false);
   const [analysisRequested, setAnalysisRequested] = useState(false);
+  const [analysisBundleId, setAnalysisBundleId] = useState('');
+  const [coachOutput, setCoachOutput] = useState<CoachOutputView | null>(null);
   const [recoveryMode, setRecoveryMode] = useState<RecoveryMode>('auto');
   const [manualRecovery, setManualRecovery] = useState<RecoveryLevel>('Moderate');
   const [baselineSource, setBaselineSource] = useState<'cosmos' | 'fallback'>('fallback');
@@ -1508,6 +1530,7 @@ export default function App() {
   const profileMenuRef = useRef<HTMLDivElement | null>(null);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
+  const aiStatusInitRef = useRef(false);
   const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previousActivePlayerIdRef = useRef<string | null>(null);
   const baselineCacheRef = useRef<Map<string, Baseline>>(new Map());
@@ -1517,9 +1540,51 @@ export default function App() {
     const host = String(window.location.hostname || '').toLowerCase();
     return host === 'localhost' || host === '127.0.0.1';
   }, []);
+  const isDemoDataMode = useMemo(() => {
+    if (typeof window === 'undefined') return demoMode;
+    const onDemoRoute = isDemoPath(window.location.pathname || '');
+    return onDemoRoute || demoMode;
+  }, [demoMode]);
+  const demoAiOptInForDeployed = useMemo(() => {
+    const raw = String(import.meta.env.VITE_DEMO_AI_ENABLED || import.meta.env.VITE_ENABLE_DEMO_AI || '').trim().toLowerCase();
+    return raw === 'true' || raw === '1' || raw === 'yes';
+  }, []);
+  const aiEnabled = useMemo(() => {
+    const configured = aiStatusLoaded ? azureOpenAIConfigured : true;
+    if (isLocalAuthHost) return configured;
+    if (isDemoDataMode) return demoAiOptInForDeployed && configured;
+    return configured;
+  }, [aiStatusLoaded, azureOpenAIConfigured, isLocalAuthHost, isDemoDataMode, demoAiOptInForDeployed]);
   const canUseLocalDemo = useMemo(() => {
     return isLocalAuthHost;
   }, [isLocalAuthHost]);
+
+  useEffect(() => {
+    if (aiStatusInitRef.current) return;
+    aiStatusInitRef.current = true;
+    let cancelled = false;
+    const controller = new AbortController();
+    void getAiStatus(controller.signal)
+      .then((status) => {
+        if (cancelled) return;
+        setAzureOpenAIConfigured(Boolean(status.azureOpenAIConfigured));
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        if (import.meta.env.DEV) {
+          console.warn('[ai][status] unavailable, defaulting to fallback', error);
+        }
+        setAzureOpenAIConfigured(false);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setAiStatusLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, []);
 
   useEffect(() => {
     matchRosterIdsRef.current = matchRosterIds;
@@ -1565,7 +1630,7 @@ export default function App() {
   }, [isProfileOpen]);
 
   useEffect(() => {
-    if (!canUseLocalDemo && demoMode) {
+    if (!canUseLocalDemo && demoMode && typeof window !== 'undefined' && !isDemoPath(window.location.pathname || '')) {
       setDemoModeEnabled(false);
       setDemoMode(false);
     }
@@ -1576,6 +1641,9 @@ export default function App() {
     const path = String(window.location.pathname || '');
     const onAuthPath = isAuthPath(path);
     const onDemoPath = isDemoPath(path);
+    if (onDemoPath) {
+      ensureDemoBaselinesSeeded();
+    }
     if (onDemoPath && !demoMode) {
       setDemoModeEnabled(true);
       setDemoMode(true);
@@ -1820,7 +1888,13 @@ export default function App() {
           console.warn('[roster-sync] fetch failed', { requestId, error });
         }
         setBaselineSource('fallback');
-        setBaselineWarning('Failed to load baseline players from backend.');
+        if (error instanceof ApiClientError && (error.status === 401 || error.status === 403)) {
+          setBaselineWarning('Sign in with Microsoft to load player baselines.');
+        } else if (error instanceof ApiClientError && error.status === 500) {
+          setBaselineWarning('Baselines service is unavailable. Check Functions env configuration.');
+        } else {
+          setBaselineWarning('Failed to load baseline players from backend.');
+        }
       } finally {
         if (requestId === rosterLoadRequestIdRef.current) {
           setIsLoadingRosterPlayers(false);
@@ -2273,7 +2347,7 @@ export default function App() {
     };
 
     const handleStorage = (event: StorageEvent) => {
-      if (event.key && event.key !== ROSTER_STORAGE_KEY) return;
+      if (event.key && event.key !== ROSTER_STORAGE_KEY && event.key !== DEMO_ROSTER_STORAGE_KEY) return;
       syncRosterFromLocalStorage();
     };
 
@@ -2563,6 +2637,8 @@ export default function App() {
     setFinalRecommendation(null);
     setOrchestrateMeta(null);
     setRouterDecision(null);
+    setAnalysisBundleId('');
+    setCoachOutput(null);
     let requestInFlight = false;
     const startRequest = () => {
       if (requestInFlight) return;
@@ -2689,6 +2765,8 @@ export default function App() {
       return null;
     }
     const payload = {
+      dataMode: demoMode ? 'demo' : 'live',
+      llmMode: 'ai',
       context: fullMatchContext,
       teamMode,
       focusRole,
@@ -2858,18 +2936,86 @@ export default function App() {
         risk: buildModelRouterEntry('risk'),
         tactical: buildModelRouterEntry('tactical'),
       };
+      const hasAnyImmediateOutput = Boolean(
+        fatigueMapped ||
+        riskMapped ||
+        tacticalMapped ||
+        result.strategicAnalysis ||
+        result.combinedDecision ||
+        result.combinedBriefing
+      );
+      const outputRecordForAnalysisId = toRecord((result as unknown as Record<string, unknown>).outputs);
+      const agentResultsRecordForAnalysisId = toRecord((result as unknown as Record<string, unknown>).agentResults);
+      const hasStructuredAgentOutput = Object.keys(outputRecordForAnalysisId).length > 0 || Object.keys(agentResultsRecordForAnalysisId).length > 0;
       const analysisIdFromResult = String(result.analysisId || result.meta?.analysisId || '').trim();
-      if (analysisIdFromResult && typeof window !== 'undefined') {
+      const analysisBundleIdFromResult = String(result.analysisBundleId || '').trim();
+      const fallbackAnalysisSeed = String(result.meta?.requestId || result.traceId || activePlayer?.id || Date.now()).trim();
+      const resolvedAnalysisId = analysisBundleIdFromResult || analysisIdFromResult || ((hasAnyImmediateOutput || hasStructuredAgentOutput)
+        ? `local-${fallbackAnalysisSeed || Date.now()}`
+        : '');
+      if (resolvedAnalysisId && typeof window !== 'undefined') {
         try {
-          window.localStorage.setItem(COPILOT_ANALYSIS_ID_STORAGE_KEY, analysisIdFromResult);
+          window.localStorage.setItem(COPILOT_ANALYSIS_ID_STORAGE_KEY, resolvedAnalysisId);
           window.localStorage.setItem(COPILOT_ANALYSIS_AT_STORAGE_KEY, String(Date.now()));
         } catch {
           // Ignore local storage failures in restricted browser modes.
         }
       }
+      if (resolvedAnalysisId) {
+        setCopilotSessionAnalysisId(resolvedAnalysisId);
+        setCopilotVerifiedAnalysisId(resolvedAnalysisId);
+      }
+      setAnalysisBundleId(resolvedAnalysisId);
+      const summaryText = [
+        typeof result.summary === 'string' ? result.summary : '',
+        typeof result.combinedBriefing === 'string' ? result.combinedBriefing : '',
+        typeof result.strategicAnalysis?.fatigueAnalysis === 'string' ? result.strategicAnalysis.fatigueAnalysis : '',
+        typeof result.tactical?.rationale === 'string' ? result.tactical.rationale : '',
+        typeof result.combinedDecision?.rationale === 'string' ? result.combinedDecision.rationale : '',
+      ].map((value) => value.trim()).find((value) => value.length > 0) || '';
+      const tacticalRecommendationText = [
+        typeof result.tacticalRecommendation === 'string' ? result.tacticalRecommendation : '',
+        typeof result.strategicAnalysis?.tacticalRecommendation?.nextAction === 'string'
+          ? result.strategicAnalysis.tacticalRecommendation.nextAction
+          : '',
+        typeof result.tactical?.immediateAction === 'string' ? result.tactical.immediateAction : '',
+        typeof result.combinedDecision?.immediateAction === 'string' ? result.combinedDecision.immediateAction : '',
+      ].map((value) => value.trim()).find((value) => value.length > 0) || '';
+      const confidence = (() => {
+        const candidates = [result.confidence, result.combinedDecision?.confidence, result.tactical?.confidence];
+        for (const candidate of candidates) {
+          const parsed = Number(candidate);
+          if (!Number.isFinite(parsed)) continue;
+          const normalized = parsed > 1 && parsed <= 100 ? parsed / 100 : parsed;
+          return Math.max(0, Math.min(1, normalized));
+        }
+        return 0.62;
+      })();
+      const outputsRecord = toRecord(result.agentOutputs as unknown);
+      const resolvedAgentOutputs = {
+        ...(hasAnyKeys(outputsRecord) ? outputsRecord : {}),
+        ...(!hasAnyKeys(outputsRecord.fatigue) && result.fatigue ? { fatigue: result.fatigue } : {}),
+        ...(!hasAnyKeys(outputsRecord.risk) && result.risk ? { risk: result.risk } : {}),
+        ...(!hasAnyKeys(outputsRecord.tactical) && result.tactical ? { tactical: result.tactical } : {}),
+      };
+      setCoachOutput({
+        summary: summaryText,
+        tacticalRecommendation: tacticalRecommendationText,
+        confidence,
+        agentOutputs: resolvedAgentOutputs,
+      });
+      const routingModeToken = String((result as unknown as Record<string, unknown>).routingMode || '').trim().toLowerCase();
+      const responseModeToken = routingModeToken || String((result as unknown as Record<string, unknown>).mode || '').trim().toLowerCase();
+      const responseMode: 'demo' | 'live' | 'fallback' | undefined =
+        responseModeToken === 'demo' || responseModeToken === 'live' || responseModeToken === 'fallback'
+          ? responseModeToken
+          : responseModeToken === 'ai'
+            ? 'live'
+          : undefined;
       setOrchestrateMeta({
-        analysisId: analysisIdFromResult || undefined,
+        analysisId: resolvedAnalysisId || undefined,
         mode: result.meta.mode,
+        responseMode,
         executedAgents: result.meta.executedAgents,
         usedFallbackAgents: result.meta.usedFallbackAgents || [],
         routerFallbackMessage: typeof result.meta.routerFallbackMessage === 'string' ? result.meta.routerFallbackMessage : undefined,
@@ -2927,16 +3073,50 @@ export default function App() {
         return Object.keys(data).length > 0;
       };
       const normalizeAgentStatusToken = (value: unknown): string => String(value || '').trim().toUpperCase();
+      const hasFallbackPayload = Boolean(
+        hasAnyImmediateOutput ||
+        result.strategicAnalysis ||
+        result.combinedDecision ||
+        (typeof result.combinedBriefing === 'string' && result.combinedBriefing.trim().length > 0)
+      );
+      const fallbackReasonRegex =
+        /(fallback|rules|orchestrate_exception|openai_error|agent_http_error|missing[_\s-]?config|missing env|azure env missing|model unavailable|backend_not_ready|temporary issue)/i;
       const deriveFeedStatus = (agent: AgentKey): AgentFeedState => {
+        const agentResult = result.agentResults?.[agent];
         const serverStatus = normalizeAgentStatusToken(result.agents?.[agent]?.status);
-        const routeStatus = String(result.agentResults?.[agent]?.status || '').trim().toLowerCase();
+        const routeStatus = String(agentResult?.status || '').trim().toLowerCase();
+        const routeReason = String(agentResult?.reason || agentResult?.error || '').trim().toLowerCase();
+        const routerReason = String(result.routerDecision?.reason || result.meta.routerFallbackMessage || '').trim().toLowerCase();
+        const routeChoice = String(agentResult?.routedTo || '').trim().toLowerCase();
         const errored = result.errors.some((entry) => entry.agent === agent);
+        const hasFallbackSignal =
+          Array.isArray(result.meta.usedFallbackAgents) && result.meta.usedFallbackAgents.includes(agent);
+        const fallbackRoutingActive =
+          hasFallbackSignal ||
+          routeChoice === 'rules' ||
+          serverStatus === 'FALLBACK' ||
+          routeStatus === 'fallback' ||
+          Boolean(result.meta.routerFallbackMessage) ||
+          (Array.isArray(result.meta.modelRouting?.fallbacksUsed) && result.meta.modelRouting.fallbacksUsed.length > 0) ||
+          fallbackReasonRegex.test(routeReason) ||
+          fallbackReasonRegex.test(routerReason);
+        if (routeReason.includes('not_selected_by_auto_router') || routeReason.includes('disabled_by_request')) {
+          return 'SKIPPED';
+        }
         if (serverStatus === 'FALLBACK' || routeStatus === 'fallback') return 'FALLBACK';
+        if (routeChoice === 'rules' && (hasAgentOutput(agent) || hasFallbackPayload)) return 'FALLBACK';
         if (hasAgentOutput(agent) || serverStatus === 'OK' || serverStatus === 'SUCCESS' || routeStatus === 'success') {
           return 'SUCCESS';
         }
         if (!selectedAgentSet.has(agent)) return 'SKIPPED';
-        if (errored || serverStatus === 'ERROR' || routeStatus === 'error') return 'ERROR';
+        if (errored || serverStatus === 'ERROR' || routeStatus === 'error') {
+          if (fallbackRoutingActive && hasFallbackPayload) return 'FALLBACK';
+          return 'ERROR';
+        }
+        if (fallbackRoutingActive && hasFallbackPayload) {
+          return 'FALLBACK';
+        }
+        if (demoMode && hasFallbackPayload) return 'FALLBACK';
         return 'ERROR';
       };
       setAgentFeedStatus({
@@ -2966,7 +3146,15 @@ export default function App() {
       const responseWarnings = Array.isArray(result.warnings)
         ? result.warnings.map((entry) => sanitizeUiNotice(entry)).filter(Boolean).join(' | ')
         : null;
-      const warning = [responseWarnings, errorNotice, sanitizeUiNotice(options?.extraWarning)]
+      const routingReasons = Array.isArray(result.reasons)
+        ? result.reasons.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean)
+        : [];
+      const llmFallbackWarning = routingReasons.includes('missing_aoai_config')
+        ? 'Azure OpenAI is not configured; showing fallback analysis.'
+        : routingReasons.includes('upstream_unavailable')
+          ? 'Azure OpenAI is temporarily unavailable; showing fallback analysis.'
+          : null;
+      const warning = [llmFallbackWarning, responseWarnings, errorNotice, sanitizeUiNotice(options?.extraWarning)]
         .filter(Boolean)
         .join(' | ') || null;
       const hasAnyAgentOutput =
@@ -3029,6 +3217,8 @@ export default function App() {
     };
 
     const toErrorReason = (error: unknown): string => {
+      if (error instanceof Error && error.message === 'ai_disabled_by_policy') return 'ai_disabled_by_policy';
+      if (error instanceof Error && error.message === 'ai_not_configured') return 'missing_config';
       if (error instanceof ApiClientError) {
         if (error.kind === 'timeout' || error.kind === 'network' || error.kind === 'cors') return 'openai_error';
         if (error.kind === 'http' || error.kind === 'parse') return 'agent_http_error';
@@ -3180,6 +3370,8 @@ export default function App() {
       const runRisk = selectedSet.has('risk');
       const runTactical = selectedSet.has('tactical');
       const fatigueRequest = {
+        dataMode: payload.dataMode,
+        llmMode: payload.llmMode,
         playerId: String(payload.telemetry?.playerId || 'UNKNOWN'),
         playerName: String(payload.telemetry?.playerName || 'Unknown Player'),
         role: String(payload.telemetry?.role || 'Unknown Role'),
@@ -3204,6 +3396,8 @@ export default function App() {
       };
 
       const tacticalRequest = {
+        dataMode: payload.dataMode,
+        llmMode: payload.llmMode,
         requestId: `coach-auto-tactical-${Date.now()}`,
         intent: payload.intent,
         teamMode: payload.teamMode,
@@ -3246,6 +3440,8 @@ export default function App() {
       const fatigueOutput = fatigueResult.output || buildRulesFatigueFallback();
 
       const riskRequest = {
+        dataMode: payload.dataMode,
+        llmMode: payload.llmMode,
         playerId: String(payload.telemetry?.playerId || 'UNKNOWN'),
         fatigueIndex: safeNum(fatigueOutput.echo?.fatigueIndex, safeNum(payload.telemetry?.fatigueIndex, 0)),
         injuryRisk: normalizeRiskToken(payload.telemetry?.injuryRisk),
@@ -3360,8 +3556,10 @@ export default function App() {
         .filter((entry) => selectedSet.has(entry.key) && entry.value.routedTo === 'rules')
         .map((entry) => entry.key);
 
+      const fallbackRequestId = `coach-auto-fallback-${Date.now()}`;
       return {
         ok: true,
+        analysisId: fallbackRequestId,
         ...(runFatigue ? { fatigue: fatigueOutput } : {}),
         ...(runRisk ? { risk: riskOutput } : {}),
         ...(runTactical ? { tactical: tacticalOutput } : {}),
@@ -3448,7 +3646,7 @@ export default function App() {
           },
         },
         meta: {
-          requestId: `coach-auto-fallback-${Date.now()}`,
+          requestId: fallbackRequestId,
           mode: 'auto',
           executedAgents: selectedAgents,
           modelRouting: {
@@ -3476,6 +3674,13 @@ export default function App() {
         if (import.meta.env.DEV) {
           console.warn('COACH_ANALYSIS_HEALTH_CHECK_FAILED', healthError);
         }
+      }
+
+      if (!aiEnabled) {
+        if (isDemoDataMode && !isLocalAuthHost && !demoAiOptInForDeployed) {
+          throw new Error('ai_disabled_by_policy');
+        }
+        throw new Error('ai_not_configured');
       }
 
       if (mode === 'full') {
@@ -3522,16 +3727,140 @@ export default function App() {
     } catch (error) {
       if ((error as Error)?.name === 'AbortError') return null;
       if (requestId !== fatigueRequestSeq.current) return null;
-      setAgentFeedStatus((prev) => ({
-        fatigue: prev.fatigue === 'RUNNING' ? 'ERROR' : prev.fatigue,
-        risk: prev.risk === 'RUNNING' ? 'ERROR' : prev.risk,
-        tactical: prev.tactical === 'RUNNING' ? 'ERROR' : prev.tactical,
-      }));
-      setAgentWarning(null);
-      setAgentFailure(toAgentFailureDetail(error, orchestrateRequestUrl));
-      setAgentState('offline');
-      setAnalysisActive(false);
-      return null;
+      const fallbackCode = error instanceof Error ? error.message : '';
+      const fallbackMessage =
+        fallbackCode === 'ai_disabled_by_policy'
+          ? 'Routing: rules-based (demo fallback)'
+          : fallbackCode === 'ai_not_configured'
+            ? 'Routing: rules-based (Azure OpenAI not configured)'
+            : 'Routing: rules-based (safe fallback)';
+      const fallbackFatigue = buildRulesFatigueFallback();
+      const fallbackRisk = buildRulesRiskFallback(
+        safeNum(fallbackFatigue.echo?.fatigueIndex, safeNum(payload.telemetry?.fatigueIndex, 0))
+      );
+      const fallbackTactical = buildRulesTacticalFallback(fallbackFatigue, fallbackRisk, fallbackMessage);
+      const fallbackAnalysisId = `local-fallback-${Date.now()}`;
+      const fallbackSignals = Array.from(
+        new Set([
+          ...(fallbackFatigue.signals || []),
+          ...(fallbackRisk.signals || []),
+          ...(fallbackTactical.keySignalsUsed || []),
+          `fallback_reason:${toErrorReason(error)}`,
+        ])
+      ).slice(0, 8);
+      const fallbackCombinedDecision: TacticalCombinedDecision = {
+        immediateAction: String(fallbackTactical.immediateAction || 'Continue with monitored plan'),
+        suggestedAdjustments: Array.isArray(fallbackTactical.suggestedAdjustments)
+          ? fallbackTactical.suggestedAdjustments.map((entry) => String(entry)).filter(Boolean).slice(0, 4)
+          : [],
+        confidence: Number.isFinite(Number(fallbackTactical.confidence)) ? Number(fallbackTactical.confidence) : 0.62,
+        rationale: String(fallbackTactical.rationale || fallbackMessage),
+      };
+      const fallbackStrategicAnalysis: NonNullable<OrchestrateResponse['strategicAnalysis']> = {
+        signals: fallbackSignals,
+        fatigueAnalysis: String(
+          fallbackFatigue.recommendation || fallbackFatigue.explanation || 'Fatigue signal reviewed via rules fallback.'
+        ),
+        injuryRiskAnalysis: String(
+          fallbackRisk.recommendation || fallbackRisk.explanation || 'Risk signal reviewed via rules fallback.'
+        ),
+        tacticalRecommendation: {
+          nextAction: String(fallbackTactical.nextAction || fallbackTactical.immediateAction || 'Continue with monitored plan'),
+          why: String(fallbackTactical.rationale || fallbackMessage),
+          ifIgnored: String(fallbackTactical.ifIgnored || 'Execution risk may increase if no adjustment is made.'),
+          alternatives: Array.isArray(fallbackTactical.suggestedAdjustments)
+            ? fallbackTactical.suggestedAdjustments.map((entry) => String(entry)).filter(Boolean).slice(0, 3)
+            : [],
+        },
+        coachNote: 'Rules fallback active: model response unavailable.',
+      };
+      const fallbackResponse: OrchestrateResponse = {
+        ok: true,
+        analysisId: fallbackAnalysisId,
+        fatigue: fallbackFatigue,
+        risk: fallbackRisk,
+        tactical: fallbackTactical,
+        strategicAnalysis: fallbackStrategicAnalysis,
+        combinedBriefing:
+          `${fallbackCombinedDecision.immediateAction} ${fallbackCombinedDecision.rationale}`.trim(),
+        finalDecision: fallbackCombinedDecision,
+        combinedDecision: fallbackCombinedDecision,
+        errors: [],
+        agents: {
+          fatigue: { status: 'FALLBACK' },
+          risk: { status: 'FALLBACK' },
+          tactical: { status: 'FALLBACK' },
+        },
+        agentResults: {
+          fatigue: { status: 'fallback', routedTo: 'rules', output: fallbackFatigue, reason: 'rules_fallback' },
+          risk: { status: 'fallback', routedTo: 'rules', output: fallbackRisk, reason: 'rules_fallback' },
+          tactical: { status: 'fallback', routedTo: 'rules', output: fallbackTactical, reason: 'rules_fallback' },
+        },
+        routerDecision: {
+          mode: requestMode,
+          intent: 'General',
+          reason: fallbackMessage,
+          rationale: fallbackMessage,
+          selectedAgents: ['fatigue', 'risk', 'tactical'],
+          agentsToRun: ['FATIGUE', 'RISK', 'TACTICAL'],
+          rulesFired: ['rules_fallback', `error:${toErrorReason(error)}`],
+          signalSummaryBullets: fallbackSignals,
+          inputsUsed: {
+            activePlayerId: String(payload.telemetry?.playerId || ''),
+            active: {
+              fatigueIndex: safeNum(fallbackFatigue.echo?.fatigueIndex, safeNum(payload.telemetry?.fatigueIndex, 0)),
+              strainIndex: safeNum(payload.telemetry?.strainIndex, 0),
+              injuryRisk: String(fallbackRisk.echo?.injuryRisk || payload.telemetry?.injuryRisk || ''),
+              noBallRisk: String(fallbackRisk.echo?.noBallRisk || payload.telemetry?.noBallRisk || ''),
+            },
+            match: {
+              matchMode: String(payload.matchContext?.matchMode || payload.matchContext?.teamMode || ''),
+              format: String(payload.matchContext?.format || ''),
+              phase: String(payload.matchContext?.phase || ''),
+              overs: safeNum(payload.matchContext?.overs, 0),
+              balls: safeNum(payload.matchContext?.balls, 0),
+              scoreRuns: safeNum(payload.matchContext?.score, 0),
+              wickets: safeNum(payload.matchContext?.wickets, 0),
+              targetRuns: safeNum(payload.matchContext?.target, 0),
+              intensity: String(payload.matchContext?.intensity || ''),
+            },
+          },
+          agents: {
+            fatigue: { routedTo: 'rules', reason: 'rules_fallback' },
+            risk: { routedTo: 'rules', reason: 'rules_fallback' },
+            tactical: { routedTo: 'rules', reason: 'rules_fallback' },
+          },
+          signals: {
+            fatigueIndex: safeNum(fallbackFatigue.echo?.fatigueIndex, safeNum(payload.telemetry?.fatigueIndex, 0)),
+            strainIndex: safeNum(payload.telemetry?.strainIndex, 0),
+            noBallRisk: String(fallbackRisk.echo?.noBallRisk || payload.telemetry?.noBallRisk || ''),
+            injuryRisk: String(fallbackRisk.echo?.injuryRisk || payload.telemetry?.injuryRisk || ''),
+          },
+        },
+        meta: {
+          requestId: fallbackAnalysisId,
+          analysisId: fallbackAnalysisId,
+          mode: requestMode,
+          executedAgents: ['fatigue', 'risk', 'tactical'],
+          modelRouting: {
+            fatigueModel: 'rules-based-fallback',
+            riskModel: 'rules-based-fallback',
+            tacticalModel: 'rules-based-fallback',
+            fallbacksUsed: ['rules_fallback', toErrorReason(error)],
+          },
+          usedFallbackAgents: ['fatigue', 'risk', 'tactical'],
+          routerFallbackMessage: fallbackMessage,
+          timingsMs: { total: 0 },
+        },
+      };
+      return applyCoachResult(fallbackResponse, {
+        extraWarning:
+          fallbackCode === 'ai_disabled_by_policy'
+            ? 'Demo route fallback is active. Rules-based output ready.'
+            : fallbackCode === 'ai_not_configured'
+              ? 'Azure OpenAI is not configured. Rules-based output ready.'
+              : 'Model unavailable — using rules-based fallback output.',
+      });
     } finally {
       if (requestInFlight && requestId === fatigueRequestSeq.current) {
         setAgentState((prev) => (prev === 'thinking' ? 'idle' : prev));
@@ -3553,6 +3882,8 @@ export default function App() {
       setFinalRecommendation(null);
       setOrchestrateMeta(null);
       setRouterDecision(null);
+      setAnalysisBundleId('');
+      setCoachOutput(null);
       setAgentFeedStatus(getDefaultAgentFeedStatus());
       setAgentWarning(null);
       setAgentFailure(null);
@@ -3582,6 +3913,8 @@ export default function App() {
     setFinalRecommendation(null);
     setOrchestrateMeta(null);
     setRouterDecision(null);
+    setAnalysisBundleId('');
+    setCoachOutput(null);
     setRunMode('auto');
     setAgentFeedStatus(getDefaultAgentFeedStatus());
   };
@@ -3872,6 +4205,8 @@ export default function App() {
                 orchestrateMeta={orchestrateMeta}
                 routerDecision={routerDecision}
                 agentFeedStatus={agentFeedStatus}
+                analysisBundleId={analysisBundleId}
+                coachOutput={coachOutput}
                 analysisActive={analysisActive}
                 runAgent={runAgent}
                 onDismissAnalysis={dismissAnalysis}
@@ -4673,6 +5008,8 @@ interface DashboardProps {
   orchestrateMeta: OrchestrateMetaView | null;
   routerDecision: RouterDecisionView | null;
   agentFeedStatus: AgentFeedStatus;
+  analysisBundleId: string;
+  coachOutput: CoachOutputView | null;
   agentWarning: string | null;
   agentFailure: AgentFailureDetail | null;
   setAgentWarning: React.Dispatch<React.SetStateAction<string | null>>;
@@ -4988,11 +5325,12 @@ function MatchModeGuardOverlay({
 
 function Dashboard({
   matchContext, runMode, teamMode, setTeamMode, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, deleteRosterPlayer, movePlayerToSub,
-  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedBriefing, combinedDecision, finalRecommendation, orchestrateMeta, routerDecision, agentFeedStatus, agentWarning, agentFailure, setAgentWarning, setAgentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleRest, handleMarkUnfit,
+  agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedBriefing, combinedDecision, finalRecommendation, orchestrateMeta, routerDecision, agentFeedStatus, analysisBundleId, coachOutput, agentWarning, agentFailure, setAgentWarning, setAgentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleRest, handleMarkUnfit,
   recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, isLoadingRosterPlayers, rosterMutationError, onGoToBaselines, onBack
 }: DashboardProps) {
   const COPILOT_ANALYSIS_ID_STORAGE_KEY = 'tactiq:lastAnalysisId';
   const COPILOT_ANALYSIS_AT_STORAGE_KEY = 'tactiq:lastAnalysisAt';
+  const COPILOT_VISIBILITY_STORAGE_KEY = 'tactiq:copilotVisible';
   const COPILOT_ANALYSIS_TTL_MS = 2 * 60 * 60 * 1000;
   const [arTelemetryView, setArTelemetryView] = useState<'batting' | 'bowling'>('batting');
   const [strainIndex, setStrainIndex] = useState(0);
@@ -5001,6 +5339,14 @@ function Dashboard({
   const [substitutionRecommendation, setSubstitutionRecommendation] = useState<string | null>(null);
   const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
   const [showCoachInsights, setShowCoachInsights] = useState(false);
+  const [showCopilotChat, setShowCopilotChat] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return String(window.sessionStorage.getItem(COPILOT_VISIBILITY_STORAGE_KEY) || '').trim() === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [copilotSessionAnalysisId, setCopilotSessionAnalysisId] = useState(() => {
     if (typeof window === 'undefined') return '';
     try {
@@ -5086,9 +5432,26 @@ function Dashboard({
   useEffect(() => {
     // Keep coach expansion local to the currently selected player.
     setShowCoachInsights(false);
+    setShowCopilotChat(false);
+    setCopilotSessionAnalysisId('');
+    setCopilotVerifiedAnalysisId('');
+    setCopilotResetToken((value) => value + 1);
     setShowRotateBowlerConfirm(false);
     setRotateBowlerSuggestion(null);
   }, [activePlayer?.id]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (showCopilotChat) {
+        window.sessionStorage.setItem(COPILOT_VISIBILITY_STORAGE_KEY, 'true');
+      } else {
+        window.sessionStorage.removeItem(COPILOT_VISIBILITY_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage failures in restricted browser modes.
+    }
+  }, [showCopilotChat]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -5138,7 +5501,9 @@ function Dashboard({
     setSubstitutionRecommendation(null);
     setShowRouterSignals(false);
     setShowCoachInsights(false);
+    setShowCopilotChat(false);
     setCopilotSessionAnalysisId('');
+    setCopilotVerifiedAnalysisId('');
     setCopilotResetToken((value) => value + 1);
     onDismissAnalysis?.();
   };
@@ -5555,28 +5920,9 @@ function Dashboard({
       setCopilotVerifiedAnalysisId(candidateId);
       return;
     }
-    let cancelled = false;
-    (async () => {
-      try {
-        const exists = await checkAnalysisExists(candidateId);
-        if (cancelled) return;
-        if (exists) {
-          setCopilotVerifiedAnalysisId(candidateId);
-          return;
-        }
-        setCopilotVerifiedAnalysisId('');
-        setCopilotSessionAnalysisId('');
-      } catch (error) {
-        if (cancelled) return;
-        if (import.meta.env.DEV) {
-          console.warn('[copilot][analysis_exists_check_failed]', error);
-        }
-        setCopilotVerifiedAnalysisId('');
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    // Keep locally cached analysis id without probing /api/analysis/:id/exists.
+    // Azure Functions backend does not expose that endpoint.
+    setCopilotVerifiedAnalysisId(candidateId);
   }, [copilotSessionAnalysisId, metaCopilotAnalysisId]);
 
   useEffect(() => {
@@ -5947,16 +6293,72 @@ function Dashboard({
   const hasAnyAnalysis = Boolean(
     activeStrategicAnalysis || finalRecommendation || combinedDecision || tacticalAnalysis || aiAnalysis || riskAnalysis
   );
+  const tacticalRecommendationSignal = Boolean(
+    activeStrategicAnalysis?.tacticalRecommendation?.nextAction ||
+    activeStrategicAnalysis?.tacticalRecommendation?.why ||
+    tacticalAnalysis?.immediateAction ||
+    tacticalAnalysis?.rationale ||
+    combinedDecision?.immediateAction ||
+    combinedDecision?.rationale ||
+    finalRecommendation?.statement
+  );
   const hasTacticalGuidance = Boolean(
     activeStrategicAnalysis?.tacticalRecommendation?.nextAction ||
     tacticalAnalysis?.immediateAction ||
     combinedDecision?.immediateAction
   );
+  const hasCoachOutputText = Boolean(
+    (typeof coachOutput?.summary === 'string' && coachOutput.summary.trim().length > 0) ||
+    (typeof coachOutput?.tacticalRecommendation === 'string' && coachOutput.tacticalRecommendation.trim().length > 0) ||
+    (typeof combinedBriefing === 'string' && combinedBriefing.trim().length > 0) ||
+    (typeof finalRecommendation?.statement === 'string' && finalRecommendation.statement.trim().length > 0) ||
+    (typeof tacticalAnalysis?.immediateAction === 'string' && tacticalAnalysis.immediateAction.trim().length > 0) ||
+    (typeof tacticalAnalysis?.rationale === 'string' && tacticalAnalysis.rationale.trim().length > 0) ||
+    (typeof activeStrategicAnalysis?.tacticalRecommendation?.nextAction === 'string' &&
+      activeStrategicAnalysis.tacticalRecommendation.nextAction.trim().length > 0) ||
+    (typeof activeStrategicAnalysis?.tacticalRecommendation?.why === 'string' &&
+      activeStrategicAnalysis.tacticalRecommendation.why.trim().length > 0)
+  );
+  const hasCopilotRenderableOutput = Boolean(
+    analysisBundleId.length > 0 ||
+    Boolean(coachOutput) ||
+    hasCoachOutputText
+  );
+  const agentExecutionFinished = agentState !== 'thinking' && !Object.values(agentFeedStatus).some((state) => state === 'RUNNING');
+  const hasCopilotActivationSignal = Boolean(
+    hasCopilotRenderableOutput ||
+    tacticalRecommendationSignal ||
+    hasAnyAnalysis ||
+    effectiveCopilotAnalysisId.length > 0 ||
+    (showCoachInsights && (analysisActive || agentState === 'done' || agentState === 'offline'))
+  );
   const showAnalysisFailureCard = Boolean(agentFailure && !hasAnyAnalysis && !hasTacticalGuidance);
   const showAnalysisFailureInline = Boolean(agentFailure && hasAnyAnalysis);
   const showAnalysisSkeleton = agentState === 'thinking' && !hasAnyAnalysis;
+  useEffect(() => {
+    if (hasCopilotActivationSignal) {
+      setShowCopilotChat(true);
+    }
+  }, [hasCopilotActivationSignal]);
+  useEffect(() => {
+    if (!hasCopilotActivationSignal) return;
+    if (effectiveCopilotAnalysisId.length > 0) return;
+    console.error('[copilot] missing analysis id after coach completion; using generated local id');
+    const generatedId = `local-${String(activePlayer?.id || 'coach')}-${Date.now()}`;
+    setCopilotSessionAnalysisId(generatedId);
+    setCopilotVerifiedAnalysisId(generatedId);
+  }, [hasCopilotActivationSignal, effectiveCopilotAnalysisId, activePlayer?.id]);
   const shouldRenderCopilotUnderGraph =
-    shouldShowTelemetryGraph && agentState === 'done' && hasAnyAnalysis && copilotAnalysisReady;
+    shouldShowTelemetryGraph && hasCoachOutputText && agentExecutionFinished;
+  useEffect(() => {
+    if (!hasCopilotActivationSignal) return;
+    if (shouldRenderCopilotUnderGraph) return;
+    console.error('[copilot] render suppressed', {
+      shouldShowTelemetryGraph,
+      hasAnyAnalysis,
+      analysisId: effectiveCopilotAnalysisId,
+    });
+  }, [hasCopilotActivationSignal, shouldRenderCopilotUnderGraph, shouldShowTelemetryGraph, hasAnyAnalysis, effectiveCopilotAnalysisId]);
   const agentStatusRows: Array<{ agent: AgentKey; label: string; state: AgentFeedState; detail: string }> = [
     { agent: 'fatigue', label: 'Fatigue Agent', state: agentFeedStatus.fatigue, detail: '' },
     { agent: 'risk', label: 'Risk Agent', state: agentFeedStatus.risk, detail: '' },
@@ -5970,6 +6372,17 @@ function Dashboard({
     if (entry.state === 'ERROR') detail = 'No output';
     return { ...entry, detail };
   });
+  const copilotFallbackMode = Boolean(
+    orchestrateMeta?.responseMode === 'fallback' ||
+    (Array.isArray(orchestrateMeta?.usedFallbackAgents) && orchestrateMeta.usedFallbackAgents.length > 0) ||
+    Object.values(agentFeedStatus).some((state) => state === 'FALLBACK') ||
+    (Object.values(agentFeedStatus).some((state) => state === 'ERROR') && hasCopilotActivationSignal) ||
+    Boolean(orchestrateMeta?.routerFallbackMessage) ||
+    /(fallback|rules|orchestrate_exception|openai_error|agent_http_error|missing[_\s-]?config|model unavailable|azure env missing)/i.test(
+      `${orchestrateMeta?.routerFallbackMessage || ''} ${routerDecisionForView?.reason || ''}`
+    )
+  );
+  const isExplicitFallbackMode = orchestrateMeta?.responseMode === 'fallback';
   const advancedSignalRecord = routerDecisionForView?.signals || {};
   const advancedFatigueSignal = safeNum(advancedSignalRecord.fatigueIndex ?? aiAnalysis?.fatigueIndex ?? activePlayer?.fatigue, Number.NaN);
   const advancedStrainSignal = safeNum(advancedSignalRecord.strainIndex ?? activePlayer?.strainIndex, Number.NaN);
@@ -8062,11 +8475,12 @@ function Dashboard({
                     {shouldRenderCopilotUnderGraph && (
                       <div className="md:col-span-2 mt-3">
                         <CopilotChatPanel
-                          analysisReady={copilotAnalysisReady}
-                          analysisId={effectiveCopilotAnalysisId}
+                          analysisReady={hasCoachOutputText && agentExecutionFinished}
+                          analysisId={effectiveCopilotAnalysisId || analysisBundleId}
                           resetKey={copilotResetKey}
                           suggestedQuestions={copilotSuggestedQuestions}
                           fallbackContext={copilotFallbackContext}
+                          forceFallbackMode={copilotFallbackMode}
                           onAnalysisIdSync={(analysisId) => {
                             setCopilotSessionAnalysisId(analysisId);
                             setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
@@ -8312,11 +8726,12 @@ function Dashboard({
                   {shouldRenderCopilotUnderGraph && (
                     <div className="mt-3">
                       <CopilotChatPanel
-                        analysisReady={copilotAnalysisReady}
-                        analysisId={effectiveCopilotAnalysisId}
+                        analysisReady={hasCoachOutputText && agentExecutionFinished}
+                        analysisId={effectiveCopilotAnalysisId || analysisBundleId}
                         resetKey={copilotResetKey}
                         suggestedQuestions={copilotSuggestedQuestions}
                         fallbackContext={copilotFallbackContext}
+                        forceFallbackMode={copilotFallbackMode}
                         onAnalysisIdSync={(analysisId) => {
                           setCopilotSessionAnalysisId(analysisId);
                           setCopilotVerifiedAnalysisId(String(analysisId || '').trim());
@@ -8925,7 +9340,7 @@ function Dashboard({
                             )}
                           </div>
 
-                          {(tacticalAnalysis?.status === 'fallback' || orchestrateMeta?.usedFallbackAgents.includes('tactical')) && (
+                          {isExplicitFallbackMode && (
                             <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
                               Fallback mode active (Azure OpenAI not configured).
                               <Info className="w-3 h-3 text-slate-500" title="Set AOAI env vars in local settings or Azure App Service to enable Azure OpenAI." />
@@ -9291,7 +9706,11 @@ function Baselines({
       setBaselineFetchFailed(false);
       if (showSuccess) setSuccessMessage(showSuccess);
     } catch (error) {
-      const warning = 'Failed to load baselines from backend.';
+      const warning = error instanceof ApiClientError && (error.status === 401 || error.status === 403)
+        ? 'Sign in with Microsoft to load player baselines.'
+        : error instanceof ApiClientError && error.status === 500
+          ? 'Baselines service is unavailable. Check Functions env configuration.'
+          : 'Failed to load baselines from backend.';
       setRuntimeSource('cosmos');
       setRuntimeWarning(warning);
       setBaselineFetchFailed(true);
@@ -9323,6 +9742,14 @@ function Baselines({
 
   useEffect(() => {
     setBaselineDraftCache(draftBaselines.map((row) => ({ ...row })));
+  }, [draftBaselines]);
+
+  useEffect(() => {
+    if (!isDemoModeEnabled()) return;
+    const normalized = draftRowsToBaselines(draftBaselines);
+    void saveBaselines(normalized).catch(() => {
+      // Demo autosave is best-effort; keep UI responsive even if storage is blocked.
+    });
   }, [draftBaselines]);
 
   useEffect(() => {
