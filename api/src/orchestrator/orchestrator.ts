@@ -26,21 +26,15 @@ import { buildContinueRiskSummary, mapLikelyInjuries } from '../lib/injuryMap';
 import { isEligibleForMode, rankSafetyCandidates, SafetyCandidate } from '../lib/safetyRank';
 
 let azureEnvLogged = false;
-const hasAzureConfig = (): boolean =>
-  Boolean(
-    String(process.env.AZURE_OPENAI_API_KEY || '').trim() &&
-      String(process.env.AZURE_OPENAI_ENDPOINT || '').trim() &&
-      String(process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || '').trim() &&
-      String(process.env.AZURE_OPENAI_API_VERSION || '').trim()
-  );
 const logAzureEnv = (context: InvocationContext): void => {
   if (azureEnvLogged) return;
   azureEnvLogged = true;
+  const aoai = getAoaiConfig();
   context.log('[env] azure', {
-    hasAzure: hasAzureConfig(),
-    endpoint: Boolean(String(process.env.AZURE_OPENAI_ENDPOINT || '').trim()),
-    deployment: Boolean(String(process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_MODEL || '').trim()),
-    apiVersion: Boolean(String(process.env.AZURE_OPENAI_API_VERSION || '').trim()),
+    hasAzure: aoai.ok,
+    endpoint: aoai.ok ? true : !aoai.missing.includes('AZURE_OPENAI_ENDPOINT'),
+    deployment: aoai.ok ? true : !aoai.missing.includes('AZURE_OPENAI_DEPLOYMENT'),
+    apiVersion: true,
   });
 };
 

@@ -75,6 +75,20 @@ export async function callLLM(input: CallLLMInput): Promise<string> {
         ? bodyCandidate.replace(/\s+/g, ' ').trim().slice(0, 200)
         : undefined;
     if (typeof status === 'number') {
+      if (status === 404) {
+        throw new LLMRequestError(
+          'Deployment not found (check AZURE_OPENAI_DEPLOYMENT name in Azure).',
+          status,
+          bodySnippet
+        );
+      }
+      if (status === 401 || status === 403) {
+        throw new LLMRequestError(
+          'Invalid subscription key or wrong endpoint (check key + endpoint).',
+          status,
+          bodySnippet
+        );
+      }
       throw new LLMRequestError(`LLM request failed (${status}): ${message}`, status, bodySnippet);
     }
     throw new LLMRequestError(`LLM request failed: ${message}`, undefined, bodySnippet);
