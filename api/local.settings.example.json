@@ -1,19 +1,21 @@
 {
   "IsEncrypted": false,
   "Values": {
-    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "AzureWebJobsStorage": "YOUR_STORAGE_CONNECTION_OR_UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "node",
-    "COSMOS_CONNECTION_STRING": "",
-    "COSMOS_ENDPOINT": "",
-    "COSMOS_KEY": "",
+
+    "AZURE_OPENAI_API_KEY": "YOUR_KEY_HERE",
+    "AZURE_OPENAI_KEY": "YOUR_KEY_HERE",
+    "AZURE_OPENAI_ENDPOINT": "https://YOUR_RESOURCE_NAME.openai.azure.com/",
+    "AZURE_OPENAI_DEPLOYMENT": "gpt-4o-mini",
+    "AOAI_DEPLOYMENT_FAST": "gpt-4o-mini",
+    "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
+
+    "COSMOS_ENDPOINT": "https://YOUR_ACCOUNT.documents.azure.com:443/",
+    "COSMOS_KEY": "YOUR_COSMOS_KEY_HERE",
+    "COSMOS_DB": "tactiq-db",
     "COSMOS_DATABASE": "tactiq-db",
     "COSMOS_CONTAINER_PLAYERS": "players",
-    "COSMOS_CONTAINER_USERS": "users",
-    "AZURE_OPENAI_ENDPOINT": "",
-    "AZURE_OPENAI_API_KEY": "",
-    "AZURE_OPENAI_DEPLOYMENT": "",
-    "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
-    "AOAI_DEPLOYMENT_STRONG": "",
-    "AOAI_DEPLOYMENT_FALLBACK": ""
+    "COSMOS_CONTAINER": "players"
   }
 }

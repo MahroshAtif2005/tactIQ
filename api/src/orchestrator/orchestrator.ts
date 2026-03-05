@@ -1,6 +1,4 @@
 import { randomUUID } from 'crypto';
-import fs from 'fs';
-import path from 'path';
 import { InvocationContext } from '@azure/functions';
 import { buildFatigueFallback, FatigueAgentRunResult, runFatigueAgent } from '../agents/fatigueAgent';
 import { buildRiskFallback, RiskAgentRunResult, runRiskAgent } from '../agents/riskAgent';
@@ -26,26 +24,6 @@ import { getAoaiConfig } from '../llm/modelRegistry';
 import { FullMatchContext, ReplacementCandidate, RosterPlayerContext } from '../shared/matchContext';
 import { buildContinueRiskSummary, mapLikelyInjuries } from '../lib/injuryMap';
 import { isEligibleForMode, rankSafetyCandidates, SafetyCandidate } from '../lib/safetyRank';
-
-let dotenvLib: { config: (options: { path: string; override?: boolean }) => unknown } | null = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  dotenvLib = require('dotenv');
-} catch {
-  dotenvLib = null;
-}
-
-const ENV_CANDIDATE_PATHS = [
-  path.resolve(__dirname, '../../../server/agent-framework/.env'),
-  path.resolve(__dirname, '../../../.env'),
-  path.resolve(__dirname, '../../.env'),
-];
-
-for (const envPath of ENV_CANDIDATE_PATHS) {
-  if (!fs.existsSync(envPath)) continue;
-  dotenvLib?.config({ path: envPath, override: false });
-  break;
-}
 
 let azureEnvLogged = false;
 const hasAzureConfig = (): boolean =>

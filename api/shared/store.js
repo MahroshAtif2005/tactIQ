@@ -360,6 +360,23 @@ const listBaselines = async ({ userId, teamId }) => {
   return sortBaselines(normalized);
 };
 
+const getTeamBaselineDocs = async ({ userId, teamId }) => {
+  const cosmos = await getCosmos();
+  if (!cosmos) return [];
+  const { playersContainer } = cosmos;
+  const query = {
+    query: 'SELECT * FROM c WHERE c.type = @type AND c.teamId = @teamId',
+    parameters: [
+      { name: '@type', value: 'playerBaseline' },
+      { name: '@teamId', value: teamId },
+    ],
+  };
+  const result = await playersContainer.items.query(query).fetchAll();
+  return Array.isArray(result.resources)
+    ? result.resources.filter((row) => normalizeId(row && row.userId) === userId)
+    : [];
+};
+
 const saveBaselines = async ({ userId, teamId, payload }) => {
   const body = payload && typeof payload === 'object' ? payload : {};
   const items = Array.isArray(body.players)
@@ -427,6 +444,99 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
   return listBaselines({ userId, teamId });
 };
 
+const replaceBaselines = async ({ userId, teamId, payload }) => {
+  const body = payload && typeof payload === 'object' ? payload : {};
+  const items = Array.isArray(body.players)
+    ? body.players
+    : Array.isArray(body.baselines)
+      ? body.baselines
+      : null;
+
+  if (!Array.isArray(items)) {
+    const error = new Error('Body must include players array.');
+    error.code = 'VALIDATION_ERROR';
+    throw error;
+  }
+
+  const cosmos = await getCosmos();
+  if (!cosmos) {
+    const nextRows = items
+      .map((incoming, index) => normalizeBaseline(
+        { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1 },
+        { userId, teamId },
+        null
+      ))
+      .filter(Boolean)
+      .map((row) => ({ ...row, id: row.baselineId }));
+    memoryBaselinesByTeam.set(teamId, sortBaselines(nextRows));
+    return listBaselines({ userId, teamId });
+  }
+
+  const { playersContainer } = cosmos;
+  const existingRows = await getTeamBaselineDocs({ userId, teamId });
+  for (const row of existingRows) {
+    const docId = normalizeId(row && row.id);
+    if (!docId) continue;
+    await playersContainer.item(docId, userId).delete();
+  }
+
+  const now = new Date().toISOString();
+  for (let index = 0; index < items.length; index += 1) {
+    const incoming = items[index];
+    const normalized = normalizeBaseline(
+      { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1, updatedAt: now },
+      { userId, teamId },
+      null
+    );
+    if (!normalized) continue;
+    await playersContainer.items.upsert(normalized, { partitionKey: userId });
+  }
+
+  return listBaselines({ userId, teamId });
+};
+
+const deleteBaselineById = async ({ userId, teamId, baselineId }) => {
+  const normalizedId = normalizeId(baselineId);
+  if (!normalizedId) return listBaselines({ userId, teamId });
+
+  const cosmos = await getCosmos();
+  if (!cosmos) {
+    const current = getMemoryBaselines(teamId);
+    const filtered = current.filter((row) => normalizeId(row.id || row.playerId || row.baselineId || row.name) !== normalizedId);
+    memoryBaselinesByTeam.set(teamId, filtered);
+    return listBaselines({ userId, teamId });
+  }
+
+  const { playersContainer } = cosmos;
+  const candidates = await playersContainer.items
+    .query({
+      query: 'SELECT * FROM c WHERE c.type = @type AND c.teamId = @teamId AND c.userId = @userId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id OR c.id = @id)',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@teamId', value: teamId },
+        { name: '@userId', value: userId },
+        { name: '@id', value: normalizedId },
+      ],
+    })
+    .fetchAll();
+
+  const rows = Array.isArray(candidates.resources) ? candidates.resources : [];
+  for (const row of rows) {
+    const docId = normalizeId(row && row.id);
+    if (!docId) continue;
+    await playersContainer.item(docId, userId).delete();
+  }
+  return listBaselines({ userId, teamId });
+};
+
+const resetBaselines = async ({ userId, teamId }) => {
+  return replaceBaselines({
+    userId,
+    teamId,
+    payload: { players: DEFAULT_BASELINES.map((row) => ({ ...row })) },
+  });
+};
+
 const getStorageMode = () => (cosmosEnabled ? 'cosmos' : 'memory');
 
 module.exports = {
@@ -434,5 +544,8 @@ module.exports = {
   ensureUser,
   listBaselines,
   saveBaselines,
+  replaceBaselines,
+  deleteBaselineById,
+  resetBaselines,
   getStorageMode,
 };

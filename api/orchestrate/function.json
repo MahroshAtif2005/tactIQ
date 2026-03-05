@@ -5,8 +5,8 @@
       "type": "httpTrigger",
       "direction": "in",
       "name": "req",
-      "methods": ["get", "post", "patch", "delete"],
-      "route": "baselines/{id?}"
+      "methods": ["post"],
+      "route": "orchestrate"
     },
     {
       "type": "http",
