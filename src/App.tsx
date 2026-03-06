@@ -235,6 +235,12 @@ interface OrchestrateMetaView {
   analysisId?: string;
   mode: 'auto' | 'full';
   responseMode?: 'demo' | 'live' | 'fallback';
+  llmMode?: 'ai' | 'rules';
+  routingMode?: 'ai' | 'fallback' | 'demo';
+  reasons?: string[];
+  fallbackReason?: string;
+  azureAttempted?: boolean;
+  agentAiFailures?: Partial<Record<'fatigue' | 'risk' | 'tactical', string>>;
   executedAgents: Array<'fatigue' | 'risk' | 'tactical'>;
   usedFallbackAgents: Array<'fatigue' | 'risk' | 'tactical'>;
   routerFallbackMessage?: string;
@@ -3216,10 +3222,63 @@ export default function App() {
           : responseModeToken === 'ai'
             ? 'live'
           : undefined;
+      const normalizedLlmMode: 'ai' | 'rules' =
+        String((result as unknown as Record<string, unknown>).llmMode || '').trim().toLowerCase() === 'rules'
+          ? 'rules'
+          : 'ai';
+      const normalizedRoutingMode: 'ai' | 'fallback' | 'demo' =
+        routingModeToken === 'fallback' || responseMode === 'fallback'
+          ? 'fallback'
+          : routingModeToken === 'demo' || responseMode === 'demo'
+            ? 'demo'
+            : 'ai';
+      const routingReasons = Array.isArray(result.reasons)
+        ? result.reasons.map((entry) => String(entry || '').trim()).filter(Boolean)
+        : [];
+      const routingDebugRecord = toRecord(resultMetaRecord.routingDebug);
+      const azureAttempted =
+        typeof result.azureAttempted === 'boolean'
+          ? result.azureAttempted
+          : typeof routingDebugRecord.azureAttempted === 'boolean'
+            ? Boolean(routingDebugRecord.azureAttempted)
+            : normalizedLlmMode === 'ai';
+      const agentAiFailures = (() => {
+        const explicitFailures = toRecord((result as unknown as Record<string, unknown>).agentAiFailures);
+        const fromExplicit: Partial<Record<AgentKey, string>> = {};
+        (['fatigue', 'risk', 'tactical'] as const).forEach((agent) => {
+          const detail = String(explicitFailures[agent] || '').trim();
+          if (detail) fromExplicit[agent] = detail;
+        });
+        if (Object.keys(fromExplicit).length > 0) return fromExplicit;
+        const computed: Partial<Record<AgentKey, string>> = {};
+        (['fatigue', 'risk', 'tactical'] as const).forEach((agent) => {
+          const resultEntry = result.agentResults?.[agent];
+          const routedTo = String(resultEntry?.routedTo || '').trim().toLowerCase();
+          const status = String(resultEntry?.status || '').trim().toLowerCase();
+          const reason = String(resultEntry?.reason || resultEntry?.error || '').trim();
+          if (!reason) return;
+          if (routedTo === 'rules' && (status === 'fallback' || status === 'error')) {
+            computed[agent] = reason;
+          }
+        });
+        return computed;
+      })();
+      const fallbackReason = String(
+        (result as unknown as Record<string, unknown>).fallbackReason ||
+        routingReasons[0] ||
+        metaRouterFallbackMessage ||
+        ''
+      ).trim() || undefined;
       setOrchestrateMeta({
         analysisId: resolvedAnalysisId || undefined,
         mode: metaMode,
         responseMode,
+        llmMode: normalizedLlmMode,
+        routingMode: normalizedRoutingMode,
+        reasons: routingReasons,
+        fallbackReason,
+        azureAttempted,
+        agentAiFailures,
         executedAgents: metaExecutedAgents,
         usedFallbackAgents: metaUsedFallbackAgents,
         routerFallbackMessage: metaRouterFallbackMessage,
@@ -3344,12 +3403,12 @@ export default function App() {
       const responseWarnings = Array.isArray(result.warnings)
         ? result.warnings.map((entry) => sanitizeUiNotice(entry)).filter(Boolean).join(' | ')
         : null;
-      const routingReasons = Array.isArray(result.reasons)
+      const routingReasonsLower = Array.isArray(result.reasons)
         ? result.reasons.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean)
         : [];
-      const llmFallbackWarning = routingReasons.includes('missing_aoai_config')
+      const llmFallbackWarning = routingReasonsLower.includes('missing_aoai_config')
         ? 'Azure OpenAI is not configured; showing fallback analysis.'
-        : routingReasons.includes('upstream_unavailable')
+        : routingReasonsLower.includes('upstream_unavailable')
           ? 'Azure OpenAI is temporarily unavailable; showing fallback analysis.'
           : null;
       const warning = [llmFallbackWarning, responseWarnings, errorNotice, sanitizeUiNotice(options?.extraWarning)]
@@ -4382,6 +4441,7 @@ export default function App() {
             {page === 'dashboard' && (
               <Dashboard 
                 key="dashboard"
+                aiEnabled={aiEnabled}
                 matchContext={matchContext}
                 runMode={runMode}
                 teamMode={matchContext.matchMode}
@@ -4922,9 +4982,25 @@ function FatigueForecastChart({
             <h3 className="text-sm font-bold text-white">Fatigue Forecast</h3>
             <p className="text-xs text-slate-400">{`Next ${projectionHorizon} overs • AI projection`}</p>
           </div>
-          <span className="rounded-full border border-cyan-400/35 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-cyan-200">
-            AI
-          </span>
+          <div className="flex flex-col items-end gap-1.5">
+            <span className="rounded-full border border-cyan-400/35 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-cyan-200">
+              AI
+            </span>
+            <div className="flex flex-col items-end gap-0.5 text-[10px] leading-tight text-slate-300">
+              <span className="inline-flex items-center gap-1">
+                <span className="text-[11px] leading-none" style={{ color: '#22d3ee' }}>
+                  ●
+                </span>
+                Fatigue (0–10)
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="text-[11px] leading-none" style={{ color: '#f59e0b' }}>
+                  ●
+                </span>
+                Injury Risk (%)
+              </span>
+            </div>
+          </div>
         </div>
         <div className="mt-4 h-[240px] w-full" style={{ height: 240 }}>
           <ResponsiveContainer width="100%" height="100%">
@@ -5213,6 +5289,7 @@ function PressureForecastChart({
 }
 
 interface DashboardProps {
+  aiEnabled: boolean;
   matchContext: MatchContext;
   runMode: RunMode;
   teamMode: TeamMode;
@@ -5262,6 +5339,16 @@ interface DashboardProps {
   rosterMutationError: string | null;
   onGoToBaselines: () => void;
   onBack: () => void;
+}
+
+interface CoachAnalysisInputSnapshot {
+  selectedPlayerId: string;
+  oversBowled: number;
+  fatigueIndex: number;
+  strainIndex: number;
+  heartRateRecovery: string;
+  injuryRisk: string;
+  noBallRisk: string;
 }
 
 interface ConfirmSwitchOverlayProps {
@@ -5553,7 +5640,7 @@ function MatchModeGuardOverlay({
 }
 
 function Dashboard({
-  matchContext, runMode, teamMode, setTeamMode, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, deleteRosterPlayer, movePlayerToSub,
+  aiEnabled, matchContext, runMode, teamMode, setTeamMode, matchState, players, activePlayer, setActivePlayerId, updatePlayer, updateMatchState, deleteRosterPlayer, movePlayerToSub,
   agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedBriefing, combinedDecision, finalRecommendation, orchestrateMeta, routerDecision, agentFeedStatus, analysisBundleId, coachOutput, agentWarning, agentFailure, setAgentWarning, setAgentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleRest, handleMarkUnfit,
   recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, isLoadingRosterPlayers, rosterMutationError, onGoToBaselines, onBack
 }: DashboardProps) {
@@ -5614,6 +5701,13 @@ function Dashboard({
   const [showRotateBowlerConfirm, setShowRotateBowlerConfirm] = useState(false);
   const [rotateBowlerSuggestion, setRotateBowlerSuggestion] = useState<SuggestedBowlerRecommendation | null>(null);
   const [rotateBowlerNotice, setRotateBowlerNotice] = useState<string | null>(null);
+  const [fullAnalysisRunPending, setFullAnalysisRunPending] = useState(false);
+  const [fullAnalysisExecuted, setFullAnalysisExecuted] = useState(false);
+  const [analysisExecuted, setAnalysisExecuted] = useState(false);
+  const [analysisStale, setAnalysisStale] = useState(false);
+  const [analysisSnapshot, setAnalysisSnapshot] = useState<CoachAnalysisInputSnapshot | null>(null);
+  const [showFullAnalysisInfo, setShowFullAnalysisInfo] = useState(false);
+  const [showDismissAnalysisInfo, setShowDismissAnalysisInfo] = useState(false);
   const [pressureStateByPlayer, setPressureStateByPlayer] = useState<{ playerId: string; base: number; eventDelta: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -5634,6 +5728,7 @@ function Dashboard({
     sixes: number;
   } | null>(null);
   const lastValidPressureRef = useRef<{ playerId: string; value: number } | null>(null);
+  const lastCapturedAnalysisBundleIdRef = useRef<string>('');
 
   useEffect(() => {
     setSubstitutionRecommendation(null);
@@ -5663,6 +5758,14 @@ function Dashboard({
     setCopilotResetToken((value) => value + 1);
     setShowRotateBowlerConfirm(false);
     setRotateBowlerSuggestion(null);
+    setFullAnalysisRunPending(false);
+    setFullAnalysisExecuted(false);
+    setAnalysisExecuted(false);
+    setAnalysisStale(false);
+    setAnalysisSnapshot(null);
+    setShowFullAnalysisInfo(false);
+    setShowDismissAnalysisInfo(false);
+    lastCapturedAnalysisBundleIdRef.current = '';
   }, [activePlayer?.id]);
 
   useEffect(() => {
@@ -5727,6 +5830,14 @@ function Dashboard({
     setShowRouterSignals(false);
     setShowCoachInsights(false);
     setShowCopilotChat(false);
+    setShowFullAnalysisInfo(false);
+    setShowDismissAnalysisInfo(false);
+    setFullAnalysisRunPending(false);
+    setFullAnalysisExecuted(false);
+    setAnalysisExecuted(false);
+    setAnalysisStale(false);
+    setAnalysisSnapshot(null);
+    lastCapturedAnalysisBundleIdRef.current = '';
     setCopilotSessionAnalysisId('');
     setCopilotVerifiedAnalysisId('');
     setCopilotResetToken((value) => value + 1);
@@ -5755,6 +5866,98 @@ function Dashboard({
         fatigueIndex: 0,
         strainIndex: 0,
       };
+  const analysisInputSnapshot = useMemo<CoachAnalysisInputSnapshot>(
+    () => ({
+      selectedPlayerId: String(activePlayer?.id || currentTelemetry.playerId || ''),
+      oversBowled: Number(safeNum(activePlayer?.overs, 0).toFixed(2)),
+      fatigueIndex: Number(safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex).toFixed(2)),
+      strainIndex: Number(safeNum(strainIndex, currentTelemetry.strainIndex).toFixed(2)),
+      heartRateRecovery: String(recoveryMode === 'manual' ? manualRecovery : activePlayer?.hrRecovery || 'Good').toUpperCase(),
+      injuryRisk: String(activePlayer?.injuryRisk || '').toUpperCase(),
+      noBallRisk: String(activePlayer?.noBallRisk || '').toUpperCase(),
+    }),
+    [
+      activePlayer?.fatigue,
+      activePlayer?.hrRecovery,
+      activePlayer?.id,
+      activePlayer?.injuryRisk,
+      activePlayer?.noBallRisk,
+      activePlayer?.overs,
+      currentTelemetry.fatigueIndex,
+      currentTelemetry.playerId,
+      currentTelemetry.strainIndex,
+      manualRecovery,
+      recoveryMode,
+      strainIndex,
+    ]
+  );
+
+  useEffect(() => {
+    if (!fullAnalysisRunPending) return;
+    if (agentState === 'thinking') return;
+    if (agentState === 'done') {
+      if (import.meta.env.DEV) {
+        console.log('[dashboard] analysis_executed', {
+          selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
+        });
+      }
+      setFullAnalysisExecuted(true);
+      setAnalysisExecuted(true);
+      setAnalysisStale(false);
+      setAnalysisSnapshot(analysisInputSnapshot);
+      setShowFullAnalysisInfo(false);
+      setShowDismissAnalysisInfo(false);
+      lastCapturedAnalysisBundleIdRef.current = String(analysisBundleId || '').trim();
+      if (import.meta.env.DEV) {
+        console.log('[dashboard] analysis_snapshot_stored', analysisInputSnapshot);
+      }
+    }
+    setFullAnalysisRunPending(false);
+  }, [agentState, analysisBundleId, analysisInputSnapshot, fullAnalysisRunPending]);
+
+  useEffect(() => {
+    if (agentState !== 'done' || !analysisActive) return;
+    const completedBundleId = String(analysisBundleId || '').trim();
+    if (!completedBundleId) return;
+    if (lastCapturedAnalysisBundleIdRef.current === completedBundleId) return;
+    lastCapturedAnalysisBundleIdRef.current = completedBundleId;
+    setAnalysisExecuted(true);
+    setAnalysisStale(false);
+    setAnalysisSnapshot(analysisInputSnapshot);
+    if (import.meta.env.DEV) {
+      console.log('[dashboard] analysis_executed', {
+        selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
+        analysisBundleId: completedBundleId,
+      });
+      console.log('[dashboard] analysis_snapshot_stored', analysisInputSnapshot);
+    }
+  }, [agentState, analysisActive, analysisBundleId, analysisInputSnapshot]);
+
+  useEffect(() => {
+    if (!analysisExecuted) return;
+    if (fullAnalysisRunPending) return;
+    const baseline = analysisSnapshot;
+    if (!baseline) return;
+    const changedFields = (Object.keys(analysisInputSnapshot) as Array<keyof CoachAnalysisInputSnapshot>).filter(
+      (field) => baseline[field] !== analysisInputSnapshot[field]
+    );
+    if (changedFields.length === 0) return;
+    if (import.meta.env.DEV) {
+      console.log('[dashboard] analysis_input_changed', {
+        changedFields,
+        before: baseline,
+        after: analysisInputSnapshot,
+      });
+    }
+    if (analysisStale) return;
+    if (import.meta.env.DEV) {
+      console.log('[dashboard] analysis_stale_true', {
+        selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
+        changedFields,
+      });
+    }
+    setAnalysisStale(true);
+  }, [analysisExecuted, analysisInputSnapshot, analysisSnapshot, analysisStale, fullAnalysisRunPending]);
 
   const fixedInningsOvers = getInningsTotalOvers(matchContext.format);
   const resolvedTotalOvers = fixedInningsOvers ?? Math.max(1, Math.floor(matchState.totalOvers));
@@ -6459,6 +6662,7 @@ function Dashboard({
   const routerStatusHint = (() => {
     const engagedRows = routerDetailRows.filter((row) => row.engaged);
     if (engagedRows.length === 0) return null;
+    const isFullMode = runMode === 'full';
     const hasBackendBuildIssue = engagedRows.some((row) => row.backendBuildIssue);
     const hasSkipped = routerDetailRows.some((row) => row.statusLabel === 'Skipped');
     const allRules = engagedRows.every((row) => row.routedTo === 'rules');
@@ -6474,7 +6678,7 @@ function Dashboard({
     }
     if (allRules) {
       return {
-        label: 'Routing: Rules fallback',
+        label: isFullMode ? 'Full Analysis: Fallback' : 'Routing: Rules fallback',
         toneClass: 'border-slate-500/35 text-slate-200 bg-slate-500/10',
         dotClass: 'bg-slate-300',
         engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
@@ -6482,14 +6686,14 @@ function Dashboard({
     }
     if (allAi && !hasSkipped && !anyRules) {
       return {
-        label: 'Routing: AI',
+        label: isFullMode ? 'Full Analysis: AI' : 'Routing: AI',
         toneClass: 'border-emerald-500/35 text-emerald-200 bg-emerald-500/10',
         dotClass: 'bg-emerald-400',
         engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
       };
     }
     return {
-      label: 'Routing: Hybrid AI',
+      label: isFullMode ? 'Full Analysis: Hybrid' : 'Routing: Hybrid AI',
       toneClass: 'border-amber-500/35 text-amber-200 bg-amber-500/10',
       dotClass: 'bg-amber-300',
       engagedLine: `Agents engaged: ${formatAgentList(engagedRows.map((row) => row.agent))}`,
@@ -6525,6 +6729,34 @@ function Dashboard({
   const isCoachOutputState = analysisActive || showCoachInsights;
   const shouldShowTelemetryGraph = showCoachInsights && (analysisActive || agentState !== 'idle');
   const isFullAnalysis = runMode === 'full';
+  const analysisRunModeLine = (() => {
+    if (!isFullAnalysis) return '';
+    const modeToken = String(orchestrateMeta?.routingMode || '').trim().toLowerCase();
+    if (!modeToken) return '';
+    const fallbackReason = sanitizeRouterReason(orchestrateMeta?.fallbackReason || orchestrateMeta?.routerFallbackMessage || '');
+    const azureAttempted =
+      typeof orchestrateMeta?.azureAttempted === 'boolean'
+        ? orchestrateMeta.azureAttempted
+        : String(orchestrateMeta?.llmMode || '').trim().toLowerCase() === 'ai';
+    if (modeToken === 'fallback') {
+      return `Full analysis ran in fallback mode (${fallbackReason || 'upstream_unavailable'}). Azure attempted: ${azureAttempted ? 'yes' : 'no'}.`;
+    }
+    return 'Full analysis ran with AI.';
+  })();
+  const analysisAgentFailureLine = (() => {
+    if (!isFullAnalysis) return '';
+    const failureRecord = toRecord(orchestrateMeta?.agentAiFailures as unknown);
+    const entries = (['fatigue', 'risk', 'tactical'] as const)
+      .map((agent) => {
+        const reason = sanitizeRouterReason(failureRecord[agent]);
+        if (!reason) return '';
+        const label = agent === 'fatigue' ? 'Fatigue' : agent === 'risk' ? 'Risk' : 'Tactical';
+        return `${label}: ${reason}`;
+      })
+      .filter(Boolean);
+    if (entries.length === 0) return '';
+    return `Agent AI failures: ${entries.join(' | ')}`;
+  })();
   const activeStrategicAnalysis = isFullAnalysis ? combinedAnalysis : strategicAnalysis;
   const analysisBadgeLabel = isFullAnalysis ? 'FULL ANALYSIS' : 'AUTO ROUTING';
   const hasAnyAnalysis = Boolean(
@@ -6615,17 +6847,28 @@ function Dashboard({
     if (entry.state === 'ERROR') detail = 'No output';
     return { ...entry, detail };
   });
-  const copilotFallbackMode = Boolean(
-    orchestrateMeta?.responseMode === 'fallback' ||
-    (Array.isArray(orchestrateMeta?.usedFallbackAgents) && orchestrateMeta.usedFallbackAgents.length > 0) ||
-    Object.values(agentFeedStatus).some((state) => state === 'FALLBACK') ||
-    (Object.values(agentFeedStatus).some((state) => state === 'ERROR') && hasCopilotActivationSignal) ||
-    Boolean(orchestrateMeta?.routerFallbackMessage) ||
-    /(fallback|rules|orchestrate_exception|openai_error|agent_http_error|missing[_\s-]?config|model unavailable|azure env missing)/i.test(
-      `${orchestrateMeta?.routerFallbackMessage || ''} ${routerDecisionForView?.reason || ''}`
-    )
+  const copilotRoutingHints = `${orchestrateMeta?.routerFallbackMessage || ''} ${routerDecisionForView?.reason || ''} ${orchestrateMeta?.responseMode || ''} ${orchestrateMeta?.llmMode || ''}`;
+  const copilotConfigFallback = Boolean(
+    !aiEnabled ||
+    /(missing[_\s-]?config|azure env missing|ai_enabled=false|missing_aoai_config|llm_mode_rules|not configured)/i.test(copilotRoutingHints)
   );
+  const copilotUpstreamFailure = /(openai_error|agent_http_error|openai_call_failed|ai_upstream_failed|openai_http_|llm-error:|upstream_error|status[:= ](?:401|403|429|5\d\d))/i.test(
+    copilotRoutingHints
+  );
+  const copilotFallbackMode = Boolean(copilotConfigFallback || copilotUpstreamFailure);
   const isExplicitFallbackMode = orchestrateMeta?.responseMode === 'fallback';
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    console.log('[copilot][chat-mode]', {
+      aiEnabled,
+      forceFallbackMode: copilotFallbackMode,
+      configFallback: copilotConfigFallback,
+      upstreamFailure: copilotUpstreamFailure,
+      responseMode: orchestrateMeta?.responseMode || null,
+      llmMode: orchestrateMeta?.llmMode || null,
+      routerReason: routerDecisionForView?.reason || null,
+    });
+  }, [aiEnabled, copilotConfigFallback, copilotFallbackMode, copilotUpstreamFailure, orchestrateMeta?.llmMode, orchestrateMeta?.responseMode, routerDecisionForView?.reason]);
   const advancedSignalRecord = routerDecisionForView?.signals || {};
   const advancedFatigueSignal = safeNum(advancedSignalRecord.fatigueIndex ?? aiAnalysis?.fatigueIndex ?? activePlayer?.fatigue, Number.NaN);
   const advancedStrainSignal = safeNum(advancedSignalRecord.strainIndex ?? activePlayer?.strainIndex, Number.NaN);
@@ -8142,6 +8385,9 @@ function Dashboard({
     const execute = (modeOverride: TeamMode) => {
       const resolvedFocusRole: 'BOWLER' | 'BATTER' = modeOverride === 'BATTING' ? 'BATTER' : 'BOWLER';
       setShowCoachInsights(true);
+      setShowFullAnalysisInfo(false);
+      setShowDismissAnalysisInfo(false);
+      setFullAnalysisRunPending(true);
       primeCoachAutoScroll();
       void runAgent('full', 'button_click', {
         teamMode: modeOverride,
@@ -8731,6 +8977,8 @@ function Dashboard({
                         <CopilotChatPanel
                           analysisReady={hasCoachOutputText && agentExecutionFinished}
                           analysisId={effectiveCopilotAnalysisId || analysisBundleId}
+                          analysisExecuted={analysisExecuted}
+                          analysisStale={analysisStale}
                           resetKey={copilotResetKey}
                           suggestedQuestions={copilotSuggestedQuestions}
                           fallbackContext={copilotFallbackContext}
@@ -8982,6 +9230,8 @@ function Dashboard({
                       <CopilotChatPanel
                         analysisReady={hasCoachOutputText && agentExecutionFinished}
                         analysisId={effectiveCopilotAnalysisId || analysisBundleId}
+                        analysisExecuted={analysisExecuted}
+                        analysisStale={analysisStale}
                         resetKey={copilotResetKey}
                         suggestedQuestions={copilotSuggestedQuestions}
                         fallbackContext={copilotFallbackContext}
@@ -9040,7 +9290,7 @@ function Dashboard({
               </div>
             </div>
 
-            <div className="flex-1 min-h-0 flex flex-col px-6 py-5">
+            <div className={`${isCoachOutputState ? 'min-h-0 flex flex-col px-6 py-5' : 'flex-1 min-h-0 flex flex-col px-6 py-5'}`}>
               {activePlayer ? (
                 <>
                   {!isCoachOutputState && (
@@ -9149,6 +9399,12 @@ function Dashboard({
                               </span>
                             </div>
                             <p className="text-[11px] text-slate-300 mt-1">{routerStatusHint.engagedLine}</p>
+                            {analysisRunModeLine && (
+                              <p className="text-[11px] text-slate-400 mt-1">{analysisRunModeLine}</p>
+                            )}
+                            {analysisAgentFailureLine && (
+                              <p className="text-[11px] text-slate-500 mt-1">{analysisAgentFailureLine}</p>
+                            )}
                             <div className="mt-2 flex flex-wrap gap-1.5">
                               {routerAgentChips.map((chip) => (
                                 <span
@@ -9596,8 +9852,17 @@ function Dashboard({
 
                           {isExplicitFallbackMode && (
                             <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
-                              Fallback mode active (Azure OpenAI not configured).
-                              <Info className="w-3 h-3 text-slate-500" title="Set AOAI env vars in local settings or Azure App Service to enable Azure OpenAI." />
+                              {aiEnabled
+                                ? 'Fallback mode active (using local/rules response for this run).'
+                                : 'Fallback mode active (Azure OpenAI unavailable).'}
+                              <Info
+                                className="w-3 h-3 text-slate-500"
+                                title={
+                                  aiEnabled
+                                    ? 'This run used fallback/rules output. Copilot chat may still use AI if available.'
+                                    : 'Set AOAI env vars in local settings or Azure App Service to enable Azure OpenAI.'
+                                }
+                              />
                             </p>
                           )}
                         </motion.div>
@@ -9635,19 +9900,151 @@ function Dashboard({
 	                <div className="space-y-3">
 	                  {isCoachOutputState && (
 	                    <>
-                      <button type="button"
-                        onClick={(event) => handleRunCoachFull(event)}
-                        disabled={agentState === 'thinking'}
-                        className={`w-full py-3 rounded-2xl border text-sm font-semibold backdrop-blur-sm transition-all duration-200 ${agentState === 'thinking' ? 'border-slate-700/80 bg-slate-900/60 text-slate-500 cursor-not-allowed shadow-none' : 'border-emerald-400/30 bg-gradient-to-r from-emerald-500/20 via-cyan-500/20 to-blue-500/20 text-white shadow-lg shadow-emerald-500/10 hover:from-emerald-500/30 hover:via-cyan-500/30 hover:to-blue-500/30 hover:border-emerald-300/50 hover:shadow-xl hover:shadow-cyan-500/15'}`}
-                      >
-                        {agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}
-                      </button>
+                      {analysisExecuted && analysisStale && (
+                        <p
+                          style={{
+                            marginTop: '12px',
+                            marginBottom: '12px',
+                            padding: '10px 12px',
+                            borderRadius: '12px',
+                            background: 'rgba(255, 184, 77, 0.10)',
+                            border: '1px solid rgba(255, 184, 77, 0.28)',
+                            color: '#ffd38a',
+                            fontSize: '13px',
+                            lineHeight: '1.4',
+                          }}
+                        >
+                          ⚠️ Inputs changed — dismiss or rerun AI analysis for updated guidance.
+                        </p>
+                      )}
+                      <div className="min-h-[48px] flex items-center">
+                        {!fullAnalysisExecuted || analysisStale ? (
+                          <button type="button"
+                            onClick={(event) => handleRunCoachFull(event)}
+                            disabled={agentState === 'thinking'}
+                            className={`w-full py-3 rounded-2xl border text-sm font-semibold transition-all duration-200 relative text-center ${agentState === 'thinking' ? 'cursor-not-allowed' : ''}`}
+                            style={agentState === 'thinking'
+                              ? {
+                                  background: 'rgba(15, 23, 42, 0.7)',
+                                  border: '1px solid rgba(100, 116, 139, 0.55)',
+                                  color: 'rgba(148, 163, 184, 0.9)',
+                                  boxShadow: 'none',
+                                  backdropFilter: 'blur(6px)',
+                                }
+                              : {
+                                  background: 'linear-gradient(135deg, rgba(160,60,72,0.42), rgba(138,48,66,0.48))',
+                                  border: '1px solid rgba(220,120,140,0.38)',
+                                  color: '#ffffff',
+                                  boxShadow: '0 8px 20px rgba(120,40,60,0.18)',
+                                  backdropFilter: 'blur(6px)',
+                                }}
+                          >
+                            <span className="block w-full whitespace-nowrap">{agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}</span>
+                            <span
+                              className="absolute inline-flex items-center justify-center rounded-full p-0.5 text-sky-100/60 transition-colors duration-150 hover:text-sky-100/90 focus-visible:text-sky-100/90"
+                              style={{ right: 14, top: '50%', transform: 'translateY(-50%)' }}
+                              onMouseEnter={() => setShowFullAnalysisInfo(true)}
+                              onMouseLeave={() => setShowFullAnalysisInfo(false)}
+                              onFocus={() => setShowFullAnalysisInfo(true)}
+                              onBlur={() => setShowFullAnalysisInfo(false)}
+                              tabIndex={0}
+                              role="button"
+                              aria-label="About full combined analysis"
+                              onMouseDown={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                              }}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                              }}
+                            >
+                              <Info className="h-3.5 w-3.5" />
+                              <span
+                                role="tooltip"
+                                className={`pointer-events-none absolute transition-all duration-150 ${showFullAnalysisInfo ? 'opacity-100 scale-100 -translate-y-0.5' : 'opacity-0 scale-95 translate-y-0'}`}
+                                style={{
+                                  position: 'absolute',
+                                  right: 0,
+                                  bottom: 'calc(100% + 10px)',
+                                  maxWidth: 240,
+                                  width: 'max-content',
+                                  padding: '10px 12px',
+                                  borderRadius: 12,
+                                  background: 'rgba(10, 18, 36, 0.96)',
+                                  border: '1px solid rgba(120, 150, 210, 0.22)',
+                                  boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
+                                  color: '#e8eefc',
+                                  fontSize: 13,
+                                  lineHeight: 1.4,
+                                  textAlign: 'left',
+                                  zIndex: 60,
+                                  transformOrigin: 'bottom right',
+                                  whiteSpace: 'normal',
+                                }}
+                              >
+                                Combines outputs from fatigue, risk, and tactical agents into one unified coaching recommendation.
+                              </span>
+                            </span>
+                          </button>
+                        ) : (
+                          <p className="w-full text-center text-xs text-slate-400/80">
+                            Combined analysis executed
+                          </p>
+                        )}
+                      </div>
 
                       <button type="button"
                         onClick={handleDismissAnalysis}
-                        className="w-full py-3 rounded-lg border border-slate-700 text-slate-400 text-sm hover:text-white hover:bg-slate-800 transition-colors"
+                        className="w-full py-3 rounded-lg border border-slate-700 text-slate-400 text-sm hover:text-white hover:bg-slate-800 transition-colors relative text-center"
                       >
-                        Dismiss Analysis
+                        <span className="block w-full">Dismiss Analysis</span>
+                        <span
+                          className="absolute inline-flex items-center justify-center rounded-full p-0.5 text-sky-100/55 transition-colors duration-150 hover:text-sky-100/85 focus-visible:text-sky-100/85"
+                          style={{ right: 14, top: '50%', transform: 'translateY(-50%)' }}
+                          onMouseEnter={() => setShowDismissAnalysisInfo(true)}
+                          onMouseLeave={() => setShowDismissAnalysisInfo(false)}
+                          onFocus={() => setShowDismissAnalysisInfo(true)}
+                          onBlur={() => setShowDismissAnalysisInfo(false)}
+                          tabIndex={0}
+                          role="button"
+                          aria-label="About dismiss analysis"
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                        >
+                          <Info className="h-3.5 w-3.5" />
+                          <span
+                            role="tooltip"
+                            className={`pointer-events-none absolute transition-all duration-150 ${showDismissAnalysisInfo ? 'opacity-100 scale-100 -translate-y-0.5' : 'opacity-0 scale-95 translate-y-0'}`}
+                            style={{
+                              position: 'absolute',
+                              right: 0,
+                              bottom: 'calc(100% + 10px)',
+                              maxWidth: 240,
+                              width: 'max-content',
+                              padding: '10px 12px',
+                              borderRadius: 12,
+                              background: 'rgba(10, 18, 36, 0.96)',
+                              border: '1px solid rgba(120, 150, 210, 0.22)',
+                              boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
+                              color: '#e8eefc',
+                              fontSize: 13,
+                              lineHeight: 1.4,
+                              textAlign: 'left',
+                              zIndex: 60,
+                              transformOrigin: 'bottom right',
+                              whiteSpace: 'normal',
+                            }}
+                          >
+                            Clears the current AI analysis so you can run it again with updated inputs.
+                          </span>
+                        </span>
                       </button>
                     </>
                   )}

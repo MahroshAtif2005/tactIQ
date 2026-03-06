@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { postCopilotChat } from '../lib/apiClient';
+import { copilotChatUrl, postCopilotChat } from '../lib/apiClient';
 
 type CopilotRole = 'user' | 'assistant';
 
@@ -16,6 +16,8 @@ interface CopilotChatPanelProps {
   suggestedQuestions?: string[];
   onAnalysisIdSync?: (analysisId: string) => void;
   forceFallbackMode?: boolean;
+  analysisExecuted?: boolean;
+  analysisStale?: boolean;
   fallbackContext?: {
     matchContextSnapshot?: Record<string, unknown>;
     telemetry?: Record<string, unknown>;
@@ -131,6 +133,8 @@ export default function CopilotChatPanel({
   suggestedQuestions,
   onAnalysisIdSync,
   forceFallbackMode = false,
+  analysisExecuted = false,
+  analysisStale = false,
   fallbackContext,
 }: CopilotChatPanelProps) {
   const [isOpen, setIsOpen] = useState(false);
@@ -140,6 +144,10 @@ export default function CopilotChatPanel({
   const [messagesUsed, setMessagesUsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [lastPrompt, setLastPrompt] = useState<string>('');
+  const [runtimeSource, setRuntimeSource] = useState<'ai' | 'fallback'>(forceFallbackMode ? 'fallback' : 'ai');
+  const [runtimeNote, setRuntimeNote] = useState<string | null>(
+    forceFallbackMode ? 'Copilot is running in fallback/local mode because Azure OpenAI is unavailable.' : null
+  );
   const [hoveredSuggestionIndex, setHoveredSuggestionIndex] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const railRef = useRef<HTMLDivElement | null>(null);
@@ -177,7 +185,23 @@ export default function CopilotChatPanel({
     setMessagesUsed(0);
     setError(null);
     setLastPrompt('');
+    setRuntimeSource(localRulesMode ? 'fallback' : 'ai');
+    setRuntimeNote(localRulesMode ? 'Copilot is running in fallback/local mode because Azure OpenAI is unavailable.' : null);
   }, [resetKey]);
+
+  useEffect(() => {
+    if (localRulesMode) {
+      setRuntimeSource('fallback');
+      setRuntimeNote('Copilot is running in fallback/local mode because Azure OpenAI is unavailable.');
+      return;
+    }
+    setRuntimeSource('ai');
+    setRuntimeNote((prev) => {
+      if (!prev) return null;
+      if (/Azure OpenAI is unavailable/i.test(prev)) return null;
+      return prev;
+    });
+  }, [localRulesMode]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -226,6 +250,15 @@ export default function CopilotChatPanel({
         role: turn.role,
         content: turn.content,
       }));
+      if (import.meta.env.DEV) {
+        console.log('[copilot] submit', {
+          prompt,
+          analysisId: resolvedAnalysisId,
+          routeCalled: localRulesMode ? 'local-fallback(no request)' : copilotChatUrl,
+          localRulesMode,
+          historyTurns: history.length,
+        });
+      }
       const basePayload = {
         analysisId: resolvedAnalysisId,
         message: prompt,
@@ -239,6 +272,14 @@ export default function CopilotChatPanel({
         ...(fallbackContext?.sessionId ? { sessionId: fallbackContext.sessionId } : {}),
       };
       if (localRulesMode) {
+        if (import.meta.env.DEV) {
+          console.warn('[copilot] fallback_local', {
+            prompt,
+            analysisId: resolvedAnalysisId,
+            routeCalled: 'local-fallback(no request)',
+            reason: 'forceFallbackMode',
+          });
+        }
         const assistantTurn: CopilotTurn = {
           id: nextTurnId(),
           role: 'assistant',
@@ -246,17 +287,34 @@ export default function CopilotChatPanel({
         };
         setMessages((prev) => [...prev, assistantTurn]);
         setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
+        setRuntimeSource('fallback');
+        setRuntimeNote('Copilot is running in fallback/local mode because Azure OpenAI is unavailable.');
         onAnalysisIdSync?.(resolvedAnalysisId);
         return;
       }
       const response = await postCopilotChat(basePayload);
       const reply = String(response?.reply || '').trim() || 'No reply returned from Copilot.';
+      const responseSource = String(response?.source || '').trim().toLowerCase() === 'ai' ? 'ai' : 'fallback';
       const assistantTurn: CopilotTurn = {
         id: nextTurnId(),
         role: 'assistant',
         content: reply,
       };
       setMessages((prev) => [...prev, assistantTurn]);
+      setRuntimeSource(responseSource);
+      setRuntimeNote(
+        responseSource === 'fallback'
+          ? 'Copilot response came from fallback/local mode.'
+          : null
+      );
+      if (import.meta.env.DEV) {
+        console.log('[copilot] response', {
+          routeCalled: String(response?.routeCalled || copilotChatUrl || '').trim() || '/api/copilot-chat',
+          source: responseSource,
+          mode: response?.mode || null,
+          fallbackReason: response?.fallbackReason || null,
+        });
+      }
       const analysisIdUsed = String(response?.analysisIdUsed || '').trim();
       if (analysisIdUsed.length > 0) {
         onAnalysisIdSync?.(analysisIdUsed);
@@ -268,7 +326,10 @@ export default function CopilotChatPanel({
       }
     } catch (sendError) {
       if (import.meta.env.DEV) {
-        console.error('[copilot] send failed', sendError);
+        console.error('[copilot] send failed', {
+          routeCalled: copilotChatUrl,
+          error: sendError instanceof Error ? sendError.message : String(sendError),
+        });
       }
       const fallbackReply = buildDemoCopilotReply(prompt, fallbackContext);
       const assistantTurn: CopilotTurn = {
@@ -278,7 +339,9 @@ export default function CopilotChatPanel({
       };
       setMessages((prev) => [...prev, assistantTurn]);
       setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
-      setError(null);
+      setRuntimeSource('fallback');
+      setRuntimeNote('Copilot API request failed; showing local fallback response.');
+      setError('Live Copilot unavailable right now; showing local fallback response.');
     } finally {
       setIsSending(false);
     }
@@ -294,6 +357,15 @@ export default function CopilotChatPanel({
           <p className="text-[11px] text-slate-400">Discuss this match state</p>
         </div>
         <div className="flex items-center gap-2">
+          <span
+            className={`text-[10px] px-2 py-0.5 rounded border ${
+              runtimeSource === 'ai'
+                ? 'border-emerald-400/40 text-emerald-100 bg-emerald-500/10'
+                : 'border-amber-400/40 text-amber-100 bg-amber-500/10'
+            }`}
+          >
+            {runtimeSource === 'ai' ? 'Live AI' : 'Fallback/local'}
+          </span>
           <span className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800/70">
             {messagesUsed}/{promptLimit}
           </span>
@@ -367,28 +439,45 @@ export default function CopilotChatPanel({
           <p className="text-[11px] text-amber-100">Run Coach Analysis first to unlock Copilot Chat.</p>
         </div>
       )}
+      {runtimeSource === 'fallback' && runtimeNote && (
+        <div className="rounded-md border border-amber-400/35 bg-amber-500/10 px-3 py-2 mt-1">
+          <p className="text-[11px] text-amber-100">{runtimeNote}</p>
+        </div>
+      )}
 
       {isOpen && (
         <div className="mt-2 rounded-xl border border-white/10 bg-slate-900/40 p-3">
+          {analysisExecuted && analysisStale && (
+            <div
+              style={{
+                marginBottom: '10px',
+                padding: '8px 10px',
+                borderRadius: '10px',
+                background: 'rgba(255,184,77,0.08)',
+                border: '1px solid rgba(255,184,77,0.25)',
+                color: '#ffd38a',
+                fontSize: '12.5px',
+                lineHeight: '1.4',
+              }}
+            >
+              ⚠️ Inputs changed since the last AI analysis. Rerun or dismiss analysis for updated guidance.
+            </div>
+          )}
           <div ref={scrollRef} className="max-h-56 overflow-y-auto space-y-3 pr-1 pb-6">
-            {messages.length === 0 ? (
-              <p className="text-[11px] text-slate-400">Ask about this match plan, workload, and next-over tactics.</p>
-            ) : (
-              messages.map((turn) => (
-                <div
-                  key={turn.id}
-                  className={`text-[12px] p-4 ${turn.role === 'user' ? 'ml-8' : 'mr-8'}`}
-                  style={turn.role === 'assistant' ? copilotStyle : userStyle}
-                >
-                  {turn.role === 'assistant' && (
-                    <div style={{ fontSize: 11, letterSpacing: 2, fontWeight: 700, color: 'rgba(167,243,208,0.95)', marginBottom: 4 }}>COPILOT</div>
-                  )}
-                  <div style={{ color: 'rgba(255,255,255,0.92)', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                    {turn.content}
-                  </div>
+            {messages.map((turn) => (
+              <div
+                key={turn.id}
+                className={`text-[12px] p-4 ${turn.role === 'user' ? 'ml-8' : 'mr-8'}`}
+                style={turn.role === 'assistant' ? copilotStyle : userStyle}
+              >
+                {turn.role === 'assistant' && (
+                  <div style={{ fontSize: 11, letterSpacing: 2, fontWeight: 700, color: 'rgba(167,243,208,0.95)', marginBottom: 4 }}>COPILOT</div>
+                )}
+                <div style={{ color: 'rgba(255,255,255,0.92)', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  {turn.content}
                 </div>
-              ))
-            )}
+              </div>
+            ))}
             {isSending && (
               <div className="text-[12px] mr-8" style={copilotStyle}>
                 <div className="p-4">

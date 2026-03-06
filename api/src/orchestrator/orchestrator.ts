@@ -157,6 +157,37 @@ const toAgentResultStatus = (status: string | undefined, didRun: boolean, hasOut
   if (status === 'error' || !hasOutput) return 'error';
   return 'success';
 };
+const extractHttpStatusFromFallback = (value: unknown): number | undefined => {
+  const token = String(value || '').trim();
+  if (!token) return undefined;
+  const match = token.match(/openai_http_(\d{3})/i) || token.match(/status[:= ]+(\d{3})/i) || token.match(/\((\d{3})\)/);
+  if (!match) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+const summarizeFallbackReason = (value: unknown): string => {
+  const token = String(value || '').trim();
+  if (!token) return 'llm_failed';
+  if (/json_schema/i.test(token)) return 'json_schema_failed';
+  if (/json_parse/i.test(token)) return 'json_parse_failed';
+  if (/timeout/i.test(token)) return 'openai_timeout';
+  const httpStatus = extractHttpStatusFromFallback(token);
+  if (typeof httpStatus === 'number') return `openai_http_${httpStatus}`;
+  if (/missing:/i.test(token)) return 'missing_config';
+  if (/orchestrator-error:/i.test(token)) return 'orchestrator_error';
+  return token.length > 140 ? `${token.slice(0, 137)}...` : token;
+};
+const classifyFallbackCategory = (value: unknown): string => {
+  const token = String(value || '').trim().toLowerCase();
+  if (!token) return 'unknown';
+  if (token.includes('json_schema')) return 'json_schema_failed';
+  if (token.includes('json_parse')) return 'json_parse_failed';
+  if (token.includes('timeout')) return 'openai_timeout';
+  if (token.includes('openai_http_') || typeof extractHttpStatusFromFallback(token) === 'number') return 'openai_http_error';
+  if (token.includes('missing:')) return 'missing_config';
+  if (token.includes('orchestrator-error')) return 'orchestrator_error';
+  return 'fallback';
+};
 const normalizeConfidenceToScore = (confidence: FinalRecommendation['confidence']): number => {
   if (confidence === 'HIGH') return 0.82;
   if (confidence === 'MEDIUM') return 0.66;
@@ -1333,18 +1364,41 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
   const fatigueRoutedTo = toAgentRoute(fatigue?.status, fatigueModel);
   const riskRoutedTo = toAgentRoute(risk?.status, riskModel);
   const tacticalRoutedTo = toAgentRoute(tactical?.status, tacticalModel);
+  const fatigueFallbackReason = fatigueResult?.fallbacksUsed.find((entry) => String(entry || '').trim().length > 0);
+  const riskFallbackReason = riskResult?.fallbacksUsed.find((entry) => String(entry || '').trim().length > 0);
+  const tacticalFallbackReason = tacticalResult?.fallbacksUsed.find((entry) => String(entry || '').trim().length > 0);
+  if (runFlags.risk && risk?.status === 'fallback') {
+    const payload = {
+      requestId,
+      requestType,
+      manualRequest,
+      userAction: String(inputWithContext.userAction || '').trim() || undefined,
+      aiAttempted: String(inputWithContext.llmMode || '').trim().toLowerCase() === 'ai',
+      category: classifyFallbackCategory(riskFallbackReason),
+      reason: summarizeFallbackReason(riskFallbackReason),
+      rawReason: String(riskFallbackReason || ''),
+      fallbacksUsed: riskResult?.fallbacksUsed || [],
+      riskMs: timingsMs.risk,
+    };
+    if (typeof (context as InvocationContext & { error?: (...args: unknown[]) => void }).error === 'function') {
+      (context as InvocationContext & { error: (...args: unknown[]) => void }).error('[orchestrate] risk_fallback', payload);
+    } else {
+      context.log('[orchestrate] risk_fallback', payload);
+    }
+  }
   const deriveRouteReason = (
     agent: LegacyAgentId,
     didRun: boolean,
     status: string | undefined,
     selected: boolean,
-    enabled: boolean
+    enabled: boolean,
+    fallbackReason?: string
   ): string => {
     if (!selected) return 'not_selected_by_auto_router';
     if (!enabled) return 'disabled_by_request';
     if (!didRun) return 'not_executed';
     if (status === 'fallback') {
-      return 'llm_failed';
+      return summarizeFallbackReason(fallbackReason);
     }
     if (status === 'error') return `${agent}:error`;
     return 'llm_success';
@@ -1354,21 +1408,24 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     runFlags.fatigue,
     fatigue?.status,
     selectedSet.has('fatigue'),
-    enabledFlags.fatigue
+    enabledFlags.fatigue,
+    fatigueFallbackReason
   );
   const riskRouteReason = deriveRouteReason(
     'risk',
     runFlags.risk,
     risk?.status,
     selectedSet.has('risk'),
-    enabledFlags.risk
+    enabledFlags.risk,
+    riskFallbackReason
   );
   const tacticalRouteReason = deriveRouteReason(
     'tactical',
     runFlags.tactical,
     tactical?.status,
     selectedSet.has('tactical'),
-    enabledFlags.tactical
+    enabledFlags.tactical,
+    tacticalFallbackReason
   );
   const routerAgentDetails: NonNullable<RouterDecision['agents']> = {
     fatigue: {
@@ -1398,6 +1455,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     fatigue: {
       status: toAgentResultStatus(fatigue?.status, runFlags.fatigue, Boolean(fatigue)),
       routedTo: fatigueRoutedTo,
+      reason: fatigueRouteReason,
       ...(fatigue ? { output: fatigue as unknown as Record<string, unknown> } : {}),
       ...(!runFlags.fatigue
         ? { error: selectedSet.has('fatigue') ? 'Agent explicitly disabled by request.' : 'Agent not selected by auto router.' }
@@ -1408,6 +1466,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     risk: {
       status: toAgentResultStatus(risk?.status, runFlags.risk, Boolean(risk)),
       routedTo: riskRoutedTo,
+      reason: riskRouteReason,
       ...(risk ? { output: risk as unknown as Record<string, unknown> } : {}),
       ...(!runFlags.risk
         ? { error: selectedSet.has('risk') ? 'Agent explicitly disabled by request.' : 'Agent not selected by auto router.' }
@@ -1418,6 +1477,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     tactical: {
       status: toAgentResultStatus(tactical?.status, runFlags.tactical, Boolean(tactical)),
       routedTo: tacticalRoutedTo,
+      reason: tacticalRouteReason,
       ...(tactical ? { output: tactical as unknown as Record<string, unknown> } : {}),
       ...(!runFlags.tactical
         ? { error: selectedSet.has('tactical') ? 'Agent explicitly disabled by request.' : 'Agent not selected by auto router.' }

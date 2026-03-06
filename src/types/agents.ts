@@ -191,6 +191,9 @@ export interface OrchestrateResponse {
   llmMode?: 'ai' | 'rules';
   routingMode?: 'ai' | 'fallback' | 'demo';
   reasons?: string[];
+  fallbackReason?: string;
+  azureAttempted?: boolean;
+  agentAiFailures?: Partial<Record<'fatigue' | 'risk' | 'tactical', string>>;
   analysisId?: string;
   analysisBundleId?: string;
   summary?: string;

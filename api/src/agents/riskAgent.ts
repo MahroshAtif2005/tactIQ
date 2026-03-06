@@ -22,6 +22,9 @@ type LLMRiskOutput = {
   confidence: number | 'low' | 'med' | 'medium' | 'high';
 };
 
+const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value && typeof value === 'object' && !Array.isArray(value));
+
 const isLLMRiskOutput = (value: unknown): value is LLMRiskOutput => {
   const candidate = value as LLMRiskOutput;
   return Boolean(
@@ -67,6 +70,115 @@ const normalizeConfidenceScore = (value: unknown): number => {
   if (token === 'low') return 0.4;
   return 0.65;
 };
+
+const parseNumericRiskScore = (value: unknown): number | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value <= 10 ? clamp(value * 10, 0, 100) : clamp(value, 0, 100);
+  }
+  const token = String(value || '').trim();
+  if (!token) return undefined;
+  const match = token.match(/-?\d+(\.\d+)?/);
+  if (!match) return undefined;
+  const parsed = Number(match[0]);
+  if (!Number.isFinite(parsed)) return undefined;
+  return parsed <= 10 && !/%/.test(token) ? clamp(parsed * 10, 0, 100) : clamp(parsed, 0, 100);
+};
+
+const normalizeWhyLines = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeText(entry)).filter(Boolean);
+  }
+  const normalized = normalizeText(value);
+  if (!normalized) return [];
+  const cleaned = normalized
+    .replace(/^\s*[-*•]\s*/g, '')
+    .replace(/\s*[-*•]\s*/g, ' | ');
+  const segments = cleaned
+    .split(/\s*\|\s*|\s*;\s*|\n+/)
+    .map((entry) => normalizeText(entry))
+    .filter(Boolean);
+  return segments.length > 0 ? segments : [normalized];
+};
+
+const parseStatusFromErrorMessage = (message: string): number | undefined => {
+  const match = String(message || '').match(/\((\d{3})\)|status[:= ]+(\d{3})/i);
+  if (!match) return undefined;
+  const parsed = Number(match[1] || match[2]);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const classifyRiskFallbackCategory = (error: unknown): string => {
+  if (error instanceof LLMJsonResponseError) {
+    return error.phase === 'parse' ? 'json_parse_failed' : 'json_schema_failed';
+  }
+  if (error instanceof LLMRequestError) {
+    if (error.status === 408 || /timeout/i.test(error.message || '')) return 'openai_timeout';
+    if (typeof error.status === 'number') return `openai_http_${error.status}`;
+    if (/timeout/i.test(error.message || '')) return 'openai_timeout';
+    return 'openai_request_failed';
+  }
+  const message = error instanceof Error ? error.message : String(error || '');
+  if (/timeout/i.test(message)) return 'openai_timeout';
+  return 'runtime_exception';
+};
+
+const extractRiskFailureDetails = (
+  error: unknown
+): {
+  category: string;
+  message: string;
+  status?: number;
+  code?: string;
+  phase?: 'parse' | 'schema';
+  bodySnippet?: string;
+  rawSnippet?: string;
+} => {
+  const category = classifyRiskFallbackCategory(error);
+  let status: number | undefined;
+  let code = '';
+  let phase: 'parse' | 'schema' | undefined;
+  let bodySnippet = '';
+  let rawSnippet = '';
+  const message = normalizeText(error instanceof Error ? error.message : String(error || 'risk_llm_error')).slice(0, 240);
+
+  if (error instanceof LLMRequestError) {
+    status = error.status;
+    code = String((error as LLMRequestError & { code?: unknown }).code || '').trim();
+    bodySnippet = normalizeText(error.bodySnippet || '').slice(0, 220);
+  } else if (error instanceof LLMJsonResponseError) {
+    phase = error.phase;
+    code = `json_${error.phase}`;
+    rawSnippet = normalizeText(error.rawSnippet || '').slice(0, 220);
+  } else if (error && typeof error === 'object') {
+    const candidate = error as {
+      status?: unknown;
+      statusCode?: unknown;
+      code?: unknown;
+      bodySnippet?: unknown;
+      rawSnippet?: unknown;
+    };
+    const parsedStatus = Number(candidate.status ?? candidate.statusCode);
+    status = Number.isFinite(parsedStatus) ? parsedStatus : undefined;
+    code = String(candidate.code || '').trim();
+    bodySnippet = normalizeText(candidate.bodySnippet || '').slice(0, 220);
+    rawSnippet = normalizeText(candidate.rawSnippet || '').slice(0, 220);
+  }
+
+  if (typeof status !== 'number') {
+    status = parseStatusFromErrorMessage(message);
+  }
+
+  return {
+    category,
+    message,
+    ...(typeof status === 'number' ? { status } : {}),
+    ...(code ? { code } : {}),
+    ...(phase ? { phase } : {}),
+    ...(bodySnippet ? { bodySnippet } : {}),
+    ...(rawSnippet ? { rawSnippet } : {}),
+  };
+};
+
 const llmFallbackReason = (error: unknown): string => {
   const message = normalizeText(error instanceof Error ? error.message : String(error || 'llm-error')).slice(0, 240);
   let status: number | undefined;
@@ -98,12 +210,117 @@ const llmFallbackReason = (error: unknown): string => {
 
 const normalizeRiskLevel = (value: unknown, fallbackScore: number): 'low' | 'medium' | 'high' => {
   const token = String(value || '').trim().toLowerCase();
+  if (!token) {
+    if (fallbackScore >= 70) return 'high';
+    if (fallbackScore >= 40) return 'medium';
+    return 'low';
+  }
   if (token === 'high') return 'high';
-  if (token === 'medium' || token === 'med') return 'medium';
-  if (token === 'low') return 'low';
+  if (token === 'medium' || token === 'med' || token === 'moderate' || token === 'elevated') return 'medium';
+  if (token === 'low' || token === 'stable') return 'low';
+  if (token.includes('high concern')) return 'high';
+  if (token.includes('elevated') || token.includes('moderate')) return 'medium';
+  if (token.includes('stable') || token.includes('low')) return 'low';
   if (fallbackScore >= 70) return 'high';
   if (fallbackScore >= 40) return 'medium';
   return 'low';
+};
+
+const coerceLLMRiskOutput = (
+  value: unknown
+): { output: LLMRiskOutput; normalizationNotes: string[] } | null => {
+  if (!isObjectRecord(value)) return null;
+  const pick = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        const candidate = value[key];
+        if (candidate !== undefined && candidate !== null && String(candidate).trim() !== '') return candidate;
+      }
+    }
+    return undefined;
+  };
+
+  const notes: string[] = [];
+  const injuryRiskRaw = pick('injuryRisk', 'riskScore', 'risk', 'score');
+  const normalizedRiskScore = parseNumericRiskScore(injuryRiskRaw);
+  if (normalizedRiskScore === undefined) {
+    notes.push('injuryRisk_missing_or_non_numeric');
+  } else if (!isLLMRiskOutput(value)) {
+    notes.push('injuryRisk_coerced');
+  }
+
+  const riskLevelRaw = pick('riskLevel', 'risk_level', 'riskLabel', 'riskBand');
+  const riskLevel = normalizeRiskLevel(riskLevelRaw, normalizedRiskScore ?? 35);
+  if (String(riskLevelRaw || '').trim() && !isLLMRiskOutput(value)) {
+    notes.push('riskLevel_normalized');
+  }
+
+  const primaryRiskTypeRaw = pick('primaryRiskType', 'primaryRisk', 'riskType', 'primaryConcern');
+  const whyRaw = pick('whyThisRiskIsEmerging', 'why', 'signals', 'keySignals');
+  const impactRaw = pick('performanceImpactIfContinued', 'performanceImpact', 'impactIfContinued', 'ifContinuedImpact');
+  const actionRaw = pick('recommendedAction', 'recommendation', 'nextAction', 'action');
+  const confidenceRaw = pick('confidence', 'confidenceLevel', 'confidenceScore');
+
+  const whyLines = normalizeWhyLines(whyRaw).map((entry) => toSingleSentence(entry)).filter(Boolean).slice(0, 4);
+  if (whyLines.length === 0 && String(whyRaw || '').trim()) {
+    notes.push('why_lines_empty_after_normalization');
+  } else if (!isLLMRiskOutput(value) && whyLines.length > 0) {
+    notes.push('why_lines_normalized');
+  }
+
+  const primaryRiskType = normalizeText(primaryRiskTypeRaw);
+  const performanceImpactIfContinued = toSingleSentence(impactRaw);
+  const recommendedAction = toSingleSentence(actionRaw);
+  const confidence: LLMRiskOutput['confidence'] = (() => {
+    if (typeof confidenceRaw === 'number' && Number.isFinite(confidenceRaw)) {
+      return clamp(confidenceRaw, 0, 1);
+    }
+    const token = String(confidenceRaw || '').trim().toLowerCase();
+    if (token === 'high') return 'high';
+    if (token === 'med' || token === 'medium' || token === 'moderate') return 'medium';
+    if (token === 'low') return 'low';
+    return 'medium';
+  })();
+  const injuryRisk =
+    typeof normalizedRiskScore === 'number'
+      ? normalizedRiskScore
+      : riskLevel === 'high'
+        ? 78
+        : riskLevel === 'medium'
+          ? 55
+          : 28;
+
+  const defaultPrimaryRisk = riskLevel === 'low' ? 'No immediate injury threat detected' : 'Lower-back overload';
+  const defaultImpact = 'Control can drop through the spell, forcing defensive field plans.';
+  const defaultAction =
+    riskLevel === 'high'
+      ? 'Rotate immediately, shorten the spell, and switch to a control-first plan.'
+      : riskLevel === 'medium'
+        ? 'Shorten this spell and schedule a proactive rotation at the next over break.'
+        : 'No immediate injury threat detected; continue while monitoring action quality each over.';
+
+  const hasAnySignal =
+    Boolean(primaryRiskType) ||
+    whyLines.length > 0 ||
+    Boolean(performanceImpactIfContinued) ||
+    Boolean(recommendedAction) ||
+    typeof normalizedRiskScore === 'number' ||
+    Boolean(String(riskLevelRaw || '').trim());
+
+  if (!hasAnySignal) return null;
+
+  return {
+    output: {
+      injuryRisk: clamp(injuryRisk, 0, 100),
+      riskLevel,
+      primaryRiskType: primaryRiskType || defaultPrimaryRisk,
+      whyThisRiskIsEmerging: whyLines,
+      performanceImpactIfContinued: performanceImpactIfContinued || defaultImpact,
+      recommendedAction: recommendedAction || defaultAction,
+      confidence,
+    },
+    normalizationNotes: notes,
+  };
 };
 
 const normalizeRiskToken = (value: unknown): 'LOW' | 'MED' | 'HIGH' | 'UNKNOWN' => {
@@ -425,6 +642,27 @@ export async function runRiskAgent(input: RiskAgentRequest): Promise<RiskAgentRu
   if (!aoai.ok || !routing.deployment) {
     return buildRiskFallback(input, `missing:${aoai.ok ? 'AZURE_OPENAI_DEPLOYMENT' : aoai.missing.join(',')}`);
   }
+  const endpointHost = (() => {
+    try {
+      return new URL(aoai.config.endpoint).host;
+    } catch {
+      return String(aoai.config.endpoint || '').replace(/^https?:\/\//i, '').split('/')[0] || 'unknown';
+    }
+  })();
+  console.log('[risk][openai] config', {
+    endpointHost,
+    deployment: routing.deployment,
+    fallbackDeployment: routing.fallbackDeployment,
+    apiVersion: aoai.config.apiVersion,
+  });
+  console.log('[risk][openai] attempt', {
+    attempted: true,
+    deployment: routing.deployment,
+    fallbackDeployment: routing.fallbackDeployment,
+    timeoutMs: 10000,
+    playerId: String(input.playerId || ''),
+    phase: String(input.phase || ''),
+  });
 
   const messages: LLMMessage[] = [
     {
@@ -465,26 +703,74 @@ export async function runRiskAgent(input: RiskAgentRequest): Promise<RiskAgentRu
       }),
     },
   ];
+  console.log('[risk][openai] prompt_payload', {
+    deployment: routing.deployment,
+    fallbackDeployment: routing.fallbackDeployment,
+    systemPrompt: normalizeText(messages[0]?.content || '').slice(0, 520),
+    userPayload: normalizeText(messages[1]?.content || '').slice(0, 2000),
+    messageCount: messages.length,
+  });
 
   try {
-    const result = await callLLMJsonWithRetry<LLMRiskOutput>({
+    const result = await callLLMJsonWithRetry<Record<string, unknown>>({
       deployment: routing.deployment,
       fallbackDeployment: routing.fallbackDeployment,
       baseMessages: messages,
       strictSystemMessage:
         'Return ONLY valid JSON with keys injuryRisk, riskLevel, primaryRiskType, whyThisRiskIsEmerging, performanceImpactIfContinued, recommendedAction, confidence. No markdown.',
-      validate: isLLMRiskOutput,
+      validate: isObjectRecord,
       temperature: routing.temperature,
       maxTokens: Math.max(320, routing.maxTokens),
       timeoutMs: 10000,
       retryOnTransient: true,
+      onRawResponse: ({ deployment, text }) => {
+        console.log('[risk][openai] raw_response', {
+          deployment,
+          length: String(text || '').length,
+          snippet: normalizeText(text).slice(0, 560),
+        });
+      },
+      onValidation: ({ deployment, parseOk, schemaOk, error, parsed }) => {
+        const parsedKeys = isObjectRecord(parsed) ? Object.keys(parsed).slice(0, 20) : [];
+        console.log('[risk][openai] validation', {
+          deployment,
+          parseOk,
+          schemaOk,
+          ...(error ? { error } : {}),
+          parsedKeys,
+        });
+      },
     });
+    const normalized = coerceLLMRiskOutput(result.parsed);
+    if (!normalized) {
+      const rawSnippet = normalizeText(JSON.stringify(result.parsed || {})).slice(0, 220);
+      console.error('[risk][openai] schema_validation_failed', {
+        deploymentUsed: result.deploymentUsed,
+        parsedKeys: Object.keys(result.parsed || {}).slice(0, 20),
+        rawSnippet,
+      });
+      throw new LLMJsonResponseError('LLM JSON failed schema validation', {
+        phase: 'schema',
+        rawSnippet,
+        deployment: result.deploymentUsed,
+      });
+    }
+    console.log('[risk][openai] success', {
+      deploymentUsed: result.deploymentUsed,
+      fallbacksUsed: result.fallbacksUsed,
+    });
+    if (normalized.normalizationNotes.length > 0) {
+      console.log('[risk][openai] schema_normalized', {
+        deploymentUsed: result.deploymentUsed,
+        notes: normalized.normalizationNotes,
+      });
+    }
 
-    const normalizedRisk = clamp(Number(result.parsed.injuryRisk) || 0, 0, 100);
-    const riskLevel = normalizeRiskLevel(result.parsed.riskLevel, normalizedRisk);
+    const normalizedRisk = clamp(Number(normalized.output.injuryRisk) || 0, 0, 100);
+    const riskLevel = normalizeRiskLevel(normalized.output.riskLevel, normalizedRisk);
     const severity: RiskAgentResponse['severity'] =
       riskLevel === 'high' ? 'HIGH' : riskLevel === 'medium' ? 'MED' : 'LOW';
-    const confidence = normalizeConfidenceScore(result.parsed.confidence);
+    const confidence = normalizeConfidenceScore(normalized.output.confidence);
     const context = input.fullMatchContext;
     const activeId = context?.activePlayerId || input.playerId;
     const active = context?.roster?.find((entry) => entry.playerId === activeId);
@@ -496,10 +782,10 @@ export async function runRiskAgent(input: RiskAgentRequest): Promise<RiskAgentRu
       recoveryTrend: deriveRecoveryTrend(input.heartRateRecovery),
       injuryRisk: normalizeRiskToken(input.injuryRisk),
       noBallRisk: normalizeRiskToken(input.noBallRisk),
-      primaryRiskType: result.parsed.primaryRiskType,
-      why: (result.parsed.whyThisRiskIsEmerging || []).map((entry) => toSingleSentence(entry)),
-      performanceImpact: toSingleSentence(result.parsed.performanceImpactIfContinued),
-      recommendedAction: toSingleSentence(result.parsed.recommendedAction),
+      primaryRiskType: normalized.output.primaryRiskType,
+      why: (normalized.output.whyThisRiskIsEmerging || []).map((entry) => toSingleSentence(entry)),
+      performanceImpact: toSingleSentence(normalized.output.performanceImpactIfContinued),
+      recommendedAction: toSingleSentence(normalized.output.recommendedAction),
       confidence,
     });
 
@@ -518,6 +804,15 @@ export async function runRiskAgent(input: RiskAgentRequest): Promise<RiskAgentRu
       fallbacksUsed: result.fallbacksUsed,
     };
   } catch (error) {
+    const details = extractRiskFailureDetails(error);
+    console.error('[risk][openai] failure', {
+      ...details,
+      attempted: true,
+      endpointHost,
+      deployment: routing.deployment,
+      fallbackDeployment: routing.fallbackDeployment,
+      apiVersion: aoai.config.apiVersion,
+    });
     return buildRiskFallback(input, llmFallbackReason(error));
   }
 }

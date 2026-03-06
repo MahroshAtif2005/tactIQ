@@ -190,6 +190,7 @@ curl -X POST http://localhost:7071/api/orchestrate \
 - Frontend should call `/api/*` only (same-origin); do not hardcode `http://localhost:7071` in browser calls.
 - Demo mode stores baselines in browser localStorage and bypasses Cosmos writes by design.
 - `GET /api/baselines` now returns storage diagnostics (`source`, `storage`, optional `warning`) so you can confirm reads/writes are hitting `playersByUser` and not memory fallback.
+- In production, set Cosmos app settings in SWA/Functions using either `COSMOS_*` or `AZURE_COSMOS_*` aliases (`ENDPOINT`, `KEY`, optional `CONNECTION_STRING`, `DB`, `CONTAINER_PLAYERS`).
 
 
                                      ARCHITECTURE (tactIQ)

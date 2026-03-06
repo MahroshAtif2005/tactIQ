@@ -34,13 +34,31 @@ const getStorageResponseMeta = () => {
     },
   };
   if (diagnostics.mode === 'memory') {
+    const reason = diagnostics.initFailure ? ` (${diagnostics.initFailure})` : '';
     responseMeta.warning =
-      'Cosmos unavailable. Using in-memory fallback only; data is not persisted to playersByUser.';
+      `Cosmos unavailable${reason}. Using in-memory fallback only; data is not persisted to playersByUser.`;
   }
   if (diagnostics.initFailure) {
     responseMeta.storageInitFailure = diagnostics.initFailure;
+    responseMeta.storageInitFailureDetail = diagnostics.initFailureDetail || null;
   }
   return responseMeta;
+};
+
+const logStorageFallback = (context, method, user) => {
+  const diagnostics = getStorageDiagnostics();
+  if (diagnostics.mode !== 'memory') return;
+  context.log.warn('[baselines] storage_fallback', {
+    method,
+    userId: String(user?.userId || '').trim() || null,
+    teamId: String(user?.teamId || '').trim() || null,
+    reason: diagnostics.initFailure || 'cosmos_unavailable',
+    detail: diagnostics.initFailureDetail || null,
+    db: diagnostics.databaseId,
+    container: diagnostics.playersContainerId,
+    endpointHost: diagnostics.endpointHost || 'n/a',
+    configSource: diagnostics.configSource || null,
+  });
 };
 
 module.exports = async function baselines(context, req) {
@@ -106,6 +124,12 @@ module.exports = async function baselines(context, req) {
       });
       return;
     }
+    context.log('[baselines] identity', {
+      source: String(identity?.source || '').trim() || null,
+      userId: String(user.userId || '').trim() || null,
+      teamId: String(user.teamId || '').trim() || null,
+      hasEmail: Boolean(String(user.email || '').trim()),
+    });
 
     if (method === 'GET') {
       const players = await listBaselines({ userId: user.userId, teamId: user.teamId });
@@ -137,7 +161,8 @@ module.exports = async function baselines(context, req) {
 
     if (method === 'POST') {
       if (isResetRoute) {
-        const players = await resetBaselines({ userId: user.userId, teamId: user.teamId });
+        const players = await resetBaselines({ userId: user.userId, teamId: user.teamId, userEmail: user.email || '' });
+        logStorageFallback(context, method, user);
         context.res = jsonResponse(200, {
           ok: true,
           deleted: players.length,
@@ -149,8 +174,10 @@ module.exports = async function baselines(context, req) {
       const players = await saveBaselines({
         userId: user.userId,
         teamId: user.teamId,
+        userEmail: user.email || '',
         payload: req.body,
       });
+      logStorageFallback(context, method, user);
       context.res = jsonResponse(200, {
         success: true,
         ok: true,
@@ -202,8 +229,10 @@ module.exports = async function baselines(context, req) {
       const saved = await replaceBaselines({
         userId: user.userId,
         teamId: user.teamId,
+        userEmail: user.email || '',
         payload: { players: nextPlayers },
       });
+      logStorageFallback(context, method, user);
       const player = saved.find((row) => String(row.id || '').trim() === baselineId) || null;
       context.res = jsonResponse(200, {
         ok: true,
@@ -227,6 +256,7 @@ module.exports = async function baselines(context, req) {
         teamId: user.teamId,
         baselineId,
       });
+      logStorageFallback(context, method, user);
       context.res = jsonResponse(200, {
         ok: true,
         deleted: 1,

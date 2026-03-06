@@ -44,6 +44,9 @@ const resolveAoaiRuntimeConfig = () => {
 
 applyEnvAlias('COSMOS_DB', ['COSMOS_DATABASE']);
 applyEnvAlias('COSMOS_CONTAINER_PLAYERS', ['COSMOS_CONTAINER']);
+applyEnvAlias('COSMOS_CONNECTION_STRING', ['AZURE_COSMOS_CONNECTION_STRING', 'AZURE_COSMOSDB_CONNECTION_STRING']);
+applyEnvAlias('COSMOS_ENDPOINT', ['AZURE_COSMOS_ENDPOINT', 'AZURE_COSMOSDB_ENDPOINT']);
+applyEnvAlias('COSMOS_KEY', ['AZURE_COSMOS_KEY', 'AZURE_COSMOS_PRIMARY_KEY', 'AZURE_COSMOSDB_KEY']);
 resolveAoaiRuntimeConfig();
 
 const normalizePayload = (payload) => {
@@ -102,7 +105,7 @@ const resolveAiExecution = (payload, llmState) => {
   const requestedDataMode = String(payload?.dataMode || '').trim().toLowerCase();
   const requestedLlmMode = String(payload?.llmMode || '').trim().toLowerCase();
 
-  const requestedMode = modeToken === 'ai' || modeToken === 'demo' || modeToken === 'fallback'
+  const requestedMode = modeToken === 'ai' || modeToken === 'demo' || modeToken === 'fallback' || modeToken === 'full'
     ? modeToken
     : 'auto';
 

@@ -117,6 +117,15 @@ export interface JsonRetryInput<T> {
   maxTokens?: number;
   timeoutMs?: number;
   retryOnTransient?: boolean;
+  onRawResponse?: (event: { deployment: string; text: string }) => void;
+  onValidation?: (event: {
+    deployment: string;
+    parseOk: boolean;
+    schemaOk: boolean;
+    error?: string;
+    rawSnippet?: string;
+    parsed?: unknown;
+  }) => void;
 }
 
 export interface JsonRetryResult<T> {
@@ -152,8 +161,16 @@ export async function callLLMJsonWithRetry<T>(input: JsonRetryInput<T>): Promise
         responseFormat: { type: 'json_object' },
         timeoutMs: input.timeoutMs ?? 10000,
       });
+      input.onRawResponse?.({ deployment, text });
       const parsedResult = safeJsonParse(text);
       if (!parsedResult.ok) {
+        input.onValidation?.({
+          deployment,
+          parseOk: false,
+          schemaOk: false,
+          error: parsedResult.error || 'parse-failed',
+          rawSnippet: String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+        });
         throw new LLMJsonResponseError(`Invalid JSON from LLM: ${parsedResult.error || 'parse-failed'}`, {
           phase: 'parse',
           rawSnippet: String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200),
@@ -162,12 +179,26 @@ export async function callLLMJsonWithRetry<T>(input: JsonRetryInput<T>): Promise
       }
       const parsed = parsedResult.data;
       if (!input.validate(parsed)) {
+        input.onValidation?.({
+          deployment,
+          parseOk: true,
+          schemaOk: false,
+          error: 'schema-validation-failed',
+          rawSnippet: String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+          parsed,
+        });
         throw new LLMJsonResponseError('LLM JSON failed schema validation', {
           phase: 'schema',
           rawSnippet: String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200),
           deployment,
         });
       }
+      input.onValidation?.({
+        deployment,
+        parseOk: true,
+        schemaOk: true,
+        parsed,
+      });
       return parsed;
     };
 

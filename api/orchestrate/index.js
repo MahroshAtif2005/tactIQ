@@ -297,6 +297,42 @@ const collectRoutingReasons = (result, fallbackReason) => {
   ]);
 };
 
+const isAiFailureReasonToken = (value) => {
+  const token = String(value || '').trim().toLowerCase();
+  if (!token) return false;
+  return (
+    token.includes('llm_failed') ||
+    token.includes('llm-error') ||
+    token.includes('openai_') ||
+    token.includes('openai_http_') ||
+    token.includes('json_schema') ||
+    token.includes('json_parse') ||
+    token.includes('schema_validation') ||
+    token.includes('upstream_') ||
+    token.includes('orchestrator-error') ||
+    token.includes('agent_http_error')
+  );
+};
+
+const collectAgentAiFailures = (result) => {
+  const record = asRecord(result);
+  const agentResults = asRecord(record.agentResults);
+  const failures = {};
+  ['fatigue', 'risk', 'tactical'].forEach((agent) => {
+    const agentResult = asRecord(agentResults[agent]);
+    const routedTo = String(agentResult.routedTo || '').trim().toLowerCase();
+    const status = String(agentResult.status || '').trim().toLowerCase();
+    const reason = firstText(agentResult.reason, agentResult.error);
+    if (
+      routedTo === 'rules' &&
+      (status === 'fallback' || status === 'error' || isAiFailureReasonToken(reason))
+    ) {
+      failures[agent] = reason || 'llm_failed';
+    }
+  });
+  return failures;
+};
+
 const collectAgentStatuses = (result, fallbackMode) => {
   const record = asRecord(result);
   const agents = asRecord(record.agents);
@@ -576,6 +612,10 @@ const respondSuccess = (respond, status, body, req, context, requestId, executio
 const buildFallbackBody = (payload, execution, reason, requestId, startedAt) => {
   const fallback = runOrchestrateFallback(payload);
   const reasons = dedupeReasons([reason, ...(execution?.reasons || [])]);
+  const reasonToken = String(reason || '').trim();
+  const azureAttempted =
+    execution.llmMode === 'ai' &&
+    (isAiFailureReasonToken(reasonToken) || /openai|upstream|llm-error|http_/i.test(reasonToken));
   const agents = {
     fatigue: { status: 'FALLBACK' },
     risk: { status: 'FALLBACK' },
@@ -594,6 +634,13 @@ const buildFallbackBody = (payload, execution, reason, requestId, startedAt) => 
       reasons,
     },
     reasons,
+    fallbackReason: reasonToken || reasons[0] || 'rules_fallback',
+    azureAttempted,
+    agentAiFailures: {
+      fatigue: reasonToken || 'rules_fallback',
+      risk: reasonToken || 'rules_fallback',
+      tactical: reasonToken || 'rules_fallback',
+    },
     coachOutput,
     agents,
     analysisBundleId: String(fallback.analysisBundleId || fallback.analysisId || requestId),
@@ -602,6 +649,13 @@ const buildFallbackBody = (payload, execution, reason, requestId, startedAt) => 
       requestId: String(asRecord(fallback.meta).requestId || requestId),
       llmMode: execution.llmMode,
       dataMode: execution.dataMode,
+      routingDebug: {
+        requestedMode: execution.requestedMode,
+        llmMode: execution.llmMode,
+        routingMode: 'fallback',
+        fallbackReason: reasonToken || reasons[0] || 'rules_fallback',
+        azureAttempted,
+      },
       usedFallbackAgents: ['fatigue', 'risk', 'tactical'],
       modelRouting: {
         ...asRecord(asRecord(fallback.meta).modelRouting),
@@ -630,6 +684,9 @@ const buildAiBody = (result, execution, requestId, startedAt) => {
   const reasons = collectRoutingReasons(result);
   const routingMode = deriveRoutingMode(result, reasons);
   const fallbackMode = routingMode === 'fallback';
+  const fallbackReason = fallbackMode ? firstText(reasons[0], 'rules_fallback') : '';
+  const agentAiFailures = collectAgentAiFailures(result);
+  const azureAttempted = execution.llmMode === 'ai';
   const agents = collectAgentStatuses(result, fallbackMode);
   const coachOutput = toCoachOutput(result);
   const meta = asRecord(result.meta);
@@ -660,6 +717,9 @@ const buildAiBody = (result, execution, requestId, startedAt) => {
       ...(reasons.length > 0 ? { reasons } : {}),
     },
     reasons,
+    ...(fallbackMode ? { fallbackReason } : {}),
+    azureAttempted,
+    agentAiFailures,
     analysisBundleId: String(result.analysisBundleId || result.analysisId || requestId),
     coachOutput,
     agents,
@@ -669,9 +729,14 @@ const buildAiBody = (result, execution, requestId, startedAt) => {
       requestId: String(meta.requestId || requestId),
       llmMode: execution.llmMode,
       dataMode: execution.dataMode,
-      usedFallbackAgents: fallbackMode
-        ? dedupeReasons([...(asArray(meta.usedFallbackAgents)), 'fatigue', 'risk', 'tactical'])
-        : asArray(meta.usedFallbackAgents),
+      routingDebug: {
+        requestedMode: execution.requestedMode,
+        llmMode: execution.llmMode,
+        routingMode,
+        fallbackReason: fallbackReason || undefined,
+        azureAttempted,
+      },
+      usedFallbackAgents: asArray(meta.usedFallbackAgents),
       timingsMs: {
         ...metaTimings,
         ...(routingMode === 'ai' ? { azureCall: inferredAzureCallMs } : {}),

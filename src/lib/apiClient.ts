@@ -55,6 +55,7 @@ const aiStatusEndpoint = resolveApiUrl('/ai/status');
 const baselinesEndpoint = resolveApiUrl('/baselines');
 const usersEnsureEndpoint = resolveApiUrl('/users/ensure');
 const copilotChatEndpoint = resolveApiUrl('/copilot-chat');
+export const copilotChatUrl = copilotChatEndpoint;
 const analysisExistsEndpoint = (analysisId: string): string =>
   resolveApiUrl(`/analysis/${encodeURIComponent(String(analysisId || '').trim())}/exists`);
 
@@ -632,6 +633,10 @@ export interface CopilotChatResponse {
   recovered?: boolean;
   messagesUsed?: number;
   suggestedQuestions?: string[];
+  source?: 'ai' | 'fallback' | string;
+  mode?: 'ai' | 'fallback' | string;
+  routeCalled?: string;
+  fallbackReason?: string;
   error?: string;
   message?: string;
   needsAnalysis?: boolean;

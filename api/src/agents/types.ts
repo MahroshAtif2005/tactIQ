@@ -101,6 +101,7 @@ export interface AgentSummary {
   status: 'success' | 'error' | 'fallback';
   routedTo: 'llm' | 'rules';
   output?: Record<string, unknown>;
+  reason?: string;
   error?: string;
 }
 

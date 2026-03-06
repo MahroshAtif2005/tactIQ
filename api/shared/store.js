@@ -24,6 +24,7 @@ let cosmosPromise = null;
 let cosmosEnabled = false;
 let cosmosConfigLogged = false;
 let lastCosmosInitFailure = '';
+let lastCosmosInitFailureDetail = null;
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const normalizeId = (value) => String(value || '').trim();
@@ -55,6 +56,14 @@ const normalizeRole = (value) => {
   return VALID_ROLES.has(role) ? role : 'FAST';
 };
 
+const resolveEnvValue = (...keys) => {
+  for (const key of keys) {
+    const value = normalizeId(process.env[key]);
+    if (value) return { value, source: key };
+  }
+  return { value: '', source: '' };
+};
+
 const getEndpointHost = (endpoint) => {
   const raw = normalizeId(endpoint);
   if (!raw) return '';
@@ -71,11 +80,36 @@ const summarizeBaselineDocForLog = (doc) => {
     id: normalizeId(doc.id),
     baselineId: normalizeId(doc.baselineId || doc.playerId || doc.name),
     userId: normalizeId(doc.userId),
+    userKey: normalizeId(doc.userKey || doc.userId),
+    userEmail: normalizeId(doc.userEmail),
     teamId: normalizeId(doc.teamId),
     role: normalizeId(doc.role),
     type: normalizeId(doc.type),
     inRoster: parseBoolean(doc.inRoster ?? doc.roster, false),
     active: parseBoolean(doc.active ?? doc.isActive, true),
+  };
+};
+
+const toCosmosErrorDetails = (error) => {
+  if (!error || typeof error !== 'object') {
+    return {
+      message: String(error || 'unknown_error'),
+      code: null,
+      statusCode: null,
+      substatus: null,
+      activityId: null,
+      body: null,
+      name: null,
+    };
+  }
+  return {
+    message: normalizeId(error.message) || 'unknown_error',
+    code: error.code ?? null,
+    statusCode: Number.isFinite(Number(error.statusCode)) ? Number(error.statusCode) : null,
+    substatus: Number.isFinite(Number(error.substatus)) ? Number(error.substatus) : null,
+    activityId: normalizeId(error.activityId) || null,
+    body: typeof error.body === 'string' ? error.body.slice(0, 500) : null,
+    name: normalizeId(error.name) || null,
   };
 };
 
@@ -150,6 +184,8 @@ const normalizeBaseline = (raw, scope = {}, existing = null) => {
     orderIndex: Number.isFinite(orderIndexRaw) ? Math.max(0, Math.floor(orderIndexRaw)) : 0,
     type: 'playerBaseline',
     userId: normalizeId(scope.userId || existingRecord.userId),
+    userKey: normalizeId(scope.userKey || scope.userId || existingRecord.userKey || existingRecord.userId),
+    userEmail: normalizeId(scope.userEmail || existingRecord.userEmail || existingRecord.email || ''),
     teamId: normalizeId(scope.teamId || existingRecord.teamId),
     createdAt: normalizeIsoDate(existingRecord.createdAt || record.createdAt || now),
     updatedAt: normalizeIsoDate(record.updatedAt || now),
@@ -306,15 +342,50 @@ const getIdentity = (req) => {
 };
 
 const getConfig = () => {
-  const connectionString = normalizeId(process.env.COSMOS_CONNECTION_STRING);
-  const endpoint = normalizeId(process.env.COSMOS_ENDPOINT);
-  const key = normalizeId(process.env.COSMOS_KEY);
-  const databaseId = normalizeId(process.env.COSMOS_DATABASE || process.env.COSMOS_DB || DEFAULT_DB) || DEFAULT_DB;
-  const playersContainerId =
-    normalizeId(process.env.COSMOS_CONTAINER_PLAYERS || DEFAULT_PLAYERS_CONTAINER) ||
-    DEFAULT_PLAYERS_CONTAINER;
-  const usersContainerId =
-    normalizeId(process.env.COSMOS_CONTAINER_USERS || DEFAULT_USERS_CONTAINER) || DEFAULT_USERS_CONTAINER;
+  const connectionStringResolved = resolveEnvValue(
+    'COSMOS_CONNECTION_STRING',
+    'AZURE_COSMOS_CONNECTION_STRING',
+    'AZURE_COSMOSDB_CONNECTION_STRING'
+  );
+  const endpointResolved = resolveEnvValue(
+    'COSMOS_ENDPOINT',
+    'AZURE_COSMOS_ENDPOINT',
+    'AZURE_COSMOSDB_ENDPOINT'
+  );
+  const keyResolved = resolveEnvValue(
+    'COSMOS_KEY',
+    'AZURE_COSMOS_KEY',
+    'AZURE_COSMOS_PRIMARY_KEY',
+    'AZURE_COSMOSDB_KEY'
+  );
+  const databaseResolved = resolveEnvValue(
+    'COSMOS_DATABASE',
+    'COSMOS_DB',
+    'AZURE_COSMOS_DATABASE',
+    'COSMOS_DATABASE_NAME',
+    'COSMOS_DATABASE_ID',
+    'COSMOS_DB_NAME'
+  );
+  const playersContainerResolved = resolveEnvValue(
+    'COSMOS_CONTAINER_PLAYERS',
+    'COSMOS_CONTAINER',
+    'AZURE_COSMOS_CONTAINER',
+    'AZURE_COSMOS_CONTAINER_PLAYERS',
+    'COSMOS_CONTAINER_NAME',
+    'COSMOS_CONTAINER_ID'
+  );
+  const usersContainerResolved = resolveEnvValue(
+    'COSMOS_CONTAINER_USERS',
+    'AZURE_COSMOS_USERS_CONTAINER',
+    'AZURE_COSMOS_CONTAINER_USERS'
+  );
+
+  const connectionString = connectionStringResolved.value;
+  const endpoint = endpointResolved.value;
+  const key = keyResolved.value;
+  const databaseId = databaseResolved.value || DEFAULT_DB;
+  const playersContainerId = playersContainerResolved.value || DEFAULT_PLAYERS_CONTAINER;
+  const usersContainerId = usersContainerResolved.value || DEFAULT_USERS_CONTAINER;
 
   const hasAuth = Boolean(connectionString || (endpoint && key));
   return {
@@ -325,6 +396,14 @@ const getConfig = () => {
     playersContainerId,
     usersContainerId,
     hasAuth,
+    source: {
+      connectionString: connectionStringResolved.source || null,
+      endpoint: endpointResolved.source || null,
+      key: keyResolved.source || null,
+      databaseId: databaseResolved.source || null,
+      playersContainerId: playersContainerResolved.source || null,
+      usersContainerId: usersContainerResolved.source || null,
+    },
   };
 };
 
@@ -339,6 +418,8 @@ const getStorageDiagnostics = () => {
     hasCosmosAuth: Boolean(config.hasAuth),
     cosmosClientLoaded: Boolean(CosmosClient),
     initFailure: normalizeId(lastCosmosInitFailure) || null,
+    initFailureDetail: lastCosmosInitFailureDetail,
+    configSource: config.source,
   };
 };
 
@@ -352,6 +433,7 @@ const logPlayersTrace = (op, detail = {}) => {
     db: diagnostics.databaseId,
     container: diagnostics.playersContainerId,
     endpointHost: diagnostics.endpointHost || 'n/a',
+    initFailure: diagnostics.initFailure || null,
     ...detail,
   });
 };
@@ -366,6 +448,7 @@ const logCosmosConfigOnce = (config) => {
     endpointHost: getEndpointHost(config.endpoint) || 'n/a',
     hasAuth: Boolean(config.hasAuth),
     cosmosClientLoaded: Boolean(CosmosClient),
+    source: config.source,
   });
 };
 
@@ -377,9 +460,19 @@ const getCosmos = async () => {
     logCosmosConfigOnce(config);
     if (!CosmosClient || !config.hasAuth) {
       cosmosEnabled = false;
+      const missingKeys = [];
+      if (!CosmosClient) missingKeys.push('@azure/cosmos dependency');
+      if (!config.connectionString && !config.endpoint) missingKeys.push('COSMOS_CONNECTION_STRING|COSMOS_ENDPOINT|AZURE_COSMOS_ENDPOINT');
+      if (!config.connectionString && !config.key) missingKeys.push('COSMOS_KEY|AZURE_COSMOS_KEY');
       lastCosmosInitFailure = !CosmosClient ? 'cosmos_client_unavailable' : 'missing_cosmos_credentials';
+      lastCosmosInitFailureDetail = {
+        reason: lastCosmosInitFailure,
+        missingKeys,
+        source: config.source,
+      };
       logPlayersTrace('cosmos.init.skip', {
         reason: lastCosmosInitFailure,
+        missingKeys,
       });
       return null;
     }
@@ -400,13 +493,28 @@ const getCosmos = async () => {
 
       cosmosEnabled = true;
       lastCosmosInitFailure = '';
+      lastCosmosInitFailureDetail = null;
       logPlayersTrace('cosmos.init.success');
       return { client, database, playersContainer, usersContainer };
     } catch (error) {
       cosmosEnabled = false;
-      lastCosmosInitFailure = error && error.message ? error.message : String(error);
-      console.warn('[functions][cosmos] init failed, using memory fallback:', lastCosmosInitFailure);
-      logPlayersTrace('cosmos.init.failed', { reason: lastCosmosInitFailure });
+      const details = toCosmosErrorDetails(error);
+      lastCosmosInitFailure = details.message || 'cosmos_init_failed';
+      lastCosmosInitFailureDetail = {
+        ...details,
+        source: config.source,
+      };
+      console.error('[functions][cosmos] init failed, using memory fallback', {
+        ...details,
+        db: config.databaseId,
+        container: config.playersContainerId,
+      });
+      logPlayersTrace('cosmos.init.failed', {
+        reason: lastCosmosInitFailure,
+        code: details.code,
+        statusCode: details.statusCode,
+        activityId: details.activityId,
+      });
       return null;
     }
   })();
@@ -656,7 +764,7 @@ const checkBaselineOwnership = async ({ userId, baselineId }) => {
   return { exists: false, owned: false };
 };
 
-const saveBaselines = async ({ userId, teamId, payload }) => {
+const saveBaselines = async ({ userId, teamId, userEmail, payload }) => {
   const scopedUserId = requireUserId(userId);
   const body = payload && typeof payload === 'object' ? payload : {};
   const items = Array.isArray(body.players)
@@ -679,7 +787,11 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
     }
     for (const incoming of items) {
       const existing = map.get(normalizeId(incoming && (incoming.id || incoming.playerId || incoming.name)).toLowerCase()) || null;
-      const normalized = normalizeBaseline(incoming, { userId: scopedUserId, teamId }, existing);
+      const normalized = normalizeBaseline(
+        incoming,
+        { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
+        existing
+      );
       if (!normalized) continue;
       map.set(normalizeId(normalized.baselineId).toLowerCase(), {
         ...normalized,
@@ -721,7 +833,7 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
     const existing = Array.isArray(existingQuery.resources) ? existingQuery.resources[0] : null;
     const normalized = normalizeBaseline(
       { ...incoming, updatedAt: now },
-      { userId: scopedUserId, teamId },
+      { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
       existing
     );
     if (!normalized) continue;
@@ -744,7 +856,7 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
   return listBaselines({ userId: scopedUserId, teamId });
 };
 
-const replaceBaselines = async ({ userId, teamId, payload }) => {
+const replaceBaselines = async ({ userId, teamId, userEmail, payload }) => {
   const scopedUserId = requireUserId(userId);
   const body = payload && typeof payload === 'object' ? payload : {};
   const items = Array.isArray(body.players)
@@ -764,7 +876,7 @@ const replaceBaselines = async ({ userId, teamId, payload }) => {
     const nextRows = items
       .map((incoming, index) => normalizeBaseline(
         { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1 },
-        { userId: scopedUserId, teamId },
+        { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
         null
       ))
       .filter(Boolean)
@@ -796,7 +908,7 @@ const replaceBaselines = async ({ userId, teamId, payload }) => {
     const incoming = items[index];
     const normalized = normalizeBaseline(
       { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1, updatedAt: now },
-      { userId: scopedUserId, teamId },
+      { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
       null
     );
     if (!normalized) continue;
@@ -870,10 +982,11 @@ const deleteBaselineById = async ({ userId, teamId, baselineId }) => {
   return listBaselines({ userId: scopedUserId, teamId });
 };
 
-const resetBaselines = async ({ userId, teamId }) => {
+const resetBaselines = async ({ userId, teamId, userEmail }) => {
   return replaceBaselines({
     userId,
     teamId,
+    userEmail,
     payload: { players: DEFAULT_BASELINES.map((row) => ({ ...row })) },
   });
 };

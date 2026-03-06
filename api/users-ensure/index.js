@@ -1,4 +1,4 @@
-const { ensureUser, getIdentity } = require('../shared/store');
+const { ensureUser, getIdentity, getStorageDiagnostics } = require('../shared/store');
 const { jsonResponse, optionsResponse } = require('../shared/agentRuntime');
 
 const isDemoRequest = (req) =>
@@ -9,6 +9,14 @@ const isDemoRequest = (req) =>
 module.exports = async function usersEnsure(context, req) {
   try {
     const method = String(req?.method || 'POST').trim().toUpperCase();
+    const diagnostics = getStorageDiagnostics();
+    context.log('[users/ensure] request', {
+      method,
+      storageMode: diagnostics.mode,
+      db: diagnostics.databaseId,
+      container: diagnostics.playersContainerId,
+      endpointHost: diagnostics.endpointHost || 'n/a',
+    });
     if (method === 'OPTIONS') {
       context.res = optionsResponse('POST,OPTIONS', {}, req);
       return;
@@ -40,6 +48,14 @@ module.exports = async function usersEnsure(context, req) {
     }
 
     const user = await ensureUser(identity);
+    const postEnsureDiagnostics = getStorageDiagnostics();
+    context.log('[users/ensure] identity', {
+      source: String(identity?.source || '').trim() || null,
+      userId: String(user?.userId || '').trim() || null,
+      teamId: String(user?.teamId || '').trim() || null,
+      hasEmail: Boolean(String(user?.email || '').trim()),
+      storageMode: postEnsureDiagnostics.mode,
+    });
     context.res = jsonResponse(200, {
       ok: true,
       id: user.id,
@@ -50,6 +66,13 @@ module.exports = async function usersEnsure(context, req) {
       role: user.role || 'coach',
       createdAt: user.createdAt || null,
       updatedAt: user.updatedAt || null,
+      source: postEnsureDiagnostics.mode,
+      storage: {
+        mode: postEnsureDiagnostics.mode,
+        db: postEnsureDiagnostics.databaseId,
+        container: postEnsureDiagnostics.playersContainerId,
+        endpointHost: postEnsureDiagnostics.endpointHost || 'n/a',
+      },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
