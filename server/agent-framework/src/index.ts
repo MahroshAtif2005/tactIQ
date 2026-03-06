@@ -180,6 +180,14 @@ const loadFallbackBaselines = (): PlayerBaselineDoc[] => {
 };
 
 let fallbackBaselines: PlayerBaselineDoc[] = loadFallbackBaselines();
+const DEFAULT_STORAGE_USER_ID =
+  String(process.env.AGENT_FRAMEWORK_STORAGE_USER_ID || 'agent-framework').trim() || 'agent-framework';
+const getStorageUserId = (req?: express.Request): string => {
+  const headerValue = req?.headers?.['x-user-id'];
+  const raw = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  const normalized = String(raw || '').trim();
+  return normalized || DEFAULT_STORAGE_USER_ID;
+};
 
 apiRouter.get('/health', (_req, res) => {
   res.json({
@@ -217,8 +225,9 @@ const deleteInChunks = async (ids: string[], deleter: (id: string) => Promise<vo
   }
 };
 
-apiRouter.get('/baselines', async (_req, res) => {
+apiRouter.get('/baselines', async (req, res) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const container = await getCosmosContainerOrNull();
     if (!container) {
       fallbackBaselines = loadFallbackBaselines();
@@ -235,10 +244,13 @@ apiRouter.get('/baselines', async (_req, res) => {
 
     const querySpec = {
       query:
-        'SELECT * FROM c WHERE c.type = @type AND (c.active = true OR NOT IS_DEFINED(c.active)) ORDER BY c.name',
-      parameters: [{ name: '@type', value: 'playerBaseline' }],
+        'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.active = true OR NOT IS_DEFINED(c.active)) ORDER BY c.name',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: storageUserId },
+      ],
     };
-    const { resources } = await container.items.query(querySpec).fetchAll();
+    const { resources } = await container.items.query(querySpec, { partitionKey: storageUserId }).fetchAll();
     const players = (Array.isArray(resources) ? resources : []).map((row) => toPublicBaseline(row));
     res.status(200).json({ players, source: 'cosmos' });
   } catch (error) {
@@ -249,6 +261,7 @@ apiRouter.get('/baselines', async (_req, res) => {
 
 apiRouter.get('/baselines/:id', async (req, res) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const idRaw = String(req.params.id || '');
     const id = decodeURIComponent(idRaw).trim();
     if (!id) {
@@ -276,13 +289,14 @@ apiRouter.get('/baselines/:id', async (req, res) => {
     }
 
     const querySpec = {
-      query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
+      query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.userId = @userId AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
       parameters: [
         { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: storageUserId },
         { name: '@id', value: lowered },
       ],
     };
-    const { resources } = await container.items.query(querySpec).fetchAll();
+    const { resources } = await container.items.query(querySpec, { partitionKey: storageUserId }).fetchAll();
     const row = Array.isArray(resources) && resources.length > 0 ? resources[0] : null;
     if (!row) {
       res.status(404).json({ error: 'Baseline not found', source: 'cosmos' });
@@ -298,8 +312,9 @@ apiRouter.get('/baselines/:id', async (req, res) => {
   }
 });
 
-apiRouter.get('/roster', async (_req, res) => {
+apiRouter.get('/roster', async (req, res) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const container = await getCosmosContainerOrNull();
     if (!container) {
       fallbackBaselines = loadFallbackBaselines();
@@ -316,10 +331,13 @@ apiRouter.get('/roster', async (_req, res) => {
 
     const querySpec = {
       query:
-        'SELECT * FROM c WHERE c.type = @type AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true) ORDER BY c.name',
-      parameters: [{ name: '@type', value: 'playerBaseline' }],
+        'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.active = true OR NOT IS_DEFINED(c.active)) AND (c.inRoster = true OR c.roster = true) ORDER BY c.name',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: storageUserId },
+      ],
     };
-    const { resources } = await container.items.query(querySpec).fetchAll();
+    const { resources } = await container.items.query(querySpec, { partitionKey: storageUserId }).fetchAll();
     const players = (Array.isArray(resources) ? resources : []).map((row) => toPublicBaseline(row));
     res.status(200).json({ players, source: 'cosmos' });
   } catch (error) {
@@ -330,6 +348,7 @@ apiRouter.get('/roster', async (_req, res) => {
 
 const saveBaselines = async (req: express.Request, res: express.Response) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const rows = Array.isArray(req.body?.baselines)
       ? req.body.baselines
       : Array.isArray(req.body?.players)
@@ -341,7 +360,11 @@ const saveBaselines = async (req: express.Request, res: express.Response) => {
       return;
     }
 
-    const { normalized, errors } = normalizeRows(rows);
+    const rowsWithUser = rows.map((row) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return row;
+      return { ...(row as Record<string, unknown>), userId: storageUserId };
+    });
+    const { normalized, errors } = normalizeRows(rowsWithUser);
 
     if (errors.length > 0) {
       res.status(400).json({ error: 'Invalid baselines payload', details: errors });
@@ -365,7 +388,7 @@ const saveBaselines = async (req: express.Request, res: express.Response) => {
     await Promise.all(
       normalized.map((doc) =>
         container.items.upsert(doc, {
-          partitionKey: doc.id,
+          partitionKey: storageUserId,
         })
       )
     );
@@ -387,6 +410,7 @@ apiRouter.put('/baselines', saveBaselines);
 
 apiRouter.put('/baselines/:id', async (req, res) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const idRaw = String(req.params.id || '');
     const id = decodeURIComponent(idRaw).trim();
     if (!id) {
@@ -401,6 +425,7 @@ apiRouter.put('/baselines/:id', async (req, res) => {
     const buildDoc = (existing?: Record<string, unknown>): PlayerBaselineDoc =>
       normalizeBaselineDoc({
         ...(existing || {}),
+        userId: storageUserId,
         id: String(existing?.id || id).trim() || id,
         name: String(body.name || existing?.name || id).trim() || id,
         role: body.role ?? existing?.role,
@@ -440,18 +465,19 @@ apiRouter.put('/baselines/:id', async (req, res) => {
     }
 
     const querySpec = {
-      query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
+      query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.userId = @userId AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
       parameters: [
         { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: storageUserId },
         { name: '@id', value: lowered },
       ],
     };
-    const { resources } = await container.items.query(querySpec).fetchAll();
+    const { resources } = await container.items.query(querySpec, { partitionKey: storageUserId }).fetchAll();
     const existing = Array.isArray(resources) && resources.length > 0
       ? (resources[0] as Record<string, unknown>)
       : undefined;
     const doc = buildDoc(existing);
-    await container.items.upsert(doc, { partitionKey: doc.id });
+    await container.items.upsert(doc, { partitionKey: storageUserId });
     res.status(200).json({ ok: true, player: toPublicBaseline(doc), source: 'cosmos' });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -461,6 +487,7 @@ apiRouter.put('/baselines/:id', async (req, res) => {
 
 apiRouter.delete('/baselines/:id', async (req, res) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const idRaw = String(req.params.id || '');
     const id = decodeURIComponent(idRaw).trim();
     if (!id) {
@@ -482,7 +509,22 @@ apiRouter.delete('/baselines/:id', async (req, res) => {
       return;
     }
 
-    await container.item(id, id).delete();
+    const lowered = id.toLowerCase();
+    const querySpec = {
+      query: 'SELECT TOP 1 c.id FROM c WHERE c.type = @type AND c.userId = @userId AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: storageUserId },
+        { name: '@id', value: lowered },
+      ],
+    };
+    const { resources } = await container.items.query(querySpec, { partitionKey: storageUserId }).fetchAll();
+    const target = Array.isArray(resources) && resources.length > 0 ? String(resources[0].id || '').trim() : '';
+    if (!target) {
+      res.status(404).json({ error: 'Baseline not found' });
+      return;
+    }
+    await container.item(target, storageUserId).delete();
     res.status(200).json({ ok: true, id, source: 'cosmos' });
   } catch (error: unknown) {
     const maybeCode =
@@ -500,6 +542,7 @@ apiRouter.delete('/baselines/:id', async (req, res) => {
 
 apiRouter.patch('/baselines/:id', async (req, res) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const idRaw = String(req.params.id || '');
     const id = decodeURIComponent(idRaw).trim();
     if (!id) {
@@ -552,20 +595,19 @@ apiRouter.patch('/baselines/:id', async (req, res) => {
     }
 
     let existing: Record<string, unknown> | null = null;
-    try {
-      const { resource } = await container.item(id, id).read();
-      existing = resource ? (resource as Record<string, unknown>) : null;
-    } catch (error: unknown) {
-      const maybeCode =
-        typeof error === 'object' && error !== null && 'code' in error
-          ? Number((error as { code?: number | string }).code)
-          : Number.NaN;
-      if (maybeCode === 404) {
-        res.status(404).json({ error: 'Baseline not found' });
-        return;
-      }
-      throw error;
-    }
+    const lowered = id.toLowerCase();
+    const querySpec = {
+      query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.userId = @userId AND (LOWER(c.id) = @id OR LOWER(c.name) = @id)',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: storageUserId },
+        { name: '@id', value: lowered },
+      ],
+    };
+    const { resources } = await container.items.query(querySpec, { partitionKey: storageUserId }).fetchAll();
+    existing = Array.isArray(resources) && resources.length > 0
+      ? (resources[0] as Record<string, unknown>)
+      : null;
 
     if (!existing) {
       res.status(404).json({ error: 'Baseline not found' });
@@ -574,11 +616,12 @@ apiRouter.patch('/baselines/:id', async (req, res) => {
 
     const patchedDoc = normalizeBaselineDoc({
       ...existing,
+      userId: storageUserId,
       ...(hasActive ? { active: body.active } : {}),
       ...(hasInRoster ? { inRoster: inRosterValue } : {}),
       updatedAt: typeof body.updatedAt === 'string' ? body.updatedAt : new Date().toISOString(),
     });
-    await container.items.upsert(patchedDoc, { partitionKey: patchedDoc.id });
+    await container.items.upsert(patchedDoc, { partitionKey: storageUserId });
     if (process.env.NODE_ENV !== 'production') {
       console.log('[agent-framework] PATCH /api/baselines/:id', { id, status: 200, source: 'cosmos' });
     }
@@ -589,8 +632,9 @@ apiRouter.patch('/baselines/:id', async (req, res) => {
   }
 });
 
-apiRouter.post('/baselines/reset', async (_req, res) => {
+apiRouter.post('/baselines/reset', async (req, res) => {
   try {
+    const storageUserId = getStorageUserId(req);
     const container = await getCosmosContainerOrNull();
     if (!container) {
       const deleted = fallbackBaselines.length;
@@ -608,23 +652,26 @@ apiRouter.post('/baselines/reset', async (_req, res) => {
     }
 
     const querySpec = {
-      query: 'SELECT c.id FROM c WHERE c.type = @type',
-      parameters: [{ name: '@type', value: 'playerBaseline' }],
+      query: 'SELECT c.id FROM c WHERE c.type = @type AND c.userId = @userId',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: storageUserId },
+      ],
     };
-    const { resources } = await container.items.query(querySpec).fetchAll();
+    const { resources } = await container.items.query(querySpec, { partitionKey: storageUserId }).fetchAll();
     const ids = (Array.isArray(resources) ? resources : [])
       .map((row) => String(row.id || '').trim())
       .filter((id) => id.length > 0);
 
     await deleteInChunks(ids, async (id) => {
-      await container.item(id, id).delete();
+      await container.item(id, storageUserId).delete();
     });
 
-    const seeded = seedFallbackBaselines();
+    const seeded = seedFallbackBaselines().map((row) => normalizeBaselineDoc({ ...row, userId: storageUserId }));
     await Promise.all(
       seeded.map((doc) =>
         container.items.upsert(doc, {
-          partitionKey: doc.id,
+          partitionKey: storageUserId,
         })
       )
     );

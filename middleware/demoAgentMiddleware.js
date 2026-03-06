@@ -41,6 +41,9 @@ const mockAgentResponses = {
 };
 
 function demoAgentMiddleware(req, res, next) {
+  const demoEnvEnabled = String(process.env.VITE_DEMO || process.env.DEMO_MODE || "").toLowerCase() === "true";
+  if (!demoEnvEnabled) return next();
+
   const demoEnabled = String(req.query.demo || "").toLowerCase() === "true";
   if (!demoEnabled) return next();
 
@@ -60,4 +63,3 @@ module.exports = {
   demoAgentMiddleware,
   mockAgentResponses,
 };
-

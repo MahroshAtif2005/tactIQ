@@ -1293,22 +1293,44 @@ export const getApiHealth = checkHealth;
 
 export interface AiStatusResponse {
   ok?: boolean;
-  azureOpenAIConfigured: boolean;
-  missing?: string[];
+  aiEnabled: boolean;
+  endpointConfigured: boolean;
+  keyConfigured: boolean;
+  deploymentConfigured: boolean;
 }
 
 export async function getAiStatus(signal?: AbortSignal): Promise<AiStatusResponse> {
-  const raw = await getJson<unknown>(aiStatusEndpoint, signal);
+  const url = aiStatusEndpoint;
+  const raw = await getJson<unknown>(url, signal);
   if (!raw || typeof raw !== 'object') {
-    return { ok: false, azureOpenAIConfigured: false };
+    const data = {
+      ok: false,
+      aiEnabled: false,
+      endpointConfigured: false,
+      keyConfigured: false,
+      deploymentConfigured: false,
+    };
+    const aiAvailable =
+      data.aiEnabled &&
+      data.endpointConfigured &&
+      data.keyConfigured &&
+      data.deploymentConfigured;
+    console.log('[ai-status]', { url, data, aiAvailable });
+    return data;
   }
   const record = raw as Record<string, unknown>;
-  const missing = Array.isArray(record.missing)
-    ? record.missing.map((entry) => String(entry || '').trim()).filter(Boolean)
-    : undefined;
-  return {
+  const data = {
     ok: typeof record.ok === 'boolean' ? record.ok : true,
-    azureOpenAIConfigured: Boolean(record.azureOpenAIConfigured),
-    ...(missing && missing.length > 0 ? { missing } : {}),
+    aiEnabled: Boolean(record.aiEnabled),
+    endpointConfigured: Boolean(record.endpointConfigured),
+    keyConfigured: Boolean(record.keyConfigured),
+    deploymentConfigured: Boolean(record.deploymentConfigured),
   };
+  const aiAvailable =
+    data.aiEnabled &&
+    data.endpointConfigured &&
+    data.keyConfigured &&
+    data.deploymentConfigured;
+  console.log('[ai-status]', { url, data, aiAvailable });
+  return data;
 }

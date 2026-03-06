@@ -96,11 +96,11 @@ applyEnvAlias("COSMOS_DB", [
   "COSMOS_DATABASE_ID",
   "COSMOS_DB_NAME",
 ]);
-applyEnvAlias("COSMOS_CONTAINER", [
+applyEnvAlias("COSMOS_CONTAINER_PLAYERS", [
+  "COSMOS_CONTAINER",
   "AZURE_COSMOS_CONTAINER",
   "COSMOS_CONTAINER_NAME",
   "COSMOS_CONTAINER_ID",
-  "COSMOS_CONTAINER_PLAYERS",
 ]);
 const getAzureDeployment = () =>
   [
@@ -134,7 +134,7 @@ const getAzureEnvPresence = () => ({
 const isMockAllowed = () => String(process.env.ALLOW_MOCK || "false").trim().toLowerCase() === "true";
 const isDebugContextEnabled = () => String(process.env.DEBUG_CONTEXT || "false").trim().toLowerCase() === "true";
 const getMissingRequiredCosmosEnv = () =>
-  ["COSMOS_ENDPOINT", "COSMOS_KEY", "COSMOS_DB", "COSMOS_CONTAINER"].filter(
+  ["COSMOS_ENDPOINT", "COSMOS_KEY", "COSMOS_DB", "COSMOS_CONTAINER_PLAYERS"].filter(
     (name) => !isNonEmptyEnv(process.env[name])
   );
 const getCosmosEndpointHost = () => {
@@ -175,7 +175,7 @@ const getCosmosErrorStatusCode = (error, fallbackCode) => {
 const getCosmosEnvStatus = () => ({
   endpoint: isNonEmptyEnv(process.env.COSMOS_ENDPOINT) ? "set" : "missing",
   db: isNonEmptyEnv(process.env.COSMOS_DB) ? "set" : "missing",
-  container: isNonEmptyEnv(process.env.COSMOS_CONTAINER) ? "set" : "missing",
+  container: isNonEmptyEnv(process.env.COSMOS_CONTAINER_PLAYERS) ? "set" : "missing",
 });
 const buildCosmosNotConfiguredError = (missingRequired = getMissingRequiredCosmosEnv()) => ({
   ok: false,
@@ -186,7 +186,7 @@ const buildCosmosNotConfiguredError = (missingRequired = getMissingRequiredCosmo
     requiredMissing: missingRequired,
     endpointHost: getCosmosEndpointHost(),
     db: process.env.COSMOS_DB || "",
-    container: process.env.COSMOS_CONTAINER || "",
+    container: process.env.COSMOS_CONTAINER_PLAYERS || "",
   },
 });
 const buildCosmosConnectionError = (error, fallbackMessage) => {
@@ -204,7 +204,7 @@ const buildCosmosConnectionError = (error, fallbackMessage) => {
     diagnostics: {
       endpointHost: getCosmosEndpointHost(),
       db: process.env.COSMOS_DB || "",
-      container: process.env.COSMOS_CONTAINER || "",
+      container: process.env.COSMOS_CONTAINER_PLAYERS || "",
       cause: extractErrorCause(error),
       errorName: error instanceof Error ? error.name : details && typeof details.name === "string" ? details.name : "Error",
       errorCode: codeValue === undefined ? null : codeValue,
@@ -249,6 +249,88 @@ const firstNonEmpty = (...values) => {
   }
   return "";
 };
+const firstNonEmptyText = (...values) => {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim();
+    if (normalized.length > 0) return normalized;
+  }
+  return "";
+};
+const normalizeConfidenceScore = (...values) => {
+  for (const value of values) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) continue;
+    const normalized = parsed > 1 && parsed <= 100 ? parsed / 100 : parsed;
+    return Math.max(0, Math.min(1, normalized));
+  }
+  return 0.62;
+};
+const buildAgentOutputsPayload = (payloadRecord) => {
+  const existing = isRecord(payloadRecord?.agentOutputs) ? { ...payloadRecord.agentOutputs } : {};
+  if (!hasAnyKeys(existing.fatigue) && isRecord(payloadRecord?.fatigue)) {
+    existing.fatigue = payloadRecord.fatigue;
+  }
+  if (!hasAnyKeys(existing.risk) && isRecord(payloadRecord?.risk)) {
+    existing.risk = payloadRecord.risk;
+  }
+  if (!hasAnyKeys(existing.tactical) && isRecord(payloadRecord?.tactical)) {
+    existing.tactical = payloadRecord.tactical;
+  }
+  return existing;
+};
+const withOrchestrateCompatFields = (payload, fallbackAnalysisId = "") => {
+  const record = isRecord(payload) ? payload : {};
+  const meta = isRecord(record.meta) ? record.meta : {};
+  const strategic = isRecord(record.strategicAnalysis) ? record.strategicAnalysis : {};
+  const tactical = isRecord(record.tactical) ? record.tactical : {};
+  const tacticalRecommendationRecord = isRecord(strategic.tacticalRecommendation)
+    ? strategic.tacticalRecommendation
+    : {};
+  const combinedDecision = isRecord(record.combinedDecision)
+    ? record.combinedDecision
+    : isRecord(record.finalDecision)
+      ? record.finalDecision
+      : {};
+  const analysisBundleId = normalizeId(
+    record.analysisBundleId ||
+      record.analysisId ||
+      meta.analysisId ||
+      meta.requestId ||
+      fallbackAnalysisId
+  );
+  const tacticalRecommendation = firstNonEmptyText(
+    record.tacticalRecommendation,
+    tacticalRecommendationRecord.nextAction,
+    tacticalRecommendationRecord.why,
+    tactical.nextAction,
+    tactical.immediateAction,
+    combinedDecision.immediateAction
+  );
+  const summary = firstNonEmptyText(
+    record.summary,
+    record.combinedBriefing,
+    strategic.fatigueAnalysis,
+    tactical.rationale,
+    combinedDecision.rationale,
+    tacticalRecommendationRecord.why,
+    strategic.coachNote
+  );
+  const confidence = normalizeConfidenceScore(
+    record.confidence,
+    combinedDecision.confidence,
+    tactical.confidence
+  );
+  const agentOutputs = buildAgentOutputsPayload(record);
+  return {
+    ...record,
+    analysisBundleId: analysisBundleId || undefined,
+    summary,
+    tacticalRecommendation,
+    confidence,
+    agentOutputs,
+  };
+};
 const getCosmosDbName = () =>
   firstNonEmpty(
     process.env.COSMOS_DB,
@@ -259,10 +341,10 @@ const getCosmosDbName = () =>
   );
 const getCosmosContainerName = () =>
   firstNonEmpty(
+    process.env.COSMOS_CONTAINER_PLAYERS,
     process.env.COSMOS_CONTAINER,
     process.env.COSMOS_CONTAINER_NAME,
-    process.env.COSMOS_CONTAINER_ID,
-    process.env.COSMOS_CONTAINER_PLAYERS
+    process.env.COSMOS_CONTAINER_ID
   );
 const getCosmosConnectionSettings = () => ({
   connectionString: firstNonEmpty(process.env.COSMOS_CONNECTION_STRING),
@@ -1029,7 +1111,7 @@ console.log("Cosmos env loaded:", {
   endpoint: !!process.env.COSMOS_ENDPOINT,
   key: !!process.env.COSMOS_KEY,
   db: process.env.COSMOS_DB,
-  container: process.env.COSMOS_CONTAINER
+  container: process.env.COSMOS_CONTAINER_PLAYERS
 });
 const missingRequiredCosmosEnv = getMissingRequiredCosmosEnv();
 if (missingRequiredCosmosEnv.length > 0) {
@@ -1049,7 +1131,8 @@ console.log("[env] cosmos", {
 const cosmosConfiguredAtBoot = getMissingRequiredCosmosEnv().length === 0;
 console.log(
   `[BOOT] cosmosConfigured=${cosmosConfiguredAtBoot} endpointHost=${getCosmosEndpointHost()} ` +
-    `db=${process.env.COSMOS_DB || ""} container=${process.env.COSMOS_CONTAINER || ""} ` +
+    `db=${process.env.COSMOS_DB || ""} playersContainer=${process.env.COSMOS_CONTAINER_PLAYERS || ""} ` +
+    `usersContainer=${process.env.COSMOS_CONTAINER_USERS || "users"} ` +
     `envFileLoaded=${loadedEnvPath || "none"}`
 );
 getContainer()
@@ -1232,6 +1315,26 @@ const blockDemoWriteIfNeeded = (req, res) => {
   });
   return true;
 };
+
+const demoStorageWarning = "Demo mode uses localStorage only. Cosmos is bypassed.";
+const buildDemoProfile = () => ({
+  ok: true,
+  id: "demo-local",
+  userId: "demo-local",
+  teamId: "demo-local-team",
+  name: "Demo Coach",
+  email: "demo@local",
+  role: "coach",
+  source: "demo-local",
+  warning: demoStorageWarning,
+});
+const buildDemoBaselinesResponse = () => ({
+  ok: true,
+  items: [],
+  players: [],
+  source: "demo-local",
+  warning: demoStorageWarning,
+});
 
 const teamBackfillCache = new Set();
 
@@ -1607,7 +1710,7 @@ app.get("/api/health", async (_req, res) => {
     cosmosConfigured,
     endpointHost: getCosmosEndpointHost(),
     db: process.env.COSMOS_DB || diagnostics.databaseId || "",
-    container: process.env.COSMOS_CONTAINER || diagnostics.containerId || "",
+    container: process.env.COSMOS_CONTAINER_PLAYERS || diagnostics.containerId || "",
     port: Number(PORT),
     time: new Date().toISOString(),
     service: "tactIQ-agent-backend",
@@ -1620,6 +1723,7 @@ app.get("/api/health", async (_req, res) => {
     count,
     routes: [
       "/api/health",
+      "/api/ai/status",
       "/api/me",
       "/api/users/ensure",
       "/api/baselines",
@@ -1649,6 +1753,15 @@ app.get("/api/health", async (_req, res) => {
   });
 });
 
+app.get("/api/ai/status", (_req, res) => {
+  const missing = getMissingAzureEnvVars();
+  return res.status(200).json({
+    ok: true,
+    azureOpenAIConfigured: missing.length === 0,
+    ...(missing.length > 0 ? { missing } : {}),
+  });
+});
+
 app.get("/api/me", (req, res) => {
   const identity = requireCoachIdentity(req, res);
   if (!identity) return;
@@ -1662,6 +1775,9 @@ app.get("/api/me", (req, res) => {
 
 app.post("/api/users/ensure", async (req, res) => {
   try {
+    if (isDemoHeaderEnabled(req)) {
+      return res.status(200).json(buildDemoProfile());
+    }
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
     const scope = await ensureCoachScope(identity);
@@ -1704,7 +1820,7 @@ const cosmosHealthHandler = async (_req, res) => {
     missing.push("COSMOS_DB or COSMOS_DATABASE or COSMOS_DATABASE_NAME or COSMOS_DATABASE_ID");
   }
   if (!config.container) {
-    missing.push("COSMOS_CONTAINER or COSMOS_CONTAINER_NAME or COSMOS_CONTAINER_ID");
+    missing.push("COSMOS_CONTAINER_PLAYERS");
   }
   if (missing.length > 0) {
     return res.status(500).json({
@@ -1751,6 +1867,22 @@ app.get("/cosmos/health", cosmosHealthHandler);
 app.get("/api/cosmos/health", cosmosHealthHandler);
 
 const readBaselinesPayload = async (req, res) => {
+  if (isDemoHeaderEnabled(req)) {
+    return {
+      ok: true,
+      status: 200,
+      body: buildDemoBaselinesResponse(),
+      where: "demo-local",
+      diagnostics: {
+        endpointHost: getCosmosEndpointHost(),
+        db: process.env.COSMOS_DB || "",
+        container: process.env.COSMOS_CONTAINER_PLAYERS || "",
+        count: 0,
+        userId: "demo-local",
+        teamId: "demo-local-team",
+      },
+    };
+  }
   const identity = requireCoachIdentity(req, res);
   if (!identity) {
     return { ok: false, aborted: true };
@@ -1785,7 +1917,7 @@ const readBaselinesPayload = async (req, res) => {
     diagnostics: {
       endpointHost: getCosmosEndpointHost(),
       db: diagnostics.databaseId,
-      container: process.env.COSMOS_COACH_CONTAINER || "playersByCoach",
+      container: process.env.COSMOS_CONTAINER_PLAYERS || diagnostics.containerId,
       count: players.length,
       userId: coachScope.userId,
       teamId: coachScope.teamId,
@@ -1828,7 +1960,7 @@ app.get("/api/_debug/baselines", async (req, res) => {
         diagnostics: {
           endpointHost: getCosmosEndpointHost(),
           db: process.env.COSMOS_DB || "",
-          container: process.env.COSMOS_CONTAINER || "",
+          container: process.env.COSMOS_CONTAINER_PLAYERS || "",
           envLoaded,
         },
       });
@@ -1851,6 +1983,13 @@ app.get("/api/_debug/baselines", async (req, res) => {
 
 app.get(["/api/roster", "/roster"], async (req, res) => {
   try {
+    if (isDemoHeaderEnabled(req)) {
+      return res.status(200).json({
+        players: [],
+        source: "demo-local",
+        warning: demoStorageWarning,
+      });
+    }
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
     const scope = await ensureCoachScope(identity);
@@ -1863,7 +2002,7 @@ app.get(["/api/roster", "/roster"], async (req, res) => {
     console.log("[roster] GET", {
       account: diagnostics.account || null,
       database: diagnostics.databaseId,
-      container: process.env.COSMOS_COACH_CONTAINER || "playersByCoach",
+      container: process.env.COSMOS_CONTAINER_PLAYERS || diagnostics.containerId,
       userId: scope.userId,
       teamId: scope.teamId,
       count: players.length,
@@ -1881,6 +2020,13 @@ app.get(["/api/roster", "/roster"], async (req, res) => {
 
 app.get("/api/baselines/:id", async (req, res) => {
   try {
+    if (isDemoHeaderEnabled(req)) {
+      return res.status(404).json({
+        ok: false,
+        error: "not_found",
+        message: "Demo mode uses localStorage only.",
+      });
+    }
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
     const scope = await ensureCoachScope(identity);
@@ -1993,6 +2139,9 @@ app.patch("/api/baselines/:id", async (req, res) => {
     return res.status(200).json({ ok: true, player: updated });
   } catch (error) {
     console.error("Baselines PATCH error", error);
+    if (error && typeof error === "object" && "code" in error && Number(error.code) === 403) {
+      return res.status(403).json({ error: `Baseline ${req.params.id} belongs to a different user.` });
+    }
     if (error && typeof error === "object" && "code" in error && Number(error.code) === 404) {
       return res.status(404).json({ error: `Baseline ${req.params.id} not found.` });
     }
@@ -2030,6 +2179,9 @@ app.delete("/api/baselines/:id", async (req, res) => {
   } catch (error) {
     console.error("Baselines DELETE error", error);
     const code = error && typeof error === "object" && "code" in error ? Number(error.code) : undefined;
+    if (code === 403) {
+      return res.status(403).json({ error: `Baseline ${req.params.id} belongs to a different user.` });
+    }
     if (code === 404) {
       return res.status(404).json({ error: `Baseline ${req.params.id} not found.` });
     }
@@ -2104,6 +2256,13 @@ app.post("/api/players", async (req, res) => {
 
 app.get("/api/players/:id", async (req, res) => {
   try {
+    if (isDemoHeaderEnabled(req)) {
+      return res.status(404).json({
+        ok: false,
+        error: "not_found",
+        message: "Demo mode uses localStorage only.",
+      });
+    }
     const identity = requireCoachIdentity(req, res);
     if (!identity) return;
     const scope = await ensureCoachScope(identity);
@@ -2188,6 +2347,9 @@ app.delete("/api/players/:id", async (req, res) => {
     return res.status(200).json({ ok: true });
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error ? Number(error.code) : undefined;
+    if (code === 403) {
+      return res.status(403).json({ ok: false, error: `Player ${req.params.id} belongs to a different user.` });
+    }
     if (code === 404) {
       return res.status(404).json({ ok: false, error: `Player ${req.params.id} not found.` });
     }
@@ -2422,8 +2584,7 @@ const orchestrateHandler = async (req, res) => {
       const totalMs = Date.now() - startedAt;
       const existingMeta = isRecord(result?.meta) ? result.meta : {};
       const existingMetaTimings = isRecord(existingMeta.timingsMs) ? existingMeta.timingsMs : {};
-
-      return res.status(200).json({
+      const responseBody = withOrchestrateCompatFields({
         ...result,
         ok: true,
         analysisId: persistedAnalysisId,
@@ -2442,7 +2603,8 @@ const orchestrateHandler = async (req, res) => {
             total: totalMs,
           },
         },
-      });
+      }, persistedAnalysisId);
+      return res.status(200).json(responseBody);
     }
 
     const result = await withTimeout(
@@ -2473,8 +2635,7 @@ const orchestrateHandler = async (req, res) => {
     const totalMs = Date.now() - startedAt;
     const existingMeta = isRecord(result?.meta) ? result.meta : {};
     const existingMetaTimings = isRecord(existingMeta.timingsMs) ? existingMeta.timingsMs : {};
-
-    return res.status(200).json({
+    const responseBody = withOrchestrateCompatFields({
       ...result,
       ok: true,
       analysisId: persistedAnalysisId,
@@ -2492,7 +2653,8 @@ const orchestrateHandler = async (req, res) => {
           total: totalMs,
         },
       },
-    });
+    }, persistedAnalysisId);
+    return res.status(200).json(responseBody);
   } catch (error) {
     console.error("[orchestrate] error", sanitizeErrorMessage(error));
     console.error("[orchestrate][crash]", error?.stack || error);
@@ -2539,27 +2701,23 @@ const orchestrateHandler = async (req, res) => {
       mode,
       traceId,
     });
-    return res.status(200).json({
+    const responseBody = withOrchestrateCompatFields({
       ok: true,
       analysisId: persistedFallbackAnalysisId,
       traceId,
       combinedBriefing,
       warnings: [combinedBriefing],
       agentResults: {
-        fatigue: { status: "error", routedTo: "rules", error: errorMessage, reason: "orchestrate_exception" },
-        risk: { status: "error", routedTo: "rules", error: errorMessage, reason: "orchestrate_exception" },
-        tactical: { status: "error", routedTo: "rules", error: errorMessage, reason: "orchestrate_exception" },
+        fatigue: { status: "fallback", routedTo: "rules", reason: "orchestrate_exception" },
+        risk: { status: "fallback", routedTo: "rules", reason: "orchestrate_exception" },
+        tactical: { status: "fallback", routedTo: "rules", reason: "orchestrate_exception" },
       },
       agents: {
-        fatigue: { status: "ERROR" },
-        risk: { status: "ERROR" },
-        tactical: { status: "ERROR" },
+        fatigue: { status: "FALLBACK" },
+        risk: { status: "FALLBACK" },
+        tactical: { status: "FALLBACK" },
       },
-      errors: [
-        { agent: "fatigue", message: errorMessage },
-        { agent: "risk", message: errorMessage },
-        { agent: "tactical", message: errorMessage },
-      ],
+      errors: [],
       combinedDecision: {
         immediateAction: "Continue with monitored plan",
         suggestedAdjustments: [combinedBriefing],
@@ -2593,17 +2751,19 @@ const orchestrateHandler = async (req, res) => {
         requestId: traceId,
         analysisId: persistedFallbackAnalysisId,
         mode,
-        executedAgents: [],
+        executedAgents: ["fatigue", "risk", "tactical"],
         modelRouting: {
-          fatigueModel: "error",
-          riskModel: "error",
-          tacticalModel: "error",
+          fatigueModel: "rules-based-fallback",
+          riskModel: "rules-based-fallback",
+          tacticalModel: "rules-based-fallback",
           fallbacksUsed: ["orchestrate_exception"],
         },
         usedFallbackAgents: ["fatigue", "risk", "tactical"],
+        routerFallbackMessage: combinedBriefing,
         timingsMs: { total: totalMs },
       },
-    });
+    }, persistedFallbackAnalysisId);
+    return res.status(200).json(responseBody);
   }
 };
 
@@ -2863,7 +3023,7 @@ app.listen(PORT, "0.0.0.0", () => {
     envFilePath: loadedEnvPath || "not found",
     cosmosEndpoint: isNonEmptyEnv(process.env.COSMOS_ENDPOINT) ? "set" : "missing",
     cosmosDb: process.env.COSMOS_DB || "",
-    cosmosContainer: process.env.COSMOS_CONTAINER || "",
+    cosmosContainer: process.env.COSMOS_CONTAINER_PLAYERS || "",
     port: PORT,
     host: "0.0.0.0",
   });

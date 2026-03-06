@@ -101,6 +101,8 @@ type Page = 'landing' | 'setup' | 'dashboard' | 'baselines';
 type TeamMode = 'BATTING' | 'BOWLING';
 type RunMode = 'auto' | 'full';
 type AuthStatus = 'checking' | 'authenticated' | 'unauthenticated';
+type SessionMode = 'demo' | 'authenticated' | 'guest';
+type DemoStep = 'landing' | 'match-context' | 'dashboard';
 
 interface MatchContext {
   matchMode: TeamMode;
@@ -668,6 +670,23 @@ const formatOverStr = (balls: number): string => {
   return `${wholeOvers}.${ballPart}`;
 };
 
+const cricketOverToBalls = (oversValue: number): number => {
+  if (!Number.isFinite(oversValue)) return 0;
+  const safeOvers = Math.max(0, oversValue);
+  const wholeOvers = Math.floor(safeOvers);
+  const ballPartRaw = Math.max(0, Math.round(((safeOvers - wholeOvers) + Number.EPSILON) * 10));
+  const carryOvers = Math.floor(ballPartRaw / 6);
+  const ballPart = ballPartRaw % 6;
+  return ((wholeOvers + carryOvers) * 6) + ballPart;
+};
+
+const ballsToOvers = (balls: number): string => formatOverStr(balls);
+
+const oversToBalls = (oversValue: string | number): number => {
+  const parsed = typeof oversValue === 'number' ? oversValue : Number(String(oversValue || '').trim());
+  return cricketOverToBalls(parsed);
+};
+
 const safeNum = (v: unknown, fallback: number): number => {
   const n = typeof v === 'number' ? v : Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -768,6 +787,13 @@ const getMaxOvers = (format: string): number => {
   if (normalized === 'T20') return 4;
   if (normalized === 'ODI') return 10;
   return 12; // Session cap for Test format.
+};
+
+const getInningsTotalOvers = (format: string): number | null => {
+  const normalized = String(format || '').trim().toUpperCase();
+  if (normalized === 'T20') return 20;
+  if (normalized === 'ODI') return 50;
+  return null;
 };
 
 const getProjectionHorizon = (format: string): number => {
@@ -1451,20 +1477,51 @@ const RECOVERY_RATE_BY_HRR: Record<RecoveryLevel, number> = {
   Poor: 0.01,
 };
 const SWA_CLI_COMMAND = 'swa start http://localhost:5173 --api-location ./api';
+const DEMO_SESSION_STORAGE_KEY = 'tactiq:demoSessionActive';
+const COPILOT_ANALYSIS_ID_STORAGE_KEY = 'tactiq:lastAnalysisId';
+const COPILOT_ANALYSIS_AT_STORAGE_KEY = 'tactiq:lastAnalysisAt';
+const COPILOT_VISIBILITY_STORAGE_KEY = 'tactiq:copilotVisible';
+const COPILOT_ANALYSIS_TTL_MS = 2 * 60 * 60 * 1000;
+
+const readDemoSessionFlag = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  try {
+    const raw = String(window.sessionStorage.getItem(DEMO_SESSION_STORAGE_KEY) || '').trim().toLowerCase();
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch {
+    // Ignore storage read failures.
+  }
+  return isDemoModeEnabled();
+};
+
+const persistDemoSessionFlag = (enabled: boolean): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    if (enabled) {
+      window.sessionStorage.setItem(DEMO_SESSION_STORAGE_KEY, 'true');
+      return;
+    }
+    window.sessionStorage.removeItem(DEMO_SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore storage write failures.
+  }
+};
 
 // --- Main App Component ---
 
 export default function App() {
   const initialStoredMatchMode = useMemo(() => readStoredMatchMode(), []);
   const initialPath = useMemo(() => (typeof window === 'undefined' ? '/' : String(window.location.pathname || '')), []);
+  const initialDemoMode = useMemo(() => readDemoSessionFlag(), []);
   const isAuthPathOnLoad = useMemo(() => {
     return isAuthPath(initialPath);
   }, [initialPath]);
-  const [demoMode, setDemoMode] = useState<boolean>(() => isDemoModeEnabled());
-  const [authStatus, setAuthStatus] = useState<AuthStatus>(() => (isDemoModeEnabled() ? 'authenticated' : 'checking'));
+  const [demoMode, setDemoMode] = useState<boolean>(() => initialDemoMode);
+  const [authStatus, setAuthStatus] = useState<AuthStatus>(() => (initialDemoMode ? 'authenticated' : 'checking'));
   const [authUser, setAuthUser] = useState<{ userId: string; name?: string; email?: string } | null>(
     () =>
-      isDemoModeEnabled()
+      initialDemoMode
         ? {
             userId: 'demo-local',
             name: 'Demo Coach',
@@ -1476,9 +1533,9 @@ export default function App() {
   const [showSplash, setShowSplash] = useState(() => !isAuthPathOnLoad);
   const [authLocalHint, setAuthLocalHint] = useState<string | null>(null);
   const [copiedSwaCommand, setCopiedSwaCommand] = useState(false);
-  const [azureOpenAIConfigured, setAzureOpenAIConfigured] = useState<boolean>(false);
+  const [aiAvailable, setAiAvailable] = useState<boolean>(false);
   const [aiStatusLoaded, setAiStatusLoaded] = useState<boolean>(false);
-  const [page, setPage] = useState<Page>(() => (isDemoPath(initialPath) ? 'dashboard' : 'landing'));
+  const [page, setPage] = useState<Page>(() => 'landing');
   const [matchContext, setMatchContext] = useState<MatchContext>({
     matchMode: initialStoredMatchMode ?? 'BOWLING',
     format: 'T20',
@@ -1513,6 +1570,8 @@ export default function App() {
   const [analysisActive, setAnalysisActive] = useState(false);
   const [analysisRequested, setAnalysisRequested] = useState(false);
   const [analysisBundleId, setAnalysisBundleId] = useState('');
+  const [, setCopilotSessionAnalysisId] = useState<string>('');
+  const [, setCopilotVerifiedAnalysisId] = useState<string>('');
   const [coachOutput, setCoachOutput] = useState<CoachOutputView | null>(null);
   const [recoveryMode, setRecoveryMode] = useState<RecoveryMode>('auto');
   const [manualRecovery, setManualRecovery] = useState<RecoveryLevel>('Moderate');
@@ -1534,30 +1593,61 @@ export default function App() {
   const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previousActivePlayerIdRef = useRef<string | null>(null);
   const baselineCacheRef = useRef<Map<string, Baseline>>(new Map());
-  const isAppUnlocked = demoMode || authStatus === 'authenticated';
+  const sessionMode: SessionMode = useMemo(() => {
+    if (demoMode) return 'demo';
+    if (authStatus === 'authenticated' && Boolean(authUser?.userId)) return 'authenticated';
+    return 'guest';
+  }, [authStatus, authUser?.userId, demoMode]);
+  const isAppUnlocked = sessionMode !== 'guest';
+  const isDemoSession = sessionMode === 'demo';
+  const demoStep: DemoStep = useMemo(() => {
+    if (page === 'setup') return 'match-context';
+    if (page === 'dashboard' || page === 'baselines') return 'dashboard';
+    return 'landing';
+  }, [page]);
   const isLocalAuthHost = useMemo(() => {
     if (typeof window === 'undefined') return false;
     const host = String(window.location.hostname || '').toLowerCase();
     return host === 'localhost' || host === '127.0.0.1';
   }, []);
-  const isDemoDataMode = useMemo(() => {
-    if (typeof window === 'undefined') return demoMode;
-    const onDemoRoute = isDemoPath(window.location.pathname || '');
-    return onDemoRoute || demoMode;
-  }, [demoMode]);
-  const demoAiOptInForDeployed = useMemo(() => {
-    const raw = String(import.meta.env.VITE_DEMO_AI_ENABLED || import.meta.env.VITE_ENABLE_DEMO_AI || '').trim().toLowerCase();
-    return raw === 'true' || raw === '1' || raw === 'yes';
-  }, []);
   const aiEnabled = useMemo(() => {
-    const configured = aiStatusLoaded ? azureOpenAIConfigured : true;
-    if (isLocalAuthHost) return configured;
-    if (isDemoDataMode) return demoAiOptInForDeployed && configured;
-    return configured;
-  }, [aiStatusLoaded, azureOpenAIConfigured, isLocalAuthHost, isDemoDataMode, demoAiOptInForDeployed]);
-  const canUseLocalDemo = useMemo(() => {
-    return isLocalAuthHost;
-  }, [isLocalAuthHost]);
+    return aiStatusLoaded ? aiAvailable : true;
+  }, [aiStatusLoaded, aiAvailable]);
+  const logSessionDebug = useCallback((source: string, extra?: Record<string, unknown>) => {
+    console.log('[session]', {
+      source,
+      userId: authUser?.userId || null,
+      email: authUser?.email || null,
+      demoMode,
+      authStatus,
+      sessionMode,
+      ...(extra || {}),
+    });
+  }, [authStatus, authUser?.email, authUser?.userId, demoMode, sessionMode]);
+  const setDemoSessionActive = useCallback((enabled: boolean, source: string) => {
+    setDemoModeEnabled(enabled);
+    persistDemoSessionFlag(enabled);
+    setDemoMode(enabled);
+    logSessionDebug(source, {
+      nextDemoMode: enabled,
+      nextSessionMode: enabled ? 'demo' : authStatus === 'authenticated' ? 'authenticated' : 'guest',
+    });
+  }, [authStatus, logSessionDebug]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    console.log('[view-state]', {
+      route: String(window.location.pathname || ''),
+      demoMode,
+      sessionMode,
+      demoStep,
+      page,
+      showSplash,
+      isAppUnlocked,
+      authStatus,
+      isLoadingRosterPlayers,
+    });
+  }, [authStatus, demoMode, demoStep, isAppUnlocked, isLoadingRosterPlayers, page, sessionMode, showSplash]);
 
   useEffect(() => {
     if (aiStatusInitRef.current) return;
@@ -1567,14 +1657,19 @@ export default function App() {
     void getAiStatus(controller.signal)
       .then((status) => {
         if (cancelled) return;
-        setAzureOpenAIConfigured(Boolean(status.azureOpenAIConfigured));
+        const nextAiAvailable =
+          Boolean(status?.aiEnabled) &&
+          Boolean(status?.endpointConfigured) &&
+          Boolean(status?.keyConfigured) &&
+          Boolean(status?.deploymentConfigured);
+        setAiAvailable(nextAiAvailable);
       })
       .catch((error) => {
         if (cancelled) return;
         if (import.meta.env.DEV) {
           console.warn('[ai][status] unavailable, defaulting to fallback', error);
         }
-        setAzureOpenAIConfigured(false);
+        setAiAvailable(false);
       })
       .finally(() => {
         if (cancelled) return;
@@ -1630,40 +1725,50 @@ export default function App() {
   }, [isProfileOpen]);
 
   useEffect(() => {
-    if (!canUseLocalDemo && demoMode && typeof window !== 'undefined' && !isDemoPath(window.location.pathname || '')) {
-      setDemoModeEnabled(false);
-      setDemoMode(false);
-    }
-  }, [canUseLocalDemo, demoMode]);
+    logSessionDebug('state_change');
+  }, [logSessionDebug]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || showSplash) return;
     const path = String(window.location.pathname || '');
     const onAuthPath = isAuthPath(path);
     const onDemoPath = isDemoPath(path);
-    if (onDemoPath) {
-      ensureDemoBaselinesSeeded();
-    }
-    if (onDemoPath && !demoMode) {
-      setDemoModeEnabled(true);
-      setDemoMode(true);
+
+    if (onDemoPath && sessionMode !== 'demo') {
+      setDemoSessionActive(true, 'route_hydration:demo_path');
       setAuthStatus('authenticated');
       setAuthUser({
         userId: 'demo-local',
         name: 'Demo Coach',
         email: 'demo@local',
       });
-      setPage('dashboard');
+      setPage('landing');
+      logSessionDebug('route_hydration:enter_demo_landing', { path, page });
       return;
     }
-    if (!isAppUnlocked && !onAuthPath) {
+
+    if (sessionMode === 'demo') {
+      ensureDemoBaselinesSeeded();
+      if (!onDemoPath) {
+        window.history.replaceState(null, '', '/demo');
+        logSessionDebug('route_redirect:force_demo_path', { path });
+      }
+      return;
+    }
+
+    if (sessionMode === 'authenticated') {
+      if (onAuthPath || onDemoPath) {
+        window.history.replaceState(null, '', '/');
+        logSessionDebug('route_redirect:auth_to_home', { path });
+      }
+      return;
+    }
+
+    if (!onAuthPath) {
       window.history.replaceState(null, '', '/auth');
-      return;
+      logSessionDebug('route_redirect:guest_to_auth', { path });
     }
-    if (isAppUnlocked && onAuthPath) {
-      window.history.replaceState(null, '', demoMode ? '/demo' : '/');
-    }
-  }, [demoMode, isAppUnlocked, showSplash]);
+  }, [logSessionDebug, page, sessionMode, setDemoSessionActive, showSplash]);
 
   useEffect(() => {
     if (isAppUnlocked) {
@@ -1676,6 +1781,14 @@ export default function App() {
     if (showSplash) return;
     let cancelled = false;
     if (demoMode) {
+      console.log('[session]', {
+        source: 'auth_hydration:demo_short_circuit',
+        userId: authUser?.userId || null,
+        email: authUser?.email || null,
+        demoMode,
+        authStatus,
+        sessionMode: 'demo',
+      });
       setAuthStatus('authenticated');
       setAuthUser({
         userId: 'demo-local',
@@ -1687,13 +1800,32 @@ export default function App() {
         cancelled = true;
       };
     }
-
-    setAuthStatus('checking');
-    setAuthUser(null);
+    const preserveAuthenticatedState = authStatus === 'authenticated' && Boolean(authUser?.userId);
+    if (!preserveAuthenticatedState) {
+      setAuthStatus('checking');
+      setAuthUser(null);
+    }
     setCoachTeamId(null);
+    console.log('[session]', {
+      source: 'auth_hydration:start',
+      userId: authUser?.userId || null,
+      email: authUser?.email || null,
+      demoMode,
+      authStatus,
+      sessionMode: preserveAuthenticatedState ? 'authenticated' : 'guest',
+      preserveAuthenticatedState,
+    });
     void getUser().then((user) => {
       if (cancelled) return;
       if (user.isAuthenticated && user.userId) {
+        console.log('[session]', {
+          source: 'auth_hydration:authenticated',
+          userId: user.userId,
+          email: user.email || null,
+          demoMode: false,
+          authStatus: 'authenticated',
+          sessionMode: 'authenticated',
+        });
         setAuthStatus('authenticated');
         setAuthUser({
           userId: user.userId,
@@ -1701,6 +1833,14 @@ export default function App() {
           ...(user.email ? { email: user.email } : {}),
         });
       } else {
+        console.log('[session]', {
+          source: 'auth_hydration:guest',
+          userId: null,
+          email: null,
+          demoMode: false,
+          authStatus: 'unauthenticated',
+          sessionMode: 'guest',
+        });
         setAuthStatus('unauthenticated');
         setAuthUser(null);
         setCoachTeamId(null);
@@ -1712,11 +1852,11 @@ export default function App() {
   }, [demoMode, showSplash]);
 
   useEffect(() => {
-    if (!isAppUnlocked) {
+    if (sessionMode === 'guest') {
       setCoachTeamId(null);
       return;
     }
-    if (demoMode) {
+    if (isDemoSession) {
       setCoachTeamId('demo-local-team');
       return;
     }
@@ -1741,11 +1881,10 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authUser?.userId, demoMode, isAppUnlocked]);
+  }, [authUser?.userId, isDemoSession, sessionMode]);
 
   const handleContinueWithMicrosoft = useCallback(() => {
-    setDemoModeEnabled(false);
-    setDemoMode(false);
+    setDemoSessionActive(false, 'action:continue_with_microsoft');
     setCopiedSwaCommand(false);
     if (isLocalAuthHost) {
       setAuthLocalHint(
@@ -1757,15 +1896,14 @@ export default function App() {
     if (typeof window !== 'undefined') {
       window.location.assign(getMicrosoftLoginUrl());
     }
-  }, [isLocalAuthHost]);
+  }, [isLocalAuthHost, setDemoSessionActive]);
 
   const handleTryDemoMode = useCallback(() => {
     setAuthLocalHint(null);
     setCopiedSwaCommand(false);
-    setDemoModeEnabled(true);
-    setDemoMode(true);
+    setDemoSessionActive(true, 'action:try_demo');
     setCoachTeamId('demo-local-team');
-    setPage('dashboard');
+    setPage('landing');
     if (typeof window !== 'undefined') {
       try {
         window.history.pushState(null, '', '/demo');
@@ -1773,18 +1911,36 @@ export default function App() {
         window.location.assign('/demo');
       }
     }
-  }, []);
+  }, [setDemoSessionActive]);
+
+  const handleExitDemo = useCallback(() => {
+    setDemoSessionActive(false, 'action:exit_demo');
+    setIsProfileOpen(false);
+    if (typeof window !== 'undefined') {
+      const path = String(window.location.pathname || '');
+      if (isDemoPath(path)) {
+        window.history.replaceState(null, '', '/');
+      }
+    }
+  }, [setDemoSessionActive]);
 
   const handleSignOut = useCallback(() => {
-    setDemoModeEnabled(false);
-    setDemoMode(false);
+    setDemoSessionActive(false, 'action:sign_out');
     setAuthStatus('unauthenticated');
     setAuthUser(null);
     setCoachTeamId(null);
     if (typeof window !== 'undefined') {
       window.location.assign(getMicrosoftLogoutUrl());
     }
-  }, []);
+  }, [setDemoSessionActive]);
+
+  const handleProfilePrimaryAction = useCallback(() => {
+    if (sessionMode === 'demo') {
+      handleExitDemo();
+      return;
+    }
+    handleSignOut();
+  }, [handleExitDemo, handleSignOut, sessionMode]);
 
   const handleCopySwaCommand = useCallback(async () => {
     if (typeof window === 'undefined') return;
@@ -2090,6 +2246,10 @@ export default function App() {
     setMatchState(prev => {
       const patch = typeof updates === 'function' ? updates(prev) : updates;
       const next = { ...prev, ...patch };
+      const fixedInningsOvers = getInningsTotalOvers(matchContext.format);
+      if (fixedInningsOvers != null) {
+        next.totalOvers = fixedInningsOvers;
+      }
       const maxBalls = totalBallsFromOvers(next.totalOvers);
       next.ballsBowled = Math.min(maxBalls, Math.max(0, Math.floor(next.ballsBowled)));
       next.wickets = Math.min(10, Math.max(0, Math.floor(next.wickets)));
@@ -2101,11 +2261,8 @@ export default function App() {
 
   useEffect(() => {
     setMatchState(prev => {
-      const nextTotalOvers = matchContext.format === 'T20'
-        ? 20
-        : matchContext.format === 'ODI'
-          ? 50
-          : prev.totalOvers;
+      const fixedInningsOvers = getInningsTotalOvers(matchContext.format);
+      const nextTotalOvers = fixedInningsOvers ?? prev.totalOvers;
 
       if (nextTotalOvers === prev.totalOvers) return prev;
 
@@ -2362,7 +2519,13 @@ export default function App() {
   const handleAddOver = () => {
     if (!activePlayer) return;
     if ((activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') || activePlayer.isSub || activePlayer.isUnfit) return;
+    const inningsLimitOvers = getInningsTotalOvers(matchContext.format) ?? Math.max(1, Math.floor(matchState.totalOvers));
+    const inningsMaxBalls = totalBallsFromOvers(inningsLimitOvers);
+    const currentInningsBalls = Math.max(0, Math.floor(matchState.ballsBowled));
+    if (currentInningsBalls >= inningsMaxBalls) return;
     const cap = getMaxOvers(matchContext.format);
+    const currentWorkload = sanitizeBowlerWorkload(activePlayer, matchContext.format);
+    if (currentWorkload.overs >= cap) return;
     updatePlayer(activePlayer.id, (p) => {
       const workload = sanitizeBowlerWorkload(p, matchContext.format);
       if (workload.overs >= cap) return {};
@@ -2380,10 +2543,13 @@ export default function App() {
         isResting: false,
       };
     });
+    updateMatchState({ ballsBowled: Math.min(inningsMaxBalls, currentInningsBalls + 6) });
   };
 
   const handleDecreaseOver = () => {
     if (!activePlayer) return;
+    const currentWorkload = sanitizeBowlerWorkload(activePlayer, matchContext.format);
+    if (currentWorkload.overs <= 0) return;
     updatePlayer(activePlayer.id, (p) => {
       const workload = sanitizeBowlerWorkload(p, matchContext.format);
       const nextOvers = Math.max(0, workload.overs - 1);
@@ -2399,6 +2565,7 @@ export default function App() {
         fatigueFloor: workload.fatigueFloor,
       };
     });
+    updateMatchState((prev) => ({ ballsBowled: Math.max(0, prev.ballsBowled - 6) }));
   };
 
   const handleRest = () => {
@@ -2936,6 +3103,32 @@ export default function App() {
         risk: buildModelRouterEntry('risk'),
         tactical: buildModelRouterEntry('tactical'),
       };
+      const resultMetaRecord = toRecord(result.meta as unknown);
+      const normalizeAgentList = (value: unknown): AgentKey[] => {
+        if (!Array.isArray(value)) return [];
+        const normalized: AgentKey[] = [];
+        value.forEach((entry) => {
+          const key = toAgentKey(entry);
+          if (key) normalized.push(key);
+        });
+        return normalized;
+      };
+      const metaMode: 'auto' | 'full' =
+        String(resultMetaRecord.mode || mode || 'auto').trim().toLowerCase() === 'full'
+          ? 'full'
+          : 'auto';
+      const metaExecutedAgents = normalizeAgentList(resultMetaRecord.executedAgents);
+      const metaUsedFallbackAgents = normalizeAgentList(resultMetaRecord.usedFallbackAgents);
+      const metaRouterFallbackMessage =
+        typeof resultMetaRecord.routerFallbackMessage === 'string'
+          ? resultMetaRecord.routerFallbackMessage
+          : undefined;
+      const metaModelRoutingRecord = toRecord(resultMetaRecord.modelRouting);
+      const metaFallbacksUsed = Array.isArray(metaModelRoutingRecord.fallbacksUsed)
+        ? metaModelRoutingRecord.fallbacksUsed
+            .map((entry) => String(entry || '').trim())
+            .filter((entry) => entry.length > 0)
+        : [];
       const hasAnyImmediateOutput = Boolean(
         fatigueMapped ||
         riskMapped ||
@@ -2944,16 +3137,29 @@ export default function App() {
         result.combinedDecision ||
         result.combinedBriefing
       );
-      const outputRecordForAnalysisId = toRecord((result as unknown as Record<string, unknown>).outputs);
-      const agentResultsRecordForAnalysisId = toRecord((result as unknown as Record<string, unknown>).agentResults);
-      const hasStructuredAgentOutput = Object.keys(outputRecordForAnalysisId).length > 0 || Object.keys(agentResultsRecordForAnalysisId).length > 0;
-      const analysisIdFromResult = String(result.analysisId || result.meta?.analysisId || '').trim();
-      const analysisBundleIdFromResult = String(result.analysisBundleId || '').trim();
-      const fallbackAnalysisSeed = String(result.meta?.requestId || result.traceId || activePlayer?.id || Date.now()).trim();
-      const resolvedAnalysisId = analysisBundleIdFromResult || analysisIdFromResult || ((hasAnyImmediateOutput || hasStructuredAgentOutput)
-        ? `local-${fallbackAnalysisSeed || Date.now()}`
-        : '');
-      if (resolvedAnalysisId && typeof window !== 'undefined') {
+      const fallbackPlayerToken =
+        String(selectedPlayer?.name || activePlayer?.name || 'session')
+          .trim()
+          .replace(/\s+/g, '-')
+          .toLowerCase() || 'session';
+      const localFallbackAnalysisId = `local-${fallbackPlayerToken}-${Date.now()}`;
+      const metaAnalysisId = String(resultMetaRecord.analysisId || '').trim();
+      const metaCopilotAnalysisId = String(resultMetaRecord.copilotAnalysisId || '').trim();
+      const resolvedAnalysisId =
+        String(
+          metaAnalysisId ||
+          metaCopilotAnalysisId ||
+          result.analysisBundleId ||
+          result.analysisId ||
+          localFallbackAnalysisId
+        ).trim() || localFallbackAnalysisId;
+      if (!metaAnalysisId && !metaCopilotAnalysisId) {
+        console.warn('[copilot] meta analysis id missing; using local fallback id', {
+          analysisId: resolvedAnalysisId,
+          requestId: String(resultMetaRecord.requestId || result.traceId || '').trim() || undefined,
+        });
+      }
+      if (typeof window !== 'undefined') {
         try {
           window.localStorage.setItem(COPILOT_ANALYSIS_ID_STORAGE_KEY, resolvedAnalysisId);
           window.localStorage.setItem(COPILOT_ANALYSIS_AT_STORAGE_KEY, String(Date.now()));
@@ -2961,10 +3167,8 @@ export default function App() {
           // Ignore local storage failures in restricted browser modes.
         }
       }
-      if (resolvedAnalysisId) {
-        setCopilotSessionAnalysisId(resolvedAnalysisId);
-        setCopilotVerifiedAnalysisId(resolvedAnalysisId);
-      }
+      setCopilotSessionAnalysisId(resolvedAnalysisId);
+      setCopilotVerifiedAnalysisId(resolvedAnalysisId);
       setAnalysisBundleId(resolvedAnalysisId);
       const summaryText = [
         typeof result.summary === 'string' ? result.summary : '',
@@ -3014,11 +3218,11 @@ export default function App() {
           : undefined;
       setOrchestrateMeta({
         analysisId: resolvedAnalysisId || undefined,
-        mode: result.meta.mode,
+        mode: metaMode,
         responseMode,
-        executedAgents: result.meta.executedAgents,
-        usedFallbackAgents: result.meta.usedFallbackAgents || [],
-        routerFallbackMessage: typeof result.meta.routerFallbackMessage === 'string' ? result.meta.routerFallbackMessage : undefined,
+        executedAgents: metaExecutedAgents,
+        usedFallbackAgents: metaUsedFallbackAgents,
+        routerFallbackMessage: metaRouterFallbackMessage,
         traceId: result.traceId || result.responseHeaders?.traceId,
         source: result.source || result.responseHeaders?.source,
         azureRequestId: result.azureRequestId,
@@ -3047,12 +3251,7 @@ export default function App() {
           });
         }
       }
-      if (Array.isArray(result.meta.executedAgents)) {
-        result.meta.executedAgents.forEach((agent) => {
-          const key = toAgentKey(agent);
-          if (key) selectedAgentSet.add(key);
-        });
-      }
+      metaExecutedAgents.forEach((agent) => selectedAgentSet.add(agent));
       if (selectedAgentSet.size === 0) {
         selectedAgentSet.add('tactical');
       }
@@ -3086,18 +3285,17 @@ export default function App() {
         const serverStatus = normalizeAgentStatusToken(result.agents?.[agent]?.status);
         const routeStatus = String(agentResult?.status || '').trim().toLowerCase();
         const routeReason = String(agentResult?.reason || agentResult?.error || '').trim().toLowerCase();
-        const routerReason = String(result.routerDecision?.reason || result.meta.routerFallbackMessage || '').trim().toLowerCase();
+        const routerReason = String(result.routerDecision?.reason || metaRouterFallbackMessage || '').trim().toLowerCase();
         const routeChoice = String(agentResult?.routedTo || '').trim().toLowerCase();
         const errored = result.errors.some((entry) => entry.agent === agent);
-        const hasFallbackSignal =
-          Array.isArray(result.meta.usedFallbackAgents) && result.meta.usedFallbackAgents.includes(agent);
+        const hasFallbackSignal = metaUsedFallbackAgents.includes(agent);
         const fallbackRoutingActive =
           hasFallbackSignal ||
           routeChoice === 'rules' ||
           serverStatus === 'FALLBACK' ||
           routeStatus === 'fallback' ||
-          Boolean(result.meta.routerFallbackMessage) ||
-          (Array.isArray(result.meta.modelRouting?.fallbacksUsed) && result.meta.modelRouting.fallbacksUsed.length > 0) ||
+          Boolean(metaRouterFallbackMessage) ||
+          metaFallbacksUsed.length > 0 ||
           fallbackReasonRegex.test(routeReason) ||
           fallbackReasonRegex.test(routerReason);
         if (routeReason.includes('not_selected_by_auto_router') || routeReason.includes('disabled_by_request')) {
@@ -3677,9 +3875,6 @@ export default function App() {
       }
 
       if (!aiEnabled) {
-        if (isDemoDataMode && !isLocalAuthHost && !demoAiOptInForDeployed) {
-          throw new Error('ai_disabled_by_policy');
-        }
         throw new Error('ai_not_configured');
       }
 
@@ -3919,7 +4114,18 @@ export default function App() {
     setAgentFeedStatus(getDefaultAgentFeedStatus());
   };
 
-  const navigateTo = (p: Page) => {
+  const navigateTo = (p: Page, source = 'ui:navigate') => {
+    if (typeof window !== 'undefined') {
+      console.log('[nav]', {
+        source,
+        route: String(window.location.pathname || ''),
+        demoMode,
+        sessionMode,
+        demoStep,
+        from: page,
+        to: p,
+      });
+    }
     window.scrollTo(0, 0);
     setPage(p);
   };
@@ -4026,7 +4232,7 @@ export default function App() {
       <nav className="border-b border-white/10 bg-[#060B16]/90 backdrop-blur-md sticky top-0 z-50 shrink-0">
         <div className="w-full px-3 sm:px-4">
           <div className="flex items-center justify-between h-20">
-            <div className="flex items-center gap-3 cursor-pointer group" onClick={() => navigateTo('landing')}>
+            <div className="flex items-center gap-3 cursor-pointer group" onClick={() => navigateTo('landing', 'nav:logo')}>
               <div className="w-10 h-10 border border-emerald-500 rounded-xl flex items-center justify-center transform group-hover:rotate-6 transition-transform">
                 <Shield className="text-emerald-500 w-5 h-5 fill-emerald-500/20" />
               </div>
@@ -4037,13 +4243,13 @@ export default function App() {
               {isAppUnlocked && page !== 'landing' && (
                 <>
                   <button type="button" 
-                    onClick={() => navigateTo('dashboard')}
+                    onClick={() => navigateTo('dashboard', 'nav:dashboard')}
                     className={`text-sm font-medium transition-colors px-3 py-1.5 rounded-md ${page === 'dashboard' ? 'bg-emerald-500/10 text-emerald-400' : 'text-slate-400 hover:text-white'}`}
                   >
                     Dashboard
                   </button>
                   <button type="button" 
-                    onClick={() => navigateTo('baselines')}
+                    onClick={() => navigateTo('baselines', 'nav:baselines')}
                     className={`text-sm font-medium transition-colors px-3 py-1.5 rounded-md ${page === 'baselines' ? 'bg-emerald-500/10 text-emerald-400' : 'text-slate-400 hover:text-white'}`}
                   >
                     Player Baselines
@@ -4079,14 +4285,14 @@ export default function App() {
                         {isAppUnlocked && (
                           <div className="pt-2 mt-2 border-t border-white/10">
                             <p className="text-[11px] text-slate-400 truncate">
-                              {demoMode ? 'Demo Coach' : authUser?.name || authUser?.email || authUser?.userId || 'Coach'}
+                              {sessionMode === 'demo' ? 'Demo Coach' : authUser?.name || authUser?.email || authUser?.userId || 'Coach'}
                             </p>
                             <button
                               type="button"
-                              onClick={handleSignOut}
+                              onClick={handleProfilePrimaryAction}
                               className="mt-2 w-full rounded-md border border-white/15 bg-white/[0.04] text-slate-200 text-xs font-medium py-1.5 hover:bg-white/[0.08] transition-colors"
                             >
-                              {demoMode ? 'Exit Demo' : 'Sign out'}
+                              {sessionMode === 'demo' ? 'Exit Demo' : 'Sign out'}
                             </button>
                           </div>
                         )}
@@ -4160,15 +4366,17 @@ export default function App() {
         ) : (
           <AnimatePresence mode="wait">
             {page === 'landing' && (
-              <LandingPage key="landing" onStart={() => navigateTo('setup')} />
+              <LandingPage key="landing" onStart={() => navigateTo('setup', 'landing:start_match')} />
             )}
             {page === 'setup' && (
               <MatchSetup 
                 key="setup" 
                 context={matchContext} 
                 setContext={setMatchContext} 
-                onNext={() => navigateTo('dashboard')} 
-                onBack={() => navigateTo('landing')}
+                inningsOvers={matchState.totalOvers}
+                setInningsOvers={(overs) => updateMatchState({ totalOvers: Math.max(1, Math.floor(safeNum(overs, 1))) })}
+                onNext={() => navigateTo('dashboard', 'setup:load_team_dashboard')} 
+                onBack={() => navigateTo('landing', 'setup:back_to_landing')}
               />
             )}
             {page === 'dashboard' && (
@@ -4220,8 +4428,8 @@ export default function App() {
                 setManualRecovery={setManualRecovery}
                 isLoadingRosterPlayers={isLoadingRosterPlayers}
                 rosterMutationError={rosterMutationError}
-                onGoToBaselines={() => navigateTo('baselines')}
-                onBack={() => navigateTo('setup')}
+                onGoToBaselines={() => navigateTo('baselines', 'dashboard:open_baselines')}
+                onBack={() => navigateTo('setup', 'dashboard:back_to_setup')}
               />
             )}
             {page === 'baselines' && (
@@ -4229,10 +4437,11 @@ export default function App() {
                 key="baselines"
                 baselineSource={baselineSource}
                 baselineWarning={baselineWarning}
+                demoMode={isDemoSession}
                 onBaselinesSynced={handleBaselinesSynced}
                 matchRosterIds={matchRosterIds}
                 onMatchRosterIdsChange={applyMatchRosterIds}
-                onBack={() => navigateTo('dashboard')}
+                onBack={() => navigateTo('dashboard', 'baselines:back_to_dashboard')}
               />
             )}
           </AnimatePresence>
@@ -4354,9 +4563,11 @@ function FeatureCard({ icon, title, desc, color }: { icon: React.ReactNode, titl
   );
 }
 
-function MatchSetup({ context, setContext, onNext, onBack }: { 
+function MatchSetup({ context, setContext, inningsOvers, setInningsOvers, onNext, onBack }: { 
   context: MatchContext, 
   setContext: (c: MatchContext) => void, 
+  inningsOvers: number;
+  setInningsOvers: (overs: number) => void;
   onNext: () => void,
   onBack: () => void 
 }) {
@@ -4400,6 +4611,24 @@ function MatchSetup({ context, setContext, onNext, onBack }: {
               ))}
             </div>
           </div>
+
+          {String(context.format || '').trim().toUpperCase() === 'TEST' && (
+            <div>
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 block">Test Overs Limit</label>
+              <input
+                type="number"
+                min={1}
+                step="1"
+                value={Math.max(1, Math.floor(safeNum(inningsOvers, 1)))}
+                onChange={(e) => {
+                  const next = Math.max(1, Math.floor(Number(e.target.value) || 1));
+                  setInningsOvers(next);
+                }}
+                className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-3 focus:border-indigo-500 focus:outline-none"
+                aria-label="Test overs limit"
+              />
+            </div>
+          )}
 
           <div>
              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 block">Match Phase</label>
@@ -5328,10 +5557,6 @@ function Dashboard({
   agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedBriefing, combinedDecision, finalRecommendation, orchestrateMeta, routerDecision, agentFeedStatus, analysisBundleId, coachOutput, agentWarning, agentFailure, setAgentWarning, setAgentFailure, analysisActive, runAgent, onDismissAnalysis, handleAddOver, handleDecreaseOver, handleRest, handleMarkUnfit,
   recoveryMode, setRecoveryMode, manualRecovery, setManualRecovery, isLoadingRosterPlayers, rosterMutationError, onGoToBaselines, onBack
 }: DashboardProps) {
-  const COPILOT_ANALYSIS_ID_STORAGE_KEY = 'tactiq:lastAnalysisId';
-  const COPILOT_ANALYSIS_AT_STORAGE_KEY = 'tactiq:lastAnalysisAt';
-  const COPILOT_VISIBILITY_STORAGE_KEY = 'tactiq:copilotVisible';
-  const COPILOT_ANALYSIS_TTL_MS = 2 * 60 * 60 * 1000;
   const [arTelemetryView, setArTelemetryView] = useState<'batting' | 'bowling'>('batting');
   const [strainIndex, setStrainIndex] = useState(0);
   const [isResettingBaselines, setIsResettingBaselines] = useState(false);
@@ -5531,14 +5756,13 @@ function Dashboard({
         strainIndex: 0,
       };
 
-  const isUnlimitedInningsFormat = String(matchContext.format || '').trim().toUpperCase() === 'TEST';
-  const totalBalls = totalBallsFromOvers(matchState.totalOvers);
-  const ballsBowled = isUnlimitedInningsFormat
-    ? Math.max(0, matchState.ballsBowled)
-    : Math.min(totalBalls, Math.max(0, matchState.ballsBowled));
+  const fixedInningsOvers = getInningsTotalOvers(matchContext.format);
+  const resolvedTotalOvers = fixedInningsOvers ?? Math.max(1, Math.floor(matchState.totalOvers));
+  const totalBalls = totalBallsFromOvers(resolvedTotalOvers);
+  const ballsBowled = Math.min(totalBalls, Math.max(0, matchState.ballsBowled));
   const ballsRemaining = Math.max(totalBalls - ballsBowled, 0);
   // Shared innings cap for setup + batting controls.
-  const isInningsFinished = !isUnlimitedInningsFormat && ballsBowled >= totalBalls;
+  const isInningsFinished = ballsBowled >= totalBalls;
   const inningsComplete = isInningsFinished;
   const formatMaxOvers = activePlayer?.maxOvers ?? getMaxOvers(matchContext.format);
   const hasFormatCap = Number.isFinite(formatMaxOvers);
@@ -5618,7 +5842,12 @@ function Dashboard({
       };
     });
   };
-  const overStr = formatOverStr(ballsBowled);
+  const overStr = ballsToOvers(ballsBowled);
+  const currentOverDisplay = (() => {
+    const wholeOvers = Math.floor(ballsBowled / 6);
+    const ballPart = ballsBowled % 6;
+    return ballPart === 0 ? String(wholeOvers) : `${wholeOvers}.${ballPart}`;
+  })();
   const oversFaced = ballsBowled / 6;
   const currentRunRate = ballsBowled > 0 ? matchState.runs / oversFaced : 0;
   const runsNeeded = matchState.target != null ? Math.max(matchState.target - matchState.runs, 0) : 0;
@@ -5904,11 +6133,19 @@ function Dashboard({
     if (fromMeta.length > 0) {
       setCopilotSessionAnalysisId((prev) => (prev === fromMeta ? prev : fromMeta));
       setCopilotVerifiedAnalysisId((prev) => (prev === fromMeta ? prev : fromMeta));
-    } else if (import.meta.env.DEV) {
-      // no-op path for debugging local state transitions.
-      console.log('[copilot][analysis_id_missing_in_meta]');
+      return;
     }
-  }, [analysisActive, orchestrateMeta, showCoachInsights]);
+    const generatedId =
+      `local-${String(activePlayer?.name || activePlayer?.id || 'session')
+        .trim()
+        .replace(/\s+/g, '-')
+        .toLowerCase() || 'session'}-${Date.now()}`;
+    console.warn('[copilot] meta analysis id missing in dashboard state; using generated local id', {
+      analysisId: generatedId,
+    });
+    setCopilotSessionAnalysisId((prev) => prev || generatedId);
+    setCopilotVerifiedAnalysisId((prev) => prev || generatedId);
+  }, [analysisActive, orchestrateMeta, showCoachInsights, activePlayer?.id, activePlayer?.name]);
 
   useEffect(() => {
     const candidateId = String(copilotSessionAnalysisId || '').trim();
@@ -6343,11 +6580,17 @@ function Dashboard({
   useEffect(() => {
     if (!hasCopilotActivationSignal) return;
     if (effectiveCopilotAnalysisId.length > 0) return;
-    console.error('[copilot] missing analysis id after coach completion; using generated local id');
-    const generatedId = `local-${String(activePlayer?.id || 'coach')}-${Date.now()}`;
-    setCopilotSessionAnalysisId(generatedId);
-    setCopilotVerifiedAnalysisId(generatedId);
-  }, [hasCopilotActivationSignal, effectiveCopilotAnalysisId, activePlayer?.id]);
+    const generatedId =
+      `local-${String(activePlayer?.name || activePlayer?.id || 'coach')
+        .trim()
+        .replace(/\s+/g, '-')
+        .toLowerCase() || 'coach'}-${Date.now()}`;
+    console.warn('[copilot] missing analysis id after coach completion; using generated local id', {
+      analysisId: generatedId,
+    });
+    setCopilotSessionAnalysisId((prev) => prev || generatedId);
+    setCopilotVerifiedAnalysisId((prev) => prev || generatedId);
+  }, [hasCopilotActivationSignal, effectiveCopilotAnalysisId, activePlayer?.id, activePlayer?.name]);
   const shouldRenderCopilotUnderGraph =
     shouldShowTelemetryGraph && hasCoachOutputText && agentExecutionFinished;
   useEffect(() => {
@@ -7193,6 +7436,15 @@ function Dashboard({
     color: 'rgba(253, 230, 138, 0.95)',
     transition: 'all 200ms ease',
   };
+  const copilotSectionStyle: React.CSSProperties = {
+    marginTop: '28px',
+    borderRadius: '20px',
+    background: 'linear-gradient(180deg, rgba(10,24,52,0.96) 0%, rgba(9,22,46,0.98) 100%)',
+    border: '1px solid rgba(110, 160, 255, 0.10)',
+    boxShadow: '0 16px 40px rgba(0,0,0,0.34), 0 0 0 1px rgba(110,160,255,0.05), inset 0 1px 0 rgba(255,255,255,0.02)',
+    padding: '28px',
+    overflow: 'hidden',
+  };
   const unselectedModeStyle: React.CSSProperties = {
     backgroundColor: 'transparent',
     borderColor: 'rgba(148, 163, 184, 0.18)',
@@ -7247,9 +7499,7 @@ function Dashboard({
           : Math.max(0, prev.runs + runDelta),
         ballsBowled: direction === -1
           ? Math.max(0, prev.ballsBowled - ballDelta)
-          : isUnlimitedInningsFormat
-            ? Math.max(0, prev.ballsBowled + ballDelta)
-            : Math.min(maxBalls, prev.ballsBowled + ballDelta),
+          : Math.min(maxBalls, prev.ballsBowled + ballDelta),
       };
     });
   };
@@ -7953,27 +8203,31 @@ function Dashboard({
            </span>
            <span className="flex items-center gap-1.5">
              OVER
-             <span className="w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center">{overStr}</span>
-             /
-             <input
-               type="number"
-               min={1}
-               step="1"
-               value={matchState.totalOvers}
-               onChange={(e) => updateMatchState({ totalOvers: Math.max(1, Number(e.target.value) || 1) })}
-               className="w-12 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-               aria-label="Total overs"
-             />
-             <span className="text-slate-500">balls</span>
              <input
                type="number"
                min={0}
-               max={isUnlimitedInningsFormat ? undefined : totalBalls}
+               max={resolvedTotalOvers}
+               step="0.1"
+               value={currentOverDisplay}
+               onChange={(e) => {
+                 const nextBalls = Math.min(totalBalls, oversToBalls(e.target.value));
+                 updateMatchState({ ballsBowled: nextBalls });
+               }}
+               className="w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+               aria-label="Current over"
+             />
+             /
+             <span className="w-12 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center">{resolvedTotalOvers}</span>
+             <span className="text-slate-500 ml-2.5">balls</span>
+             <input
+               type="number"
+               min={0}
+               max={totalBalls}
                step="1"
                value={ballsBowled}
                onChange={(e) => {
                  const nextBalls = Math.max(0, Number(e.target.value) || 0);
-                 updateMatchState({ ballsBowled: isUnlimitedInningsFormat ? nextBalls : Math.min(totalBalls, nextBalls) });
+                 updateMatchState({ ballsBowled: Math.min(totalBalls, nextBalls) });
                }}
                className="w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                aria-label="Balls bowled"
@@ -8473,7 +8727,7 @@ function Dashboard({
                       </div>
                     )}
                     {shouldRenderCopilotUnderGraph && (
-                      <div className="md:col-span-2 mt-3">
+                      <div className="md:col-span-2" style={copilotSectionStyle}>
                         <CopilotChatPanel
                           analysisReady={hasCoachOutputText && agentExecutionFinished}
                           analysisId={effectiveCopilotAnalysisId || analysisBundleId}
@@ -8551,8 +8805,8 @@ function Dashboard({
                           </button>
                           <button type="button"
                             onClick={handleAddOver}
-                            disabled={isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap}
-                            className={`w-12 h-12 rounded-full flex items-center justify-center shadow-lg transition-all ${isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none opacity-40' : 'cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
+                            disabled={isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap || isInningsFinished}
+                            className={`w-12 h-12 rounded-full flex items-center justify-center shadow-lg transition-all ${isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap || isInningsFinished ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none opacity-40' : 'cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
                           >
                             <Plus className="w-6 h-6" />
                           </button>
@@ -8724,7 +8978,7 @@ function Dashboard({
                     </div>
                   )}
                   {shouldRenderCopilotUnderGraph && (
-                    <div className="mt-3">
+                    <div style={copilotSectionStyle}>
                       <CopilotChatPanel
                         analysisReady={hasCoachOutputText && agentExecutionFinished}
                         analysisId={effectiveCopilotAnalysisId || analysisBundleId}
@@ -9433,6 +9687,7 @@ function Dashboard({
 interface BaselinesProps {
   baselineSource: 'cosmos' | 'fallback';
   baselineWarning: string | null;
+  demoMode: boolean;
   onBaselinesSynced: (
     baselines: Baseline[],
     source: 'cosmos' | 'fallback',
@@ -9522,6 +9777,7 @@ const draftRowToBaseline = (row: BaselineDraftRow): Baseline | null => {
 function Baselines({
   baselineSource,
   baselineWarning,
+  demoMode,
   onBaselinesSynced,
   matchRosterIds,
   onMatchRosterIdsChange,
@@ -9745,12 +10001,12 @@ function Baselines({
   }, [draftBaselines]);
 
   useEffect(() => {
-    if (!isDemoModeEnabled()) return;
+    if (!demoMode) return;
     const normalized = draftRowsToBaselines(draftBaselines);
     void saveBaselines(normalized).catch(() => {
       // Demo autosave is best-effort; keep UI responsive even if storage is blocked.
     });
-  }, [draftBaselines]);
+  }, [demoMode, draftBaselines]);
 
   useEffect(() => {
     const handlePointerDownOutside = (event: MouseEvent | TouchEvent) => {

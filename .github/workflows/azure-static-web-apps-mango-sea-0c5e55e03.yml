@@ -28,6 +28,10 @@ jobs:
           node-version: 20
       - name: Install dependencies
         run: npm ci
+      - name: Install API dependencies
+        run: npm --prefix api ci
+      - name: Build API functions
+        run: npm --prefix api run build
       - name: Build Vite app
         run: npm run build
       - name: Verify dist output

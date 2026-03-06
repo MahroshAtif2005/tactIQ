@@ -1,5 +1,20 @@
+import { isDemoModeEnabled } from '../auth/swaAuth';
+
 const ROSTER_STORAGE_KEY = 'tactiq_roster_ids_v1';
+const DEMO_ROSTER_STORAGE_KEY = 'tactiq_demo_players_v1';
 const BASELINE_DRAFT_STORAGE_KEY = 'tactiq_baseline_drafts_v1';
+const DEFAULT_DEMO_ROSTER_IDS = [
+  'J. Archer',
+  'R. Khan',
+  'M. Starc',
+  'H. Ali',
+  'S. Khan',
+  'B. Stokes',
+  'V. Kohli',
+  'B. Azam',
+  'K. Williamson',
+  'G. Maxwell',
+] as const;
 
 const normalizeId = (value: unknown): string => String(value || '').trim();
 const keyOf = (value: string): string => normalizeId(value).toLowerCase();
@@ -15,6 +30,30 @@ const dedupeIds = (ids: string[]): string[] => {
     result.push(normalized);
   });
   return result;
+};
+
+const getActiveRosterStorageKey = (): string => (isDemoModeEnabled() ? DEMO_ROSTER_STORAGE_KEY : ROSTER_STORAGE_KEY);
+
+const parseRosterIds = (raw: string): string[] | null => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return dedupeIds(parsed.map((entry) => normalizeId(entry)));
+  } catch {
+    return null;
+  }
+};
+
+const seedDemoRosterIds = (): string[] => {
+  const seeded = dedupeIds([...DEFAULT_DEMO_ROSTER_IDS]);
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(DEMO_ROSTER_STORAGE_KEY, JSON.stringify(seeded));
+    } catch {
+      // Ignore storage write failures.
+    }
+  }
+  return seeded;
 };
 
 const readBaselineDraftCache = (): Array<Record<string, unknown>> => {
@@ -64,12 +103,24 @@ const updateBaselineDraftRosterState = (playerId: string, inRoster: boolean): vo
 
 export const getRosterIds = (): string[] => {
   if (typeof window === 'undefined') return [];
+  if (isDemoModeEnabled()) {
+    try {
+      const raw = window.localStorage.getItem(DEMO_ROSTER_STORAGE_KEY);
+      if (!raw) {
+        return seedDemoRosterIds();
+      }
+      const parsed = parseRosterIds(raw);
+      if (parsed) return parsed;
+      return seedDemoRosterIds();
+    } catch {
+      return seedDemoRosterIds();
+    }
+  }
   try {
-    const raw = window.localStorage.getItem(ROSTER_STORAGE_KEY);
+    const activeKey = getActiveRosterStorageKey();
+    const raw = window.localStorage.getItem(activeKey);
     if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return dedupeIds(parsed.map((entry) => normalizeId(entry)));
+    return parseRosterIds(raw) || [];
   } catch {
     return [];
   }
@@ -79,7 +130,8 @@ export const setRosterIds = (ids: string[]): void => {
   if (typeof window === 'undefined') return;
   const next = dedupeIds(Array.isArray(ids) ? ids : []);
   try {
-    window.localStorage.setItem(ROSTER_STORAGE_KEY, JSON.stringify(next));
+    const key = getActiveRosterStorageKey();
+    window.localStorage.setItem(key, JSON.stringify(next));
   } catch {
     // Ignore storage write failures.
   }
@@ -118,9 +170,25 @@ export const clearRoster = (): void => {
   if (typeof window === 'undefined') return;
   try {
     window.localStorage.removeItem(ROSTER_STORAGE_KEY);
+    window.localStorage.removeItem(DEMO_ROSTER_STORAGE_KEY);
   } catch {
     // Ignore storage write failures.
   }
 };
 
-export { ROSTER_STORAGE_KEY };
+export const ensureDemoRosterSeeded = (): string[] => {
+  if (!isDemoModeEnabled()) return getRosterIds();
+  return getRosterIds();
+};
+
+export const resetDemoRosterToDefaults = (): string[] => {
+  if (typeof window === 'undefined') return dedupeIds([...DEFAULT_DEMO_ROSTER_IDS]);
+  try {
+    window.localStorage.removeItem(DEMO_ROSTER_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+  return seedDemoRosterIds();
+};
+
+export { ROSTER_STORAGE_KEY, DEMO_ROSTER_STORAGE_KEY };

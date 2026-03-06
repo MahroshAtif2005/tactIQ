@@ -3,6 +3,7 @@ export type BaselineRole = 'BAT' | 'SPIN' | 'FAST' | 'AR';
 export interface PlayerBaselineDoc {
   id: string;
   type: 'playerBaseline';
+  userId: string;
   name: string;
   role: BaselineRole;
   sleep: number;
@@ -58,11 +59,12 @@ const getConfig = (): CosmosConfig => ({
     'tactiq-db'
   ).trim() || 'tactiq-db',
   containerId: String(
-    process.env.COSMOS_CONTAINER_NAME ||
+    process.env.COSMOS_CONTAINER_PLAYERS ||
     process.env.COSMOS_CONTAINER ||
+    process.env.COSMOS_CONTAINER_NAME ||
     process.env.COSMOS_CONTAINER_ID ||
-    'players'
-  ).trim() || 'players',
+    'playersByUser'
+  ).trim() || 'playersByUser',
 });
 
 let cosmosEnvLogged = false;
@@ -155,6 +157,8 @@ export const normalizeBaselineDoc = (raw: unknown): PlayerBaselineDoc => {
   const row = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
   const name = String(row.name || row.id || '').trim();
   const id = String(row.id || name).trim();
+  const userId =
+    String(row.userId || process.env.AGENT_FRAMEWORK_STORAGE_USER_ID || 'agent-framework').trim() || 'agent-framework';
   if (!id) {
     throw new Error('Baseline id/name is required.');
   }
@@ -162,6 +166,7 @@ export const normalizeBaselineDoc = (raw: unknown): PlayerBaselineDoc => {
   return {
     id,
     type: 'playerBaseline',
+    userId,
     name: name || id,
     role: normalizeRole(row.role),
     sleep: clamp(toNumber(row.sleep, 7), 0, 12),
@@ -179,6 +184,7 @@ export const normalizeBaselineDoc = (raw: unknown): PlayerBaselineDoc => {
 export const toPublicBaseline = (row: Partial<PlayerBaselineDoc>): PlayerBaselineDoc => ({
   id: String(row.id || '').trim(),
   type: 'playerBaseline',
+  userId: String(row.userId || '').trim(),
   name: String(row.name || row.id || '').trim(),
   role: normalizeRole(row.role),
   sleep: clamp(toNumber(row.sleep, 7), 0, 12),

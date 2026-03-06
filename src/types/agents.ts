@@ -186,7 +186,23 @@ export interface SuggestedRotationPayload {
 
 export interface OrchestrateResponse {
   ok?: boolean;
+  mode?: 'demo' | 'live' | 'fallback';
+  dataMode?: 'demo' | 'live';
+  llmMode?: 'ai' | 'rules';
+  routingMode?: 'ai' | 'fallback' | 'demo';
+  reasons?: string[];
   analysisId?: string;
+  analysisBundleId?: string;
+  summary?: string;
+  tacticalRecommendation?: string;
+  confidence?: number;
+  coachOutput?: {
+    summary?: string;
+    tacticalRecommendation?: string;
+    recommendation?: string;
+    explanation?: string;
+    confidence?: number;
+  };
   combinedBriefing?: string;
   fatigue?: FatigueAgentResponse;
   risk?: RiskAgentResponse;

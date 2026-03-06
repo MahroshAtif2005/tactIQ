@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClientError, postCopilotChat } from '../lib/apiClient';
+import { postCopilotChat } from '../lib/apiClient';
 
 type CopilotRole = 'user' | 'assistant';
 
@@ -15,6 +15,7 @@ interface CopilotChatPanelProps {
   resetKey?: string;
   suggestedQuestions?: string[];
   onAnalysisIdSync?: (analysisId: string) => void;
+  forceFallbackMode?: boolean;
   fallbackContext?: {
     matchContextSnapshot?: Record<string, unknown>;
     telemetry?: Record<string, unknown>;
@@ -40,17 +41,87 @@ const nextTurnId = (): string => {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 };
 
-const summarizeError = (error: unknown): string => {
-  if (error instanceof ApiClientError) {
-    if (error.status === 404) return 'Copilot endpoint not reachable.';
-    if (error.status === 409) return 'Run Coach Analysis first.';
-    if (error.status === 400) return 'Invalid Copilot request.';
-    if (error.status === 429) return 'Session limit reached.';
-    if (error.status && error.status >= 500) return 'Server error. Please retry.';
-    return error.message;
+const readNumber = (value: unknown, fallback = 0): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const readText = (value: unknown, fallback = ''): string => {
+  const text = String(value ?? '').trim();
+  return text || fallback;
+};
+
+const normalizeRisk = (value: unknown): 'LOW' | 'MED' | 'HIGH' => {
+  const token = String(value || '').trim().toUpperCase();
+  if (token === 'HIGH' || token === 'CRITICAL') return 'HIGH';
+  if (token === 'MED' || token === 'MEDIUM') return 'MED';
+  return 'LOW';
+};
+
+const buildDemoCopilotReply = (
+  prompt: string,
+  context?: CopilotChatPanelProps['fallbackContext']
+): string => {
+  const snapshot = (context?.matchContextSnapshot || {}) as Record<string, unknown>;
+  const telemetry = ((context?.telemetry || snapshot.telemetry || {}) as Record<string, unknown>);
+  const match = ((context?.matchContext || snapshot.matchContext || {}) as Record<string, unknown>);
+  const players = ((context?.players || snapshot.players || {}) as Record<string, unknown>);
+  const coachOutput = (context?.coachOutput || {}) as Record<string, unknown>;
+  const tacticalRecommendation = (coachOutput.tacticalRecommendation || {}) as Record<string, unknown>;
+
+  const playerName =
+    readText(telemetry.playerName)
+    || readText(players.bowler)
+    || 'the current bowler';
+  const fatigueIndex = readNumber(telemetry.fatigueIndex, 0);
+  const strainIndex = readNumber(telemetry.strainIndex, 0);
+  const oversBowled = readNumber(telemetry.oversBowled, 0);
+  const injuryRisk = normalizeRisk(telemetry.injuryRisk);
+  const noBallRisk = normalizeRisk(telemetry.noBallRisk);
+  const phase = readText(match.phase, 'middle overs');
+  const recovery = readText((telemetry.heartRateRecovery || telemetry.recovery), 'Moderate');
+  const tacticalNextAction = readText(tacticalRecommendation.nextAction || tacticalRecommendation.primary);
+  const benchList = Array.isArray(players.bench)
+    ? players.bench.map((entry) => String(entry || '').trim()).filter(Boolean).slice(0, 3)
+    : [];
+  const benchHint = benchList.length > 0 ? ` Keep ${benchList.join(', ')} ready as rotation options.` : '';
+
+  const promptLower = prompt.toLowerCase();
+  const safeToContinue = oversBowled === 0 || (fatigueIndex <= 4 && injuryRisk === 'LOW');
+  const elevatedRisk = injuryRisk !== 'LOW' || noBallRisk === 'HIGH' || fatigueIndex >= 6 || strainIndex >= 4;
+
+  let action = safeToContinue
+    ? `Continue with ${playerName} for the next over and focus on repeatable release points.`
+    : elevatedRisk
+      ? `Rotate ${playerName} after this over and shift to a control-first option.`
+      : `Use ${playerName} for one controlled over, then reassess before committing to another spell.`;
+
+  if (promptLower.includes('no-ball')) {
+    action = safeToContinue
+      ? `Keep ${playerName} on, slow the run-up slightly, and commit to a shorter, repeatable run-up marker this over.`
+      : `Take one over off ${playerName}, then bring him back with a simplified run-up and yorker target plan.`;
+  } else if (promptLower.includes('next 2 overs') || promptLower.includes('two overs') || promptLower.includes('2 overs')) {
+    action = elevatedRisk
+      ? `Split the next two overs between a control bowler now and ${playerName} only if rhythm is stable after the break.`
+      : `Keep ${playerName} for one over, then use a change-up bowler for the following over to protect late-phase flexibility.`;
+  } else if (promptLower.includes('safest plan')) {
+    action = elevatedRisk
+      ? `Safest plan is to rotate now, protect execution quality, and avoid back-to-back high-intensity overs.`
+      : `Safest plan is one more controlled over from ${playerName}, with a pre-committed rotation trigger on any control drop.`;
   }
-  if (error instanceof Error && error.message.trim().length > 0) return error.message;
-  return 'Copilot chat is temporarily unavailable.';
+
+  const whyLine = elevatedRisk
+    ? `${phase} pressure plus current workload signals can compound quickly if you extend the spell unchanged.`
+    : `${phase} context is manageable, and current workload signals still support controlled execution.`;
+  const watchLine = elevatedRisk
+    ? `Watch for line-length drift or rushed run-up rhythm; rotate immediately if either appears.`
+    : `Watch recovery and front-foot discipline; rotate if rhythm drops or no-ball pressure rises.`;
+  const recoveryLine = `Recovery trend is ${recovery}, so keep the reassessment window short.${benchHint}`;
+  const tacticalLine = tacticalNextAction
+    ? `This stays aligned with the latest tactical guidance while keeping options open.`
+    : `This keeps tactical flexibility for the next decision point.`;
+
+  return `${action}\n\n${whyLine} ${recoveryLine} ${watchLine} ${tacticalLine}`;
 };
 
 export default function CopilotChatPanel({
@@ -59,6 +130,7 @@ export default function CopilotChatPanel({
   resetKey,
   suggestedQuestions,
   onAnalysisIdSync,
+  forceFallbackMode = false,
   fallbackContext,
 }: CopilotChatPanelProps) {
   const [isOpen, setIsOpen] = useState(false);
@@ -68,11 +140,20 @@ export default function CopilotChatPanel({
   const [messagesUsed, setMessagesUsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [lastPrompt, setLastPrompt] = useState<string>('');
+  const [hoveredSuggestionIndex, setHoveredSuggestionIndex] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const railRef = useRef<HTMLDivElement | null>(null);
 
   const promptLimit = 10;
   const limitReached = messagesUsed >= promptLimit;
+  const localRulesMode = forceFallbackMode;
+  const hasFallbackContext = Boolean(
+    fallbackContext?.coachOutput ||
+    fallbackContext?.matchContextSnapshot ||
+    fallbackContext?.telemetry ||
+    fallbackContext?.matchContext
+  );
+  const canSend = analysisReady || String(analysisId || '').trim().length > 0 || (localRulesMode && hasFallbackContext);
   const resolvedSuggestions = useMemo(
     () => (Array.isArray(suggestedQuestions) && suggestedQuestions.length > 0 ? suggestedQuestions.slice(0, 6) : DEFAULT_QUESTIONS),
     [suggestedQuestions]
@@ -122,10 +203,11 @@ export default function CopilotChatPanel({
   const sendMessage = async (promptOverride?: string) => {
     const prompt = String(promptOverride ?? input).trim();
     if (!prompt || isSending || limitReached) return;
-    if (!analysisReady || !analysisId || analysisId.trim().length === 0) {
+    if (!canSend) {
       setError('Run Coach Analysis first to unlock Copilot Chat.');
       return;
     }
+    const resolvedAnalysisId = String(analysisId || '').trim() || `local-copilot-${Date.now()}`;
 
     const userTurn: CopilotTurn = {
       id: nextTurnId(),
@@ -145,7 +227,7 @@ export default function CopilotChatPanel({
         content: turn.content,
       }));
       const basePayload = {
-        analysisId: String(analysisId).trim(),
+        analysisId: resolvedAnalysisId,
         message: prompt,
         history,
         ...(fallbackContext?.matchContextSnapshot ? { matchContextSnapshot: fallbackContext.matchContextSnapshot } : {}),
@@ -156,6 +238,17 @@ export default function CopilotChatPanel({
         ...(fallbackContext?.matchId ? { matchId: fallbackContext.matchId } : {}),
         ...(fallbackContext?.sessionId ? { sessionId: fallbackContext.sessionId } : {}),
       };
+      if (localRulesMode) {
+        const assistantTurn: CopilotTurn = {
+          id: nextTurnId(),
+          role: 'assistant',
+          content: buildDemoCopilotReply(prompt, fallbackContext),
+        };
+        setMessages((prev) => [...prev, assistantTurn]);
+        setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
+        onAnalysisIdSync?.(resolvedAnalysisId);
+        return;
+      }
       const response = await postCopilotChat(basePayload);
       const reply = String(response?.reply || '').trim() || 'No reply returned from Copilot.';
       const assistantTurn: CopilotTurn = {
@@ -174,20 +267,27 @@ export default function CopilotChatPanel({
         setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
       }
     } catch (sendError) {
-      if (sendError instanceof ApiClientError && sendError.status === 409) {
-        onAnalysisIdSync?.('');
-      }
       if (import.meta.env.DEV) {
         console.error('[copilot] send failed', sendError);
       }
-      setError(summarizeError(sendError));
+      const fallbackReply = buildDemoCopilotReply(prompt, fallbackContext);
+      const assistantTurn: CopilotTurn = {
+        id: nextTurnId(),
+        role: 'assistant',
+        content: fallbackReply,
+      };
+      setMessages((prev) => [...prev, assistantTurn]);
+      setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
+      setError(null);
     } finally {
       setIsSending(false);
     }
   };
 
+  if (!analysisReady) return null;
+
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] p-4 mt-3 overflow-hidden">
+    <div className="w-full">
       <div className="flex items-center justify-between gap-3">
         <div>
           <h3 className="text-sm font-bold text-white">Copilot Chat</h3>
@@ -200,7 +300,7 @@ export default function CopilotChatPanel({
           <button
             type="button"
             onClick={() => setIsOpen((prev) => !prev)}
-            disabled={!analysisReady}
+            disabled={!canSend}
             className="text-[10px] px-2 py-0.5 rounded border border-cyan-400/35 text-cyan-200 bg-cyan-500/10 hover:bg-cyan-500/20 transition-colors"
           >
             {isOpen ? 'Close' : 'Open'}
@@ -227,24 +327,42 @@ export default function CopilotChatPanel({
           <button
             type="button"
             key={`copilot-question-${index}`}
+            onMouseEnter={() => setHoveredSuggestionIndex(index)}
+            onMouseLeave={() => setHoveredSuggestionIndex((prev) => (prev === index ? null : prev))}
             onClick={() => {
-              if (!analysisReady || !analysisId || analysisId.trim().length === 0) return;
+              if (!canSend) return;
               if (!isOpen) setIsOpen(true);
               void sendMessage(question);
             }}
-            disabled={!analysisReady || isSending || limitReached}
+            disabled={!canSend || isSending || limitReached}
             className={`flex-[0_0_auto] whitespace-nowrap rounded-full px-4 py-2 text-sm font-medium transition ${
-              !analysisReady || isSending || limitReached
+              !canSend || isSending || limitReached
                 ? 'bg-white/5 border border-white/10 text-slate-400 cursor-not-allowed opacity-55'
                 : 'bg-white/5 border border-white/10 text-slate-200 hover:text-white hover:bg-white/[0.08] hover:border-white/15 hover:shadow-[0_0_0_1px_rgba(99,102,241,0.25),0_0_18px_rgba(99,102,241,0.12)]'
             }`}
+            style={
+              !canSend || isSending || limitReached
+                ? undefined
+                : {
+                    background:
+                      hoveredSuggestionIndex === index
+                        ? 'linear-gradient(180deg, rgba(34,54,102,0.44) 0%, rgba(20,35,72,0.30) 100%)'
+                        : 'linear-gradient(180deg, rgba(24,40,78,0.32) 0%, rgba(16,28,58,0.22) 100%)',
+                    boxShadow:
+                      hoveredSuggestionIndex === index
+                        ? '0 0 0 1px rgba(110,150,255,0.08), inset 0 1px 0 rgba(255,255,255,0.03), 0 8px 22px rgba(0,0,0,0.16)'
+                        : '0 0 0 1px rgba(110,150,255,0.05), inset 0 1px 0 rgba(255,255,255,0.02), 0 6px 18px rgba(0,0,0,0.14)',
+                    color: '#f2f6ff',
+                    borderColor: 'rgba(120,150,210,0.22)',
+                  }
+            }
           >
             {question}
           </button>
         ))}
       </div>
 
-      {!analysisReady && (
+      {!canSend && (
         <div className="rounded-md border border-amber-400/35 bg-amber-500/10 px-3 py-2 mt-1">
           <p className="text-[11px] text-amber-100">Run Coach Analysis first to unlock Copilot Chat.</p>
         </div>
@@ -292,13 +410,13 @@ export default function CopilotChatPanel({
                 }
               }}
               placeholder={limitReached ? 'Session limit reached' : 'Ask about this match state...'}
-              disabled={!analysisReady || isSending || limitReached}
+              disabled={!canSend || isSending || limitReached}
               className="flex-1 rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-[12px] text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-400/60"
             />
             <button
               type="button"
               onClick={() => void sendMessage()}
-              disabled={!analysisReady || isSending || limitReached || input.trim().length === 0}
+              disabled={!canSend || isSending || limitReached || input.trim().length === 0}
               className="rounded-lg border border-cyan-400/35 bg-cyan-500/15 px-3 py-2 text-[12px] font-semibold text-cyan-100 hover:bg-cyan-500/25 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Send

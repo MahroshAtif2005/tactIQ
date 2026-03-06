@@ -2,9 +2,10 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react-swc';
 import path from 'path';
-const API_PROXY_TARGET = 'http://localhost:7071';
 
 export default defineConfig(() => {
+  const FUNCTIONS_PORT = process.env.VITE_FUNCTIONS_PORT || process.env.FUNCTION_PORT || '7071';
+  const API_PROXY_TARGET = `http://localhost:${FUNCTIONS_PORT}`;
   return {
     plugins: [react()],
     resolve: {
