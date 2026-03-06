@@ -7,7 +7,7 @@ const {
   deleteBaselineById,
   checkBaselineOwnership,
   resetBaselines,
-  getStorageMode,
+  getStorageDiagnostics,
 } = require('../shared/store');
 const { jsonResponse, optionsResponse } = require('../shared/agentRuntime');
 
@@ -22,9 +22,39 @@ const isDemoRequest = (req) =>
     .trim()
     .toLowerCase() === 'true';
 
+const getStorageResponseMeta = () => {
+  const diagnostics = getStorageDiagnostics();
+  const responseMeta = {
+    source: diagnostics.mode,
+    storage: {
+      mode: diagnostics.mode,
+      db: diagnostics.databaseId,
+      container: diagnostics.playersContainerId,
+      endpointHost: diagnostics.endpointHost || 'n/a',
+    },
+  };
+  if (diagnostics.mode === 'memory') {
+    responseMeta.warning =
+      'Cosmos unavailable. Using in-memory fallback only; data is not persisted to playersByUser.';
+  }
+  if (diagnostics.initFailure) {
+    responseMeta.storageInitFailure = diagnostics.initFailure;
+  }
+  return responseMeta;
+};
+
 module.exports = async function baselines(context, req) {
   try {
     const method = String(req.method || 'GET').toUpperCase();
+    const diagnostics = getStorageDiagnostics();
+    context.log('[baselines] request', {
+      method,
+      routeId: String(req?.params?.id || '').trim() || null,
+      demoRequest: isDemoRequest(req),
+      storageMode: diagnostics.mode,
+      db: diagnostics.databaseId,
+      container: diagnostics.playersContainerId,
+    });
     if (method === 'OPTIONS') {
       context.res = optionsResponse('GET,POST,PATCH,DELETE,OPTIONS', {}, req);
       return;
@@ -92,7 +122,7 @@ module.exports = async function baselines(context, req) {
         context.res = jsonResponse(200, {
           ok: true,
           player,
-          source: getStorageMode(),
+          ...getStorageResponseMeta(),
         });
         return;
       }
@@ -100,7 +130,7 @@ module.exports = async function baselines(context, req) {
         ok: true,
         items: players,
         players,
-        source: getStorageMode(),
+        ...getStorageResponseMeta(),
       });
       return;
     }
@@ -112,7 +142,7 @@ module.exports = async function baselines(context, req) {
           ok: true,
           deleted: players.length,
           players,
-          source: getStorageMode(),
+          ...getStorageResponseMeta(),
         });
         return;
       }
@@ -125,7 +155,7 @@ module.exports = async function baselines(context, req) {
         success: true,
         ok: true,
         players,
-        source: getStorageMode(),
+        ...getStorageResponseMeta(),
       });
       return;
     }
@@ -178,7 +208,7 @@ module.exports = async function baselines(context, req) {
       context.res = jsonResponse(200, {
         ok: true,
         player,
-        source: getStorageMode(),
+        ...getStorageResponseMeta(),
       });
       return;
     }
@@ -201,7 +231,7 @@ module.exports = async function baselines(context, req) {
         ok: true,
         deleted: 1,
         players,
-        source: getStorageMode(),
+        ...getStorageResponseMeta(),
       });
       return;
     }

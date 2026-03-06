@@ -9635,10 +9635,10 @@ function Dashboard({
 	                <div className="space-y-3">
 	                  {isCoachOutputState && (
 	                    <>
-	                      <button type="button"
+                      <button type="button"
                         onClick={(event) => handleRunCoachFull(event)}
                         disabled={agentState === 'thinking'}
-                        className={`w-full py-3 rounded-lg border text-sm transition-colors ${agentState === 'thinking' ? 'border-slate-700 text-slate-500 cursor-not-allowed' : 'border-indigo-400/30 text-indigo-200 hover:text-white hover:bg-indigo-500/10'}`}
+                        className={`w-full py-3 rounded-2xl border text-sm font-semibold backdrop-blur-sm transition-all duration-200 ${agentState === 'thinking' ? 'border-slate-700/80 bg-slate-900/60 text-slate-500 cursor-not-allowed shadow-none' : 'border-emerald-400/30 bg-gradient-to-r from-emerald-500/20 via-cyan-500/20 to-blue-500/20 text-white shadow-lg shadow-emerald-500/10 hover:from-emerald-500/30 hover:via-cyan-500/30 hover:to-blue-500/30 hover:border-emerald-300/50 hover:shadow-xl hover:shadow-cyan-500/15'}`}
                       >
                         {agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}
                       </button>

@@ -188,6 +188,8 @@ curl -X POST http://localhost:7071/api/orchestrate \
 - Do **not** run any other service on port `7071` while the backend is running.
 - If you modify `.env`, restart the backend and frontend.
 - Frontend should call `/api/*` only (same-origin); do not hardcode `http://localhost:7071` in browser calls.
+- Demo mode stores baselines in browser localStorage and bypasses Cosmos writes by design.
+- `GET /api/baselines` now returns storage diagnostics (`source`, `storage`, optional `warning`) so you can confirm reads/writes are hitting `playersByUser` and not memory fallback.
 
 
                                      ARCHITECTURE (tactIQ)

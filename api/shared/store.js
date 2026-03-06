@@ -23,6 +23,7 @@ const memoryBaselinesByUser = new Map();
 let cosmosPromise = null;
 let cosmosEnabled = false;
 let cosmosConfigLogged = false;
+let lastCosmosInitFailure = '';
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const normalizeId = (value) => String(value || '').trim();
@@ -52,6 +53,30 @@ const parseBoolean = (value, fallback) => {
 const normalizeRole = (value) => {
   const role = String(value || '').trim().toUpperCase();
   return VALID_ROLES.has(role) ? role : 'FAST';
+};
+
+const getEndpointHost = (endpoint) => {
+  const raw = normalizeId(endpoint);
+  if (!raw) return '';
+  try {
+    return new URL(raw).host || raw;
+  } catch {
+    return raw;
+  }
+};
+
+const summarizeBaselineDocForLog = (doc) => {
+  if (!doc || typeof doc !== 'object') return null;
+  return {
+    id: normalizeId(doc.id),
+    baselineId: normalizeId(doc.baselineId || doc.playerId || doc.name),
+    userId: normalizeId(doc.userId),
+    teamId: normalizeId(doc.teamId),
+    role: normalizeId(doc.role),
+    type: normalizeId(doc.type),
+    inRoster: parseBoolean(doc.inRoster ?? doc.roster, false),
+    active: parseBoolean(doc.active ?? doc.isActive, true),
+  };
 };
 
 const normalizeAuthHeader = (req) => {
@@ -303,6 +328,34 @@ const getConfig = () => {
   };
 };
 
+const getStorageDiagnostics = () => {
+  const config = getConfig();
+  return {
+    mode: cosmosEnabled ? 'cosmos' : 'memory',
+    databaseId: config.databaseId,
+    playersContainerId: config.playersContainerId,
+    usersContainerId: config.usersContainerId,
+    endpointHost: getEndpointHost(config.endpoint),
+    hasCosmosAuth: Boolean(config.hasAuth),
+    cosmosClientLoaded: Boolean(CosmosClient),
+    initFailure: normalizeId(lastCosmosInitFailure) || null,
+  };
+};
+
+const logPlayersTrace = (op, detail = {}) => {
+  const mode = String(process.env.NODE_ENV || '').trim().toLowerCase();
+  if (mode === 'test') return;
+  const diagnostics = getStorageDiagnostics();
+  console.log('[playersByUser][trace]', {
+    op,
+    mode: diagnostics.mode,
+    db: diagnostics.databaseId,
+    container: diagnostics.playersContainerId,
+    endpointHost: diagnostics.endpointHost || 'n/a',
+    ...detail,
+  });
+};
+
 const logCosmosConfigOnce = (config) => {
   if (cosmosConfigLogged) return;
   cosmosConfigLogged = true;
@@ -310,6 +363,9 @@ const logCosmosConfigOnce = (config) => {
     database: config.databaseId,
     playersContainer: config.playersContainerId,
     usersContainer: config.usersContainerId,
+    endpointHost: getEndpointHost(config.endpoint) || 'n/a',
+    hasAuth: Boolean(config.hasAuth),
+    cosmosClientLoaded: Boolean(CosmosClient),
   });
 };
 
@@ -321,6 +377,10 @@ const getCosmos = async () => {
     logCosmosConfigOnce(config);
     if (!CosmosClient || !config.hasAuth) {
       cosmosEnabled = false;
+      lastCosmosInitFailure = !CosmosClient ? 'cosmos_client_unavailable' : 'missing_cosmos_credentials';
+      logPlayersTrace('cosmos.init.skip', {
+        reason: lastCosmosInitFailure,
+      });
       return null;
     }
 
@@ -339,10 +399,14 @@ const getCosmos = async () => {
       });
 
       cosmosEnabled = true;
+      lastCosmosInitFailure = '';
+      logPlayersTrace('cosmos.init.success');
       return { client, database, playersContainer, usersContainer };
     } catch (error) {
       cosmosEnabled = false;
-      console.warn('[functions][cosmos] init failed, using memory fallback:', error && error.message ? error.message : String(error));
+      lastCosmosInitFailure = error && error.message ? error.message : String(error);
+      console.warn('[functions][cosmos] init failed, using memory fallback:', lastCosmosInitFailure);
+      logPlayersTrace('cosmos.init.failed', { reason: lastCosmosInitFailure });
       return null;
     }
   })();
@@ -400,6 +464,10 @@ const ensureUser = async (identity) => {
     };
 
     await usersContainer.items.upsert(userDoc, { partitionKey: identity.userId });
+    logPlayersTrace('users.ensure.cosmos', {
+      userId: normalizeId(identity.userId),
+      teamId: normalizeId(userDoc.teamId),
+    });
     return userDoc;
   }
 
@@ -416,6 +484,10 @@ const ensureUser = async (identity) => {
     updatedAt: now,
   };
   memoryUsers.set(identity.userId, userDoc);
+  logPlayersTrace('users.ensure.memory', {
+    userId: normalizeId(identity.userId),
+    teamId: normalizeId(userDoc.teamId),
+  });
   return userDoc;
 };
 
@@ -428,7 +500,13 @@ const queryBaselinesByScope = async ({ userId, teamId }) => {
   }
   const cosmos = await getCosmos();
   if (!cosmos) {
-    return getMemoryBaselines(normalizedUserId).map((row) => ({ ...row, userId: normalizedUserId, teamId }));
+    const rows = getMemoryBaselines(normalizedUserId).map((row) => ({ ...row, userId: normalizedUserId, teamId }));
+    logPlayersTrace('baselines.list.memory', {
+      userId: normalizedUserId,
+      teamId: normalizeId(teamId),
+      count: rows.length,
+    });
+    return rows;
   }
 
   const { playersContainer } = cosmos;
@@ -440,7 +518,13 @@ const queryBaselinesByScope = async ({ userId, teamId }) => {
     ],
   };
   const result = await playersContainer.items.query(query, { partitionKey: normalizedUserId }).fetchAll();
-  return Array.isArray(result.resources) ? result.resources : [];
+  const rows = Array.isArray(result.resources) ? result.resources : [];
+  logPlayersTrace('baselines.list.cosmos', {
+    userId: normalizedUserId,
+    teamId: normalizeId(teamId),
+    count: rows.length,
+  });
+  return rows;
 };
 
 const listBaselines = async ({ userId, teamId }) => {
@@ -490,12 +574,14 @@ const logPlayersWriteVerification = (op, userId, count = 0) => {
   const mode = String(process.env.NODE_ENV || '').trim().toLowerCase();
   if (mode === 'test') return;
   const meta = getWriteVerificationMeta();
+  const diagnostics = getStorageDiagnostics();
   console.log('[playersByUser][verify]', {
     op,
     userId: normalizeId(userId),
     count: Number.isFinite(Number(count)) ? Number(count) : 0,
     db: meta.db,
     container: meta.container,
+    mode: diagnostics.mode,
     note: meta.note,
   });
 };
@@ -602,6 +688,13 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
     }
     const savedRows = [...map.values()].map((row) => ({ ...row, id: row.baselineId }));
     memoryBaselinesByUser.set(scopedUserId, sortBaselines(savedRows));
+    logPlayersTrace('baselines.save.memory', {
+      userId: scopedUserId,
+      teamId: normalizeId(teamId),
+      incomingCount: items.length,
+      savedCount: savedRows.length,
+      sampleDoc: summarizeBaselineDocForLog(savedRows[0] || null),
+    });
     logPlayersWriteVerification('save.memory', scopedUserId, savedRows.length);
     return listBaselines({ userId: scopedUserId, teamId });
   }
@@ -609,6 +702,7 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
   const { playersContainer } = cosmos;
   const now = new Date().toISOString();
   let upsertedCount = 0;
+  let sampleSavedDoc = null;
   for (const incoming of items) {
     const incomingId = normalizeId(incoming && (incoming.id || incoming.playerId || incoming.baselineId || incoming.name));
     if (!incomingId) continue;
@@ -635,9 +729,17 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
     await playersContainer.items.upsert(normalized, {
       partitionKey: scopedUserId,
     });
+    if (!sampleSavedDoc) sampleSavedDoc = summarizeBaselineDocForLog(normalized);
     upsertedCount += 1;
   }
 
+  logPlayersTrace('baselines.save.cosmos', {
+    userId: scopedUserId,
+    teamId: normalizeId(teamId),
+    incomingCount: items.length,
+    upsertedCount,
+    sampleDoc: sampleSavedDoc,
+  });
   logPlayersWriteVerification('save.cosmos', scopedUserId, upsertedCount);
   return listBaselines({ userId: scopedUserId, teamId });
 };
@@ -668,6 +770,13 @@ const replaceBaselines = async ({ userId, teamId, payload }) => {
       .filter(Boolean)
       .map((row) => ({ ...row, id: row.baselineId }));
     memoryBaselinesByUser.set(scopedUserId, sortBaselines(nextRows));
+    logPlayersTrace('baselines.replace.memory', {
+      userId: scopedUserId,
+      teamId: normalizeId(teamId),
+      incomingCount: items.length,
+      savedCount: nextRows.length,
+      sampleDoc: summarizeBaselineDocForLog(nextRows[0] || null),
+    });
     logPlayersWriteVerification('replace.memory', scopedUserId, nextRows.length);
     return listBaselines({ userId: scopedUserId, teamId });
   }
@@ -682,6 +791,7 @@ const replaceBaselines = async ({ userId, teamId, payload }) => {
 
   const now = new Date().toISOString();
   let upsertedCount = 0;
+  let sampleSavedDoc = null;
   for (let index = 0; index < items.length; index += 1) {
     const incoming = items[index];
     const normalized = normalizeBaseline(
@@ -691,9 +801,18 @@ const replaceBaselines = async ({ userId, teamId, payload }) => {
     );
     if (!normalized) continue;
     await playersContainer.items.upsert(normalized, { partitionKey: scopedUserId });
+    if (!sampleSavedDoc) sampleSavedDoc = summarizeBaselineDocForLog(normalized);
     upsertedCount += 1;
   }
 
+  logPlayersTrace('baselines.replace.cosmos', {
+    userId: scopedUserId,
+    teamId: normalizeId(teamId),
+    deletedBeforeReplace: existingRows.length,
+    incomingCount: items.length,
+    upsertedCount,
+    sampleDoc: sampleSavedDoc,
+  });
   logPlayersWriteVerification('replace.cosmos', scopedUserId, upsertedCount);
   return listBaselines({ userId: scopedUserId, teamId });
 };
@@ -716,6 +835,12 @@ const deleteBaselineById = async ({ userId, teamId, baselineId }) => {
       }
     }
     memoryBaselinesByUser.set(scopedUserId, filtered);
+    logPlayersTrace('baselines.delete.memory', {
+      userId: scopedUserId,
+      teamId: normalizeId(teamId),
+      baselineId: normalizedId,
+      deletedCount: current.length - filtered.length,
+    });
     logPlayersWriteVerification('delete.memory', scopedUserId, current.length - filtered.length);
     return listBaselines({ userId: scopedUserId, teamId });
   }
@@ -735,6 +860,12 @@ const deleteBaselineById = async ({ userId, teamId, baselineId }) => {
     if (!docId) continue;
     await playersContainer.item(docId, scopedUserId).delete();
   }
+  logPlayersTrace('baselines.delete.cosmos', {
+    userId: scopedUserId,
+    teamId: normalizeId(teamId),
+    baselineId: normalizedId,
+    deletedCount: rows.length,
+  });
   logPlayersWriteVerification('delete.cosmos', scopedUserId, rows.length);
   return listBaselines({ userId: scopedUserId, teamId });
 };
@@ -759,4 +890,5 @@ module.exports = {
   checkBaselineOwnership,
   resetBaselines,
   getStorageMode,
+  getStorageDiagnostics,
 };
