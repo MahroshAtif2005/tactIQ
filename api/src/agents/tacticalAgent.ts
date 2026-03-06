@@ -115,12 +115,89 @@ const applyTacticalDefaults = (input: TacticalAgentInput): TacticalAgentInput =>
     },
   };
 };
-const shouldForceContinueGuardrail = (input: TacticalAgentInput, teamMode: 'BATTING' | 'BOWLING'): boolean => {
-  if (teamMode !== 'BOWLING') return false;
+const asRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+const normalizeModeToken = (value: unknown): 'auto' | 'full' =>
+  String(value || '').trim().toLowerCase() === 'full' ? 'full' : 'auto';
+const normalizeDataModeToken = (value: unknown): 'demo' | 'live' =>
+  String(value || '').trim().toLowerCase() === 'demo' ? 'demo' : 'live';
+const isManualCoachRequest = (input: TacticalAgentInput): boolean => {
+  const signals = asRecord(input.signals);
+  const actionToken = normalizeText(input.userAction || signals.userAction).toLowerCase();
+  if (/(^|[^a-z])(run[_\s-]?coach|manual|button[_\s-]?click|coach_analysis|coach)([^a-z]|$)/i.test(actionToken)) {
+    return true;
+  }
+  return (
+    signals.manual === true ||
+    signals.manualRequest === true ||
+    signals.manualTrigger === true ||
+    normalizeText(signals.requestOrigin).toLowerCase() === 'manual' ||
+    normalizeText(signals.requestType).toLowerCase() === 'manual' ||
+    normalizeText(signals.trigger).toLowerCase() === 'manual' ||
+    normalizeText(signals.trigger).toLowerCase() === 'button'
+  );
+};
+type StableContinueGuardrailDecision = {
+  stableState: boolean;
+  applied: boolean;
+  requestType: 'manual' | 'automatic';
+  bypassReason?: 'manual_request' | 'demo_auto_mode';
+  oversBowled: number;
+  fatigueIndex: number;
+  injuryRisk: 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN';
+  requestMode: 'auto' | 'full';
+  dataMode: 'demo' | 'live';
+};
+const evaluateStableContinueGuardrail = (
+  input: TacticalAgentInput,
+  teamMode: 'BATTING' | 'BOWLING'
+): StableContinueGuardrailDecision => {
   const oversBowled = Number(input.telemetry?.oversBowled || 0);
   const fatigueIndex = Number(input.telemetry?.fatigueIndex || 0);
   const injuryRisk = normalizeRisk(input.telemetry?.injuryRisk);
-  return oversBowled === 0 || (fatigueIndex <= 4 && injuryRisk === 'LOW');
+  const requestMode = normalizeModeToken(input.requestMode);
+  const dataMode = normalizeDataModeToken(input.dataMode);
+  const manualRequest = isManualCoachRequest(input);
+  const stableState =
+    teamMode === 'BOWLING' &&
+    (oversBowled === 0 || (fatigueIndex <= 4 && injuryRisk === 'LOW'));
+  const bypassReason = manualRequest
+    ? 'manual_request'
+    : dataMode === 'demo' && requestMode === 'auto'
+      ? 'demo_auto_mode'
+      : undefined;
+  return {
+    stableState,
+    applied: stableState && !bypassReason,
+    requestType: manualRequest ? 'manual' : 'automatic',
+    bypassReason,
+    oversBowled,
+    fatigueIndex,
+    injuryRisk,
+    requestMode,
+    dataMode,
+  };
+};
+const logStableContinueGuardrail = (
+  decision: StableContinueGuardrailDecision,
+  input: TacticalAgentInput,
+  reason: string
+): void => {
+  if (!decision.stableState) return;
+  console.log('[tactical] guardrail:stable_continue', {
+    applied: decision.applied,
+    reason: decision.applied ? reason : decision.bypassReason || 'bypassed',
+    requestType: decision.requestType,
+    requestMode: decision.requestMode,
+    dataMode: decision.dataMode,
+    userAction: normalizeText(input.userAction) || undefined,
+    oversBowled: decision.oversBowled,
+    fatigueIndex: decision.fatigueIndex,
+    injuryRisk: decision.injuryRisk,
+  });
+};
+const shouldForceContinueGuardrail = (input: TacticalAgentInput, teamMode: 'BATTING' | 'BOWLING'): boolean => {
+  return evaluateStableContinueGuardrail(input, teamMode).applied;
 };
 const buildContinueGuardrailOutput = (input: TacticalAgentInput, status: TacticalAgentOutput['status']): TacticalAgentOutput => {
   const teamMode = normalizeTeamMode(input);
@@ -416,6 +493,40 @@ const classifyTacticalFallbackReason = (error: unknown): string => {
   }
   return 'openai_error';
 };
+const tacticalErrorDetailSuffix = (error: unknown): string => {
+  let status: number | undefined;
+  let code = '';
+  let body = '';
+  let message = '';
+  if (error instanceof LLMRequestError) {
+    status = error.status;
+    code = String((error as LLMRequestError & { code?: unknown }).code || '').trim();
+    body = normalizeText(error.bodySnippet || '').slice(0, 200);
+    message = normalizeText(error.message).slice(0, 220);
+  } else if (error instanceof LLMJsonResponseError) {
+    code = `json_${error.phase}`;
+    body = normalizeText(error.rawSnippet || '').slice(0, 200);
+    message = normalizeText(error.message).slice(0, 220);
+  } else if (error instanceof Error) {
+    const parsedStatus = parseStatusFromErrorMessage(error.message);
+    status = typeof parsedStatus === 'number' ? parsedStatus : undefined;
+    message = normalizeText(error.message).slice(0, 220);
+  } else if (error && typeof error === 'object') {
+    const candidate = error as { status?: unknown; statusCode?: unknown; code?: unknown; bodySnippet?: unknown; message?: unknown };
+    const statusParsed = Number(candidate.status ?? candidate.statusCode);
+    status = Number.isFinite(statusParsed) ? statusParsed : undefined;
+    code = String(candidate.code || '').trim();
+    body = normalizeText(String(candidate.bodySnippet || '')).slice(0, 200);
+    message = normalizeText(String(candidate.message || '')).slice(0, 220);
+  }
+  const parts = [
+    message ? `message=${message}` : '',
+    typeof status === 'number' ? `status=${status}` : '',
+    code ? `code=${code}` : '',
+    body ? `body=${body}` : '',
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(';') : '';
+};
 
 const coerceSubstitutionAdvice = (
   value: unknown
@@ -633,7 +744,9 @@ const compactTacticalContext = (input: TacticalAgentInput) => {
 export function buildTacticalFallback(input: TacticalAgentInput, reason: string): TacticalAgentResult {
   const safeInput = applyTacticalDefaults(input);
   const teamMode = normalizeTeamMode(safeInput);
-  if (shouldForceContinueGuardrail(safeInput, teamMode)) {
+  const guardrailDecision = evaluateStableContinueGuardrail(safeInput, teamMode);
+  logStableContinueGuardrail(guardrailDecision, safeInput, reason);
+  if (guardrailDecision.applied) {
     return {
       output: sanitizeTacticalOutput(buildContinueGuardrailOutput(safeInput, 'fallback')),
       model: 'fallback-heuristic',
@@ -732,6 +845,7 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
 export async function runTacticalAgent(input: TacticalAgentInput): Promise<TacticalAgentResult> {
   const safeInput = applyTacticalDefaults(input);
   const teamMode = normalizeTeamMode(safeInput);
+  const guardrailDecision = evaluateStableContinueGuardrail(safeInput, teamMode);
   const routing = routeModel({ task: 'tactical', needsJson: true, complexity: 'high' });
   const aoai = getAoaiConfig();
   if (!aoai.ok || !routing.deployment) {
@@ -754,6 +868,18 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
     endpointHost,
     deployment: routing.deployment,
     apiVersion: aoai.config.apiVersion,
+  });
+  console.log('[tactical][openai] attempt', {
+    attempted: true,
+    requestType: guardrailDecision.requestType,
+    requestMode: guardrailDecision.requestMode,
+    dataMode: guardrailDecision.dataMode,
+    userAction: normalizeText(safeInput.userAction) || undefined,
+    guardrailStableState: guardrailDecision.stableState,
+    guardrailWillApply: guardrailDecision.applied,
+    ...(guardrailDecision.bypassReason ? { guardrailBypassReason: guardrailDecision.bypassReason } : {}),
+    deployment: routing.deployment,
+    endpointHost,
   });
   const focusRole = normalizeFocusRole(safeInput, teamMode);
   const telemetryBasis = buildTelemetryBasis(safeInput);
@@ -851,7 +977,8 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
     }
     parsed = applyRotationGuardrail(parsed, safeInput, telemetryBasis);
     parsed = enforceSubstitutionEligibility(parsed, safeInput, teamMode);
-    if (shouldForceContinueGuardrail(safeInput, teamMode)) {
+    logStableContinueGuardrail(guardrailDecision, safeInput, 'llm_postprocess');
+    if (guardrailDecision.applied) {
       parsed = buildContinueGuardrailOutput(safeInput, parsed.status);
       fallbacksUsed = [...new Set([...fallbacksUsed, 'guardrail:stable_continue'])];
     }
@@ -878,7 +1005,9 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
     } else if (error instanceof LLMRequestError && error.bodySnippet) {
       console.log('[tactical][openai] body', error.bodySnippet.slice(0, 200));
     }
-    const reason = classifyTacticalFallbackReason(error);
+    const reasonToken = classifyTacticalFallbackReason(error);
+    const detailSuffix = tacticalErrorDetailSuffix(error);
+    const reason = detailSuffix ? `${reasonToken};${detailSuffix}` : reasonToken;
     console.log('[tactical] fallback reason:', reason);
     return buildTacticalFallback(safeInput, reason);
   }

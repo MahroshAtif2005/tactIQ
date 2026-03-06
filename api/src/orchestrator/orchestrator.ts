@@ -104,6 +104,26 @@ const toAgentStatus = (status: string | undefined, didRun: boolean): AgentStatus
 };
 const isRecordValue = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+const normalizeToken = (value: unknown): string => String(value || '').trim().toLowerCase();
+const isManualCoachRequest = (input: OrchestrateRequest): boolean => {
+  const actionToken = normalizeToken(input.userAction);
+  if (/(^|[^a-z])(run[_\s-]?coach|manual|button[_\s-]?click|coach_analysis|coach)([^a-z]|$)/.test(actionToken)) {
+    return true;
+  }
+  const signalRecord = isRecordValue(input.signals) ? input.signals : {};
+  if (
+    signalRecord.manual === true ||
+    signalRecord.manualRequest === true ||
+    signalRecord.manualTrigger === true ||
+    normalizeToken(signalRecord.requestOrigin) === 'manual' ||
+    normalizeToken(signalRecord.requestType) === 'manual' ||
+    normalizeToken(signalRecord.trigger) === 'manual' ||
+    normalizeToken(signalRecord.trigger) === 'button'
+  ) {
+    return true;
+  }
+  return input.mode === 'full';
+};
 const isExplicitDisable = (value: unknown): boolean => value === true || String(value || '').trim().toLowerCase() === 'true';
 const allowFatigueDisableFlag =
   String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production' &&
@@ -340,6 +360,11 @@ const runTacticalAgentFromContext = (args: {
   runTacticalAgent({
     requestId: args.requestId,
     intent: args.intent,
+    requestMode: args.requestInput.mode,
+    dataMode: args.requestInput.dataMode,
+    llmMode: args.requestInput.llmMode,
+    userAction: args.requestInput.userAction,
+    signals: args.requestInput.signals,
     teamMode: args.requestInput.teamMode,
     focusRole: args.requestInput.focusRole,
     matchContext: args.requestInput.matchContext,
@@ -895,6 +920,8 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     ...contextDerivedInput,
     replacementCandidates,
   };
+  const manualRequest = isManualCoachRequest(inputWithContext);
+  const requestType = manualRequest ? 'manual' : 'automatic';
 
   const routerDecisionRaw = runModelRouter(inputWithContext.context as FullMatchContext, inputWithContext, mode, requestId);
   const forceAllAgents = mode === 'full';
@@ -928,6 +955,11 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
   const executedAgents: LegacyAgentId[] = (['fatigue', 'risk', 'tactical'] as const).filter((agent) => runFlags[agent]);
   context.log('[orchestrate] routing', {
     mode,
+    requestType,
+    manualRequest,
+    userAction: String(inputWithContext.userAction || '').trim() || undefined,
+    dataMode: String(inputWithContext.dataMode || '').trim().toLowerCase() || undefined,
+    llmMode: String(inputWithContext.llmMode || '').trim().toLowerCase() || undefined,
     intent: routerDecision.intent,
     forceAllAgents,
     agentsToRun: routerDecision.selectedAgents,
@@ -1018,6 +1050,11 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
             {
               requestId,
               intent,
+              requestMode: inputWithContext.mode,
+              dataMode: inputWithContext.dataMode,
+              llmMode: inputWithContext.llmMode,
+              userAction: inputWithContext.userAction,
+              signals: inputWithContext.signals,
               matchContext: inputWithContext.matchContext,
               telemetry: inputWithContext.telemetry,
               players: inputWithContext.players,
@@ -1078,6 +1115,11 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
       {
         requestId,
         intent,
+        requestMode: inputWithContext.mode,
+        dataMode: inputWithContext.dataMode,
+        llmMode: inputWithContext.llmMode,
+        userAction: inputWithContext.userAction,
+        signals: inputWithContext.signals,
         matchContext: inputWithContext.matchContext,
         telemetry: inputWithContext.telemetry,
         players: inputWithContext.players,

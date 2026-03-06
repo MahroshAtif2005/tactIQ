@@ -2,35 +2,27 @@ import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { getAoaiConfig } from '../llm/modelRegistry';
 import { ok } from '../lib/httpResponse';
 import { ROUTES } from '../routes/routes';
+import { loadAoaiEnv } from '../shared/env';
 import { preflight, withCors } from './_cors';
 
 export async function aiStatusHandler(request: HttpRequest): Promise<HttpResponseInit> {
   const pf = preflight(request);
   if (pf) return pf;
   const aoai = getAoaiConfig();
-  const endpoint = String(process.env.AZURE_OPENAI_ENDPOINT || '').trim();
-  const deploymentName = String(process.env.AZURE_OPENAI_DEPLOYMENT || '').trim();
-  const apiVersion = String(process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview').trim();
-  const endpointHost = (() => {
-    try {
-      return endpoint ? new URL(endpoint).host : '';
-    } catch {
-      return '';
-    }
-  })();
+  const env = loadAoaiEnv();
   return withCors(
     request,
     ok({
       ok: true,
-      aiEnabled: aoai.ok,
-      endpointConfigured: endpoint.length > 0,
-      keyConfigured: aoai.ok ? true : !aoai.missing.includes('AZURE_OPENAI_API_KEY'),
-      deploymentConfigured: deploymentName.length > 0 || (aoai.ok ? aoai.config.strongDeployment.length > 0 : false),
-      apiVersion,
-      endpointHost,
-      deploymentName: deploymentName || (aoai.ok ? aoai.config.strongDeployment : ''),
-      modeHint: aoai.ok ? 'ai' : 'fallback',
-      ...(aoai.ok ? {} : { missing: aoai.missing }),
+      aiEnabled: env.aiEnabled,
+      endpointConfigured: Boolean(env.endpoint),
+      keyConfigured: Boolean(env.apiKey),
+      deploymentConfigured: Boolean(env.deployment),
+      apiVersion: env.apiVersion,
+      endpointHost: env.endpointHost,
+      deploymentName: env.deployment || (aoai.ok ? aoai.config.strongDeployment : ''),
+      modeHint: env.aiEnabled ? 'ai' : 'fallback',
+      ...(env.missing.length > 0 ? { missing: env.missing } : {}),
     })
   );
 }

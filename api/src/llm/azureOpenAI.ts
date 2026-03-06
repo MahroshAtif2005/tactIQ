@@ -1,12 +1,4 @@
-import { getModelRegistry } from './modelRegistry';
-// Use runtime require so TypeScript build can proceed before dependencies are installed.
-let OpenAI: any = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  OpenAI = require('openai').default;
-} catch {
-  OpenAI = null;
-}
+import { AzureOpenAIError, chatComplete } from '../lib/azureOpenAI';
 
 export interface SafeJsonParseResult<T = unknown> {
   ok: boolean;
@@ -36,6 +28,7 @@ const extractFirstJsonObject = (raw: string): string | null => {
   let depth = 0;
   let inString = false;
   let escaped = false;
+
   for (let index = start; index < text.length; index += 1) {
     const char = text[index];
     if (inString) {
@@ -76,7 +69,7 @@ export const safeJsonParse = <T = unknown>(raw: string): SafeJsonParseResult<T> 
         const parsed = JSON.parse(fenced) as T;
         return { ok: true, data: parsed, raw: fenced };
       } catch {
-        // fall through to next extraction strategy
+        // continue
       }
     }
     const extracted = extractFirstJsonObject(normalized);
@@ -85,7 +78,7 @@ export const safeJsonParse = <T = unknown>(raw: string): SafeJsonParseResult<T> 
         const parsed = JSON.parse(extracted) as T;
         return { ok: true, data: parsed, raw: extracted };
       } catch {
-        // fall through to standard parse error payload
+        // continue
       }
     }
     return {
@@ -115,84 +108,53 @@ export interface AzureChatOptions {
   timeoutMs?: number;
 }
 
-export function createAzureOpenAIClient(deployment: string): any {
-  if (!OpenAI) {
-    throw new Error('openai package is not installed');
-  }
-  const registry = getModelRegistry();
-  return new OpenAI({
-    apiKey: registry.apiKey || 'missing-api-key',
-    baseURL: buildDeploymentBaseUrl(registry.endpoint, deployment),
-    defaultQuery: { 'api-version': registry.apiVersion },
-    defaultHeaders: {
-      'api-key': registry.apiKey,
-    },
-  });
-}
-
 export async function callAzureChat(options: AzureChatOptions): Promise<string> {
-  const client = createAzureOpenAIClient(options.deployment);
   const maxTokens = options.response_format?.type === 'json_object'
     ? Math.min(800, Math.max(320, options.max_tokens ?? 400))
-    : Math.min(200, Math.max(1, options.max_tokens ?? 200));
-  const requestBody = {
-    model: options.deployment,
-    messages: options.messages,
+    : Math.min(240, Math.max(1, options.max_tokens ?? 200));
+
+  const completion = await chatComplete(options.messages, {
+    deployment: options.deployment,
     temperature: options.temperature ?? 0.2,
     max_tokens: maxTokens,
-    ...(options.response_format ? { response_format: options.response_format } : {}),
-  };
-  const timeoutMs = Number(options.timeoutMs);
-  const useTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  let controller: AbortController | undefined;
+    response_format: options.response_format,
+    timeoutMs: options.timeoutMs,
+  });
 
-  if (useTimeout && typeof AbortController !== 'undefined') {
-    controller = new AbortController();
-    timeoutId = setTimeout(() => controller?.abort(), timeoutMs);
-  }
+  const choices = Array.isArray(completion.choices) ? completion.choices : [];
+  const firstChoice = choices[0] as Record<string, unknown> | undefined;
+  const message = firstChoice && typeof firstChoice === 'object'
+    ? (firstChoice.message as Record<string, unknown> | undefined)
+    : undefined;
+  const content = message?.content;
 
-  let completion: any;
-  try {
-    completion = controller
-      ? await client.chat.completions.create(requestBody, { signal: controller.signal })
-      : await client.chat.completions.create(requestBody);
-  } catch (error) {
-    const aborted = controller?.signal.aborted === true;
-    const isAbortError = error instanceof Error && error.name === 'AbortError';
-    if (aborted || isAbortError) {
-      throw new Error(`LLM request timed out after ${Math.round(timeoutMs)}ms`);
-    }
-    throw error;
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
-
-  const content = completion?.choices?.[0]?.message?.content;
   if (typeof content === 'string' && content.trim().length > 0) {
     return content;
   }
+
   if (Array.isArray(content)) {
     const joined = content
       .map((entry) => {
         if (typeof entry === 'string') return entry;
-        if (entry && typeof entry === 'object' && 'text' in entry) return String((entry as { text?: unknown }).text || '');
+        if (entry && typeof entry === 'object' && 'text' in entry) {
+          return String((entry as { text?: unknown }).text || '');
+        }
         return '';
       })
       .join(' ')
       .trim();
     if (joined) return joined;
   }
+
   if (content && typeof content === 'object') {
     return JSON.stringify(content);
   }
-  if (!content) {
-    throw new Error('Azure OpenAI response missing content');
-  }
-  return String(content);
+
+  throw new AzureOpenAIError('Azure OpenAI response missing content');
 }
 
 export const getAzureErrorStatus = (error: unknown): number | undefined => {
+  if (error instanceof AzureOpenAIError) return error.status;
   if (!error || typeof error !== 'object') return undefined;
   const candidate = error as { status?: unknown; code?: unknown };
   if (typeof candidate.status === 'number') return candidate.status;

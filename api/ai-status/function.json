@@ -5,8 +5,8 @@
       "type": "httpTrigger",
       "direction": "in",
       "name": "req",
-      "methods": ["post", "options"],
-      "route": "users/ensure"
+      "methods": ["get", "options"],
+      "route": "ai/status"
     },
     {
       "type": "http",

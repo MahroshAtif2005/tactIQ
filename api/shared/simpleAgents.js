@@ -207,10 +207,21 @@ const runOrchestrateFallback = (payload) => {
 
   return {
     ok: true,
+    analysisId: traceId,
+    analysisBundleId: traceId,
     traceId,
     fatigue,
     risk,
     tactical,
+    summary: toText(
+      tactical.rationale ||
+      fatigue.summary ||
+      fatigue.explanation ||
+      risk.explanation ||
+      'Coach analysis generated using rules fallback.'
+    ),
+    tacticalRecommendation: toText(tactical.immediateAction || tactical.nextAction || 'Continue with monitored plan'),
+    confidence: Number.isFinite(Number(tactical.confidence)) ? Number(tactical.confidence) : 0.62,
     agentOutputs: { fatigue, risk, tactical },
     combinedDecision: {
       immediateAction: tactical.immediateAction,

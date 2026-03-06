@@ -2,9 +2,16 @@ import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/fu
 import { orchestrateAgents } from '../orchestrator/orchestrator';
 import { validateOrchestrateRequest } from '../orchestrator/validation';
 import { ROUTES } from '../routes/routes';
+import { json, preflight } from './http';
 
 export async function analysisFullHandler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
   try {
+    const method = String(request.method || 'POST').trim().toUpperCase();
+    const pf = preflight(request);
+    if (pf) return pf;
+    if (method !== 'POST') {
+      return json(request, 405, { error: 'Method not allowed' });
+    }
     const body = await request.json();
     const bodyRecord =
       body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
@@ -14,12 +21,9 @@ export async function analysisFullHandler(request: HttpRequest, context: Invocat
     };
     const validated = validateOrchestrateRequest(forcedBody);
     if (!validated.ok) {
-      return {
-        status: 400,
-        jsonBody: {
-          error: validated.message,
-        },
-      };
+      return json(request, 400, {
+        error: validated.message,
+      });
     }
 
     context.log('analysis full request', {
@@ -54,37 +58,28 @@ export async function analysisFullHandler(request: HttpRequest, context: Invocat
     const hasNarrative =
       Boolean(result.strategicAnalysis) || Boolean(result.fatigue) || Boolean(result.risk) || Boolean(result.tactical);
     if (!hasNarrative) {
-      return {
-        status: 502,
-        jsonBody: {
-          error: 'Full analysis unavailable',
-          details: 'All full-analysis agents failed.',
-        },
-      };
+      return json(request, 502, {
+        error: 'Full analysis unavailable',
+        details: 'All full-analysis agents failed.',
+      });
     }
-    return {
-      status: result.errors.length > 0 ? 207 : 200,
-      jsonBody: {
-        ...result,
-        ...(result.errors.length > 0
-          ? { warning: 'Some signals unavailable; showing best available guidance.' }
-          : {}),
-      },
-    };
+    return json(request, result.errors.length > 0 ? 207 : 200, {
+      ...result,
+      ...(result.errors.length > 0
+        ? { warning: 'Some signals unavailable; showing best available guidance.' }
+        : {}),
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Invalid request payload';
     context.error('Full analysis error', { message });
-    return {
-      status: 400,
-      jsonBody: {
-        error: message,
-      },
-    };
+    return json(request, 400, {
+      error: message,
+    });
   }
 }
 
 app.http('analysisFull', {
-  methods: ['POST'],
+  methods: ['POST', 'OPTIONS'],
   authLevel: 'anonymous',
   route: ROUTES.analysisFull,
   handler: analysisFullHandler,

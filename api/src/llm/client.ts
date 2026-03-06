@@ -62,11 +62,15 @@ export async function callLLM(input: CallLLMInput): Promise<string> {
   } catch (error) {
     const status = getAzureErrorStatus(error);
     const message = error instanceof Error ? error.message : 'Unknown Azure OpenAI error';
+    const codeCandidate = String((error as { code?: unknown })?.code || '').trim();
     const bodyCandidate =
       (typeof (error as { response?: { data?: unknown } })?.response?.data === 'string'
         ? (error as { response?: { data?: unknown } }).response?.data
         : undefined) ||
       (typeof (error as { body?: unknown })?.body === 'string' ? (error as { body?: unknown }).body : undefined) ||
+      (typeof (error as { bodySnippet?: unknown })?.bodySnippet === 'string'
+        ? (error as { bodySnippet?: unknown }).bodySnippet
+        : undefined) ||
       (typeof (error as { error?: { message?: unknown } })?.error?.message === 'string'
         ? (error as { error?: { message?: unknown } }).error?.message
         : undefined);
@@ -76,22 +80,30 @@ export async function callLLM(input: CallLLMInput): Promise<string> {
         : undefined;
     if (typeof status === 'number') {
       if (status === 404) {
-        throw new LLMRequestError(
+        const failure = new LLMRequestError(
           'Deployment not found (check AZURE_OPENAI_DEPLOYMENT name in Azure).',
           status,
           bodySnippet
         );
+        if (codeCandidate) (failure as LLMRequestError & { code?: string }).code = codeCandidate;
+        throw failure;
       }
       if (status === 401 || status === 403) {
-        throw new LLMRequestError(
+        const failure = new LLMRequestError(
           'Invalid subscription key or wrong endpoint (check key + endpoint).',
           status,
           bodySnippet
         );
+        if (codeCandidate) (failure as LLMRequestError & { code?: string }).code = codeCandidate;
+        throw failure;
       }
-      throw new LLMRequestError(`LLM request failed (${status}): ${message}`, status, bodySnippet);
+      const failure = new LLMRequestError(`LLM request failed (${status}): ${message}`, status, bodySnippet);
+      if (codeCandidate) (failure as LLMRequestError & { code?: string }).code = codeCandidate;
+      throw failure;
     }
-    throw new LLMRequestError(`LLM request failed: ${message}`, undefined, bodySnippet);
+    const failure = new LLMRequestError(`LLM request failed: ${message}`, undefined, bodySnippet);
+    if (codeCandidate) (failure as LLMRequestError & { code?: string }).code = codeCandidate;
+    throw failure;
   }
 }
 

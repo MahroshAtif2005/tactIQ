@@ -34,6 +34,14 @@ function normalizeMode(mode: unknown): 'route' | 'auto' | 'full' {
   return 'route';
 }
 
+function normalizeDataMode(value: unknown): 'demo' | 'live' {
+  return String(value || '').trim().toLowerCase() === 'demo' ? 'demo' : 'live';
+}
+
+function normalizeLlmMode(value: unknown): 'ai' | 'rules' {
+  return String(value || '').trim().toLowerCase() === 'ai' ? 'ai' : 'rules';
+}
+
 function normalizeRisk(value: unknown, fallback: 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN' = 'UNKNOWN'): 'LOW' | 'MED' | 'HIGH' | 'UNKNOWN' {
   const upper = String(value || fallback).toUpperCase();
   if (upper === 'UNKNOWN') return 'UNKNOWN';
@@ -252,7 +260,14 @@ export const validateOrchestrateRequest = (body: unknown): { ok: true; value: Or
   const text = String(payload.text || '').trim();
   const lowerText = text.toLowerCase();
   const rawMode = normalizeMode(payload.mode);
+  const legacyModeToken = String(payload.mode || '').trim().toLowerCase();
   const normalizedMode: OrchestrateRequest['mode'] = rawMode === 'full' ? 'full' : 'auto';
+  const dataMode: OrchestrateRequest['dataMode'] = normalizeDataMode(
+    payload.dataMode ?? (legacyModeToken === 'demo' ? 'demo' : 'live')
+  );
+  const llmMode: OrchestrateRequest['llmMode'] = normalizeLlmMode(
+    payload.llmMode ?? (legacyModeToken === 'rules' || legacyModeToken === 'mock' ? 'rules' : 'ai')
+  );
 
   const fatigueSignal = signals.fatigue ?? signals.fatigueIndex;
   const rawFatigueIndex = toNum(sourceTelemetry.fatigueIndex ?? fatigueSignal, Number.NaN);
@@ -282,6 +297,8 @@ export const validateOrchestrateRequest = (body: unknown): { ok: true; value: Or
   const value: OrchestrateRequest = {
     mode: normalizedMode,
     rawMode,
+    dataMode,
+    llmMode,
     intent,
     teamMode,
     focusRole,

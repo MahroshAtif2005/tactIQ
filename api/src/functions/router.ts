@@ -4,6 +4,7 @@ import { callLLMJsonWithRetry, LLMMessage } from '../llm/client';
 import { routeModel } from '../llm/router';
 import { validateOrchestrateRequest } from '../orchestrator/validation';
 import { ROUTES } from '../routes/routes';
+import { json, preflight } from './http';
 
 type StrategicIntent = 'InjuryPrevention' | 'PressureControl' | 'TacticalAttack' | 'General';
 type RouterAgentKey = 'fatigue' | 'risk' | 'tactical';
@@ -334,18 +335,20 @@ const buildRouterLlmMessages = (
 
 export async function routerHandler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
   try {
+    const method = String(request.method || 'POST').trim().toUpperCase();
+    const pf = preflight(request);
+    if (pf) return pf;
+    if (method !== 'POST') {
+      return json(request, 405, { error: 'Method not allowed', code: 'ROUTER_METHOD_NOT_ALLOWED' });
+    }
     const requestContentType = String(request.headers.get('content-type') || '').toLowerCase() || 'unknown';
     const body = await request.json();
     const validated = validateOrchestrateRequest(body);
     if (!validated.ok) {
-      return {
-        status: 400,
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
-        jsonBody: {
-          error: validated.message,
-          code: 'ROUTER_INVALID_PAYLOAD',
-        },
-      };
+      return json(request, 400, {
+        error: validated.message,
+        code: 'ROUTER_INVALID_PAYLOAD',
+      });
     }
 
     const mode = validated.value.mode === 'full' ? 'full' : 'auto';
@@ -470,44 +473,36 @@ export async function routerHandler(request: HttpRequest, context: InvocationCon
       routerUnavailable = true;
     }
 
-    return {
-      status: 200,
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      jsonBody: {
-        intent: strategicIntent,
-        run: {
-          fatigue: finalSelectedAgents.includes('fatigue'),
-          risk: finalSelectedAgents.includes('risk'),
-          tactical: finalSelectedAgents.includes('tactical'),
-        },
-        agentsToRun: finalAgentCodes,
-        selectedAgents: finalSelectedAgents,
-        signalSummaryBullets,
-        rationale,
-        reason: decision.reason,
-        signals: normalizedSignals,
-        rulesFired: decision.rulesFired,
-        inputsUsed: decision.inputsUsed,
-        fallbackRoutingUsed,
-        routerUnavailable,
+    return json(request, 200, {
+      intent: strategicIntent,
+      run: {
+        fatigue: finalSelectedAgents.includes('fatigue'),
+        risk: finalSelectedAgents.includes('risk'),
+        tactical: finalSelectedAgents.includes('tactical'),
       },
-    };
+      agentsToRun: finalAgentCodes,
+      selectedAgents: finalSelectedAgents,
+      signalSummaryBullets,
+      rationale,
+      reason: decision.reason,
+      signals: normalizedSignals,
+      rulesFired: decision.rulesFired,
+      inputsUsed: decision.inputsUsed,
+      fallbackRoutingUsed,
+      routerUnavailable,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Router handler failed';
     context.error('ROUTER_HANDLER_ERROR', { message: message.slice(0, 240) });
-    return {
-      status: 500,
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      jsonBody: {
-        error: 'Router request failed',
-        code: 'ROUTER_HANDLER_ERROR',
-      },
-    };
+    return json(request, 500, {
+      error: 'Router request failed',
+      code: 'ROUTER_HANDLER_ERROR',
+    });
   }
 }
 
 app.http('router', {
-  methods: ['POST'],
+  methods: ['POST', 'OPTIONS'],
   authLevel: 'anonymous',
   route: ROUTES.router,
   handler: routerHandler,

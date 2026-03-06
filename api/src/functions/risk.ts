@@ -1,6 +1,11 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
+import { randomUUID } from 'crypto';
+import { buildRiskFallback, runRiskAgent } from '../agents/riskAgent';
+import { ok } from '../lib/httpResponse';
+import { getAoaiConfig } from '../llm/modelRegistry';
 import { RiskAgentRequest, RiskAgentResponse } from '../shared/types';
-import { runRiskAgent } from '../agents/riskAgent';
+import { dedupeRoutingReasons, extractAoaiStatusFromValues, resolveDataMode, resolveLlmMode, toResponseMode } from '../shared/routing';
+import { preflight, withCors } from './_cors';
 
 const sanitizeRequest = (payload: Partial<RiskAgentRequest>): RiskAgentRequest => {
   const toNum = (value: unknown, fallback: number) => {
@@ -70,14 +75,43 @@ const sanitizeRequest = (payload: Partial<RiskAgentRequest>): RiskAgentRequest =
 };
 
 export async function riskHandler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  const method = String(request.method || 'POST').trim().toUpperCase();
+  const url = String(request.url || '/api/agents/risk').trim() || '/api/agents/risk';
+  const pf = preflight(request);
+  if (pf) return pf;
+  let mode = 'live';
+  let dataMode: 'demo' | 'live' = 'live';
+  let llmMode: 'ai' | 'rules' = 'ai';
   try {
-    const body = (await request.json()) as Partial<RiskAgentRequest>;
+    const body = (await request.json()) as Partial<RiskAgentRequest> & Record<string, unknown>;
+    mode = String(body?.mode || '').trim().toLowerCase() || 'live';
+    dataMode = resolveDataMode(body?.dataMode);
+    llmMode = resolveLlmMode(body?.llmMode);
     const input = sanitizeRequest(body);
+    const aoai = getAoaiConfig();
+    const aoaiConfigured = aoai.ok;
+    context.log('[risk] request', {
+      requestId,
+      method,
+      url,
+      mode,
+      dataMode,
+      llmMode,
+      aoaiConfigured,
+      routing: llmMode === 'ai' && aoaiConfigured ? 'real' : 'fallback',
+    });
     if (process.env.NODE_ENV !== 'production') {
       console.log('Risk payload', input);
     }
 
-    const result = await runRiskAgent(input);
+    const result =
+      llmMode !== 'ai'
+        ? buildRiskFallback(input, 'llm_mode_rules')
+        : !aoaiConfigured
+          ? buildRiskFallback(input, 'missing_aoai_config')
+          : await runRiskAgent(input);
     const response: RiskAgentResponse = {
       ...result.output,
       status: result.output.status || (result.fallbacksUsed.length > 0 ? 'fallback' : 'ok'),
@@ -90,30 +124,100 @@ export async function riskHandler(request: HttpRequest, context: InvocationConte
         signals: response.signals,
       });
     }
-
-    return {
+    const routingMode: 'fallback' | 'ai' = response.status === 'fallback' ? 'fallback' : 'ai';
+    const reasons = routingMode === 'fallback'
+      ? dedupeRoutingReasons(result.fallbacksUsed, llmMode !== 'ai' ? 'llm_mode_rules' : 'upstream_unavailable')
+      : [];
+    const aoaiStatus = extractAoaiStatusFromValues(result.fallbacksUsed);
+    const coachOutput = String(response.recommendation || response.explanation || response.headline || 'Risk analysis completed.').trim();
+    const timings = {
+      totalMs: Date.now() - startedAt,
+      riskMs: Date.now() - startedAt,
+    };
+    if (typeof aoaiStatus === 'number') {
+      context.log('[risk] aoai_status', { requestId, status: aoaiStatus });
+    }
+    context.log('[risk] response', {
+      requestId,
+      method,
+      url,
+      mode,
+      dataMode,
+      llmMode,
+      routing: routingMode,
       status: 200,
-      jsonBody: {
+      durationMs: timings.totalMs,
+    });
+
+    return withCors(
+      request,
+      ok({
+        ok: true,
+        mode: toResponseMode(routingMode),
+        dataMode,
+        llmMode,
+        routingMode,
+        reasons,
+        analysisBundleId: `risk-${requestId}`,
+        coachOutput,
+        agents: {
+          risk: { status: routingMode === 'fallback' ? 'FALLBACK' : 'OK' },
+        },
+        timings,
         ...response,
         meta: {
+          requestId,
           model: result.model,
           fallbacksUsed: result.fallbacksUsed,
+          llmMode,
+          dataMode,
+          timingsMs: timings,
         },
-      },
-    };
+      })
+    );
   } catch (error) {
-    context.error('Risk agent error', error);
-    return {
-      status: 400,
-      jsonBody: {
-        error: 'Invalid request payload',
-      },
+    const message = error instanceof Error ? error.message : 'Risk request failed';
+    const reasons = dedupeRoutingReasons([message], 'upstream_unavailable');
+    context.error('Risk agent error', { requestId, message, stack: error instanceof Error ? error.stack : undefined });
+    const timings = {
+      totalMs: Date.now() - startedAt,
+      riskMs: Date.now() - startedAt,
     };
+    context.log('[risk] response', {
+      requestId,
+      method,
+      url,
+      mode,
+      dataMode,
+      llmMode,
+      routing: 'fallback',
+      status: 200,
+      durationMs: timings.totalMs,
+    });
+    return withCors(
+      request,
+      ok({
+        error: true,
+        message,
+        ...(process.env.NODE_ENV === 'production' ? {} : { stack: error instanceof Error ? error.stack : undefined }),
+        mode: 'fallback',
+        dataMode,
+        llmMode,
+        routingMode: 'fallback',
+        reasons,
+        coachOutput: 'Risk analysis failed before a recommendation could be produced.',
+        agents: {
+          risk: { status: 'FALLBACK' },
+        },
+        timings,
+        requestId,
+      })
+    );
   }
 }
 
 app.http('risk', {
-  methods: ['POST'],
+  methods: ['POST', 'OPTIONS'],
   authLevel: 'anonymous',
   route: 'agents/risk',
   handler: riskHandler,

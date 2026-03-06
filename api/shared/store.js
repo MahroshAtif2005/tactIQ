@@ -8,7 +8,7 @@ try {
 }
 
 const DEFAULT_DB = 'tactiq-db';
-const DEFAULT_PLAYERS_CONTAINER = 'players';
+const DEFAULT_PLAYERS_CONTAINER = 'playersByUser';
 const DEFAULT_USERS_CONTAINER = 'users';
 const VALID_ROLES = new Set(['BAT', 'FAST', 'SPIN', 'AR']);
 
@@ -19,9 +19,10 @@ const DEFAULT_BASELINES = [
 ];
 
 const memoryUsers = new Map();
-const memoryBaselinesByTeam = new Map();
+const memoryBaselinesByUser = new Map();
 let cosmosPromise = null;
 let cosmosEnabled = false;
+let cosmosConfigLogged = false;
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const normalizeId = (value) => String(value || '').trim();
@@ -51,6 +52,45 @@ const parseBoolean = (value, fallback) => {
 const normalizeRole = (value) => {
   const role = String(value || '').trim().toUpperCase();
   return VALID_ROLES.has(role) ? role : 'FAST';
+};
+
+const normalizeAuthHeader = (req) => {
+  const headers = (req && req.headers) || {};
+  const raw = headers.authorization || headers.Authorization;
+  return normalizeId(Array.isArray(raw) ? raw[0] : raw);
+};
+
+const parseBase64UrlJson = (input) => {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+  try {
+    const padded = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const normalized = padded + '='.repeat((4 - (padded.length % 4 || 4)) % 4);
+    const decoded = Buffer.from(normalized, 'base64').toString('utf8');
+    const parsed = JSON.parse(decoded);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const extractBearerPayload = (req) => {
+  const authHeader = normalizeAuthHeader(req);
+  if (!/^bearer\s+/i.test(authHeader)) return null;
+  const token = authHeader.replace(/^bearer\s+/i, '').trim();
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  return parseBase64UrlJson(parts[1]);
+};
+
+const getJwtClaim = (payload, ...keys) => {
+  if (!payload || typeof payload !== 'object') return '';
+  for (const key of keys) {
+    const value = normalizeId(payload[key]);
+    if (value) return value;
+  }
+  return '';
 };
 
 const normalizeBaseline = (raw, scope = {}, existing = null) => {
@@ -148,10 +188,25 @@ const getClaim = (claims, ...types) => {
   return '';
 };
 
+const isLocalHostRequest = (req) => {
+  const headers = (req && req.headers) || {};
+  const hostHeader = headers['x-forwarded-host'] || headers['X-FORWARDED-HOST'] || headers.host || headers.Host;
+  const host = normalizeId(Array.isArray(hostHeader) ? hostHeader[0] : hostHeader).toLowerCase();
+  return host.includes('localhost') || host.includes('127.0.0.1');
+};
+
+const isProductionRuntime = () => {
+  const functionsEnv = normalizeId(process.env.AZURE_FUNCTIONS_ENVIRONMENT).toLowerCase();
+  if (functionsEnv) return functionsEnv === 'production';
+  const nodeEnv = normalizeId(process.env.NODE_ENV).toLowerCase();
+  return nodeEnv === 'production';
+};
+
 const getIdentity = (req) => {
   const principal = extractPrincipal(req);
   if (principal) {
     const claims = Array.isArray(principal.claims) ? principal.claims : [];
+    const email = normalizeId(getClaim(claims, 'emails', 'email', 'preferred_username', 'upn'));
     const userId = normalizeId(
       principal.userId ||
       getClaim(
@@ -160,19 +215,45 @@ const getIdentity = (req) => {
         'oid',
         'sub',
         'nameidentifier'
-      )
+      ) ||
+      email
     );
     if (userId) {
       return {
         userId,
         name: normalizeId(principal.userDetails || getClaim(claims, 'name', 'given_name')),
-        email: normalizeId(getClaim(claims, 'emails', 'email', 'preferred_username', 'upn')),
+        email,
         source: 'swa',
       };
     }
   }
 
-  if (String(process.env.NODE_ENV || '').toLowerCase() !== 'production') {
+  const bearerPayload = extractBearerPayload(req);
+  if (bearerPayload) {
+    const email = normalizeId(getJwtClaim(bearerPayload, 'email', 'preferred_username', 'upn'));
+    const userId = normalizeId(
+      getJwtClaim(
+        bearerPayload,
+        'oid',
+        'sub',
+        'nameid',
+        'nameidentifier',
+        'http://schemas.microsoft.com/identity/claims/objectidentifier'
+      ) ||
+      email
+    );
+    if (userId) {
+      return {
+        userId,
+        name: normalizeId(getJwtClaim(bearerPayload, 'name', 'given_name')),
+        email,
+        source: 'bearer',
+      };
+    }
+  }
+
+  const localRuntime = !isProductionRuntime() || isLocalHostRequest(req);
+  if (localRuntime) {
     const headers = (req && req.headers) || {};
     const devHeader = headers['x-dev-user-id'] || headers['X-DEV-USER-ID'];
     const devUserId = normalizeId(Array.isArray(devHeader) ? devHeader[0] : devHeader);
@@ -182,6 +263,16 @@ const getIdentity = (req) => {
         name: 'Local Dev Coach',
         email: '',
         source: 'dev-header',
+      };
+    }
+
+    const allowAnonymousLocal = String(process.env.ALLOW_LOCAL_ANON_IDENTITY || 'true').trim().toLowerCase() !== 'false';
+    if (allowAnonymousLocal) {
+      return {
+        userId: 'demo-local',
+        name: 'Local Demo Coach',
+        email: '',
+        source: 'local-anon',
       };
     }
   }
@@ -195,7 +286,7 @@ const getConfig = () => {
   const key = normalizeId(process.env.COSMOS_KEY);
   const databaseId = normalizeId(process.env.COSMOS_DATABASE || process.env.COSMOS_DB || DEFAULT_DB) || DEFAULT_DB;
   const playersContainerId =
-    normalizeId(process.env.COSMOS_CONTAINER_PLAYERS || process.env.COSMOS_CONTAINER || DEFAULT_PLAYERS_CONTAINER) ||
+    normalizeId(process.env.COSMOS_CONTAINER_PLAYERS || DEFAULT_PLAYERS_CONTAINER) ||
     DEFAULT_PLAYERS_CONTAINER;
   const usersContainerId =
     normalizeId(process.env.COSMOS_CONTAINER_USERS || DEFAULT_USERS_CONTAINER) || DEFAULT_USERS_CONTAINER;
@@ -212,11 +303,22 @@ const getConfig = () => {
   };
 };
 
+const logCosmosConfigOnce = (config) => {
+  if (cosmosConfigLogged) return;
+  cosmosConfigLogged = true;
+  console.log('[functions][cosmos] storage config', {
+    database: config.databaseId,
+    playersContainer: config.playersContainerId,
+    usersContainer: config.usersContainerId,
+  });
+};
+
 const getCosmos = async () => {
   if (cosmosPromise) return cosmosPromise;
 
   cosmosPromise = (async () => {
     const config = getConfig();
+    logCosmosConfigOnce(config);
     if (!CosmosClient || !config.hasAuth) {
       cosmosEnabled = false;
       return null;
@@ -255,13 +357,13 @@ const sortBaselines = (rows) => {
     .map((entry) => entry.row);
 };
 
-const getMemoryBaselines = (teamId) => {
-  const key = normalizeId(teamId);
-  if (!memoryBaselinesByTeam.has(key)) {
+const getMemoryBaselines = (userId) => {
+  const key = normalizeId(userId);
+  if (!memoryBaselinesByUser.has(key)) {
     const seeded = DEFAULT_BASELINES.map((row) => ({ ...row }));
-    memoryBaselinesByTeam.set(key, seeded);
+    memoryBaselinesByUser.set(key, seeded);
   }
-  return memoryBaselinesByTeam.get(key) || [];
+  return memoryBaselinesByUser.get(key) || [];
 };
 
 const ensureUser = async (identity) => {
@@ -270,25 +372,30 @@ const ensureUser = async (identity) => {
   }
 
   const now = new Date().toISOString();
+  const defaultTeamId = identity.userId;
   const cosmos = await getCosmos();
   if (cosmos) {
     const { usersContainer } = cosmos;
-    const query = {
-      query: 'SELECT TOP 1 * FROM c WHERE c.userId = @userId',
-      parameters: [{ name: '@userId', value: identity.userId }],
-    };
-    const result = await usersContainer.items.query(query).fetchAll();
-    const existing = Array.isArray(result.resources) ? result.resources[0] : null;
+    let existingUser = null;
+    try {
+      const result = await usersContainer.item(identity.userId, identity.userId).read();
+      existingUser = result && result.resource ? result.resource : null;
+    } catch (error) {
+      const code = Number(error && error.code);
+      const statusCode = Number(error && error.statusCode);
+      const notFound = code === 404 || statusCode === 404;
+      if (!notFound) throw error;
+    }
 
     const userDoc = {
       id: identity.userId,
-      type: 'coachUser',
+      type: 'userAccount',
       userId: identity.userId,
-      email: identity.email || existing && existing.email || null,
-      name: identity.name || existing && existing.name || null,
-      role: existing && existing.role ? existing.role : 'coach',
-      teamId: normalizeId(existing && existing.teamId) || randomUUID(),
-      createdAt: normalizeIsoDate(existing && existing.createdAt || now),
+      email: identity.email || (existingUser && existingUser.email) || null,
+      name: identity.name || (existingUser && existingUser.name) || null,
+      teamId: normalizeId((existingUser && existingUser.teamId) || defaultTeamId) || defaultTeamId,
+      role: normalizeId(existingUser && existingUser.role) || 'coach',
+      createdAt: normalizeIsoDate((existingUser && existingUser.createdAt) || now),
       updatedAt: now,
     };
 
@@ -297,59 +404,43 @@ const ensureUser = async (identity) => {
   }
 
   const existing = memoryUsers.get(identity.userId);
-  const doc = {
+  const userDoc = {
     id: identity.userId,
-    type: 'coachUser',
+    type: 'userAccount',
     userId: identity.userId,
     email: identity.email || (existing && existing.email) || null,
     name: identity.name || (existing && existing.name) || null,
-    role: (existing && existing.role) || 'coach',
-    teamId: normalizeId(existing && existing.teamId) || randomUUID(),
+    teamId: normalizeId((existing && existing.teamId) || defaultTeamId) || defaultTeamId,
+    role: normalizeId(existing && existing.role) || 'coach',
     createdAt: normalizeIsoDate((existing && existing.createdAt) || now),
     updatedAt: now,
   };
-  memoryUsers.set(identity.userId, doc);
-  return doc;
+  memoryUsers.set(identity.userId, userDoc);
+  return userDoc;
 };
 
 const queryBaselinesByScope = async ({ userId, teamId }) => {
+  const normalizedUserId = normalizeId(userId);
+  if (!normalizedUserId) {
+    const error = new Error('userId is required.');
+    error.code = 'VALIDATION_ERROR';
+    throw error;
+  }
   const cosmos = await getCosmos();
   if (!cosmos) {
-    return getMemoryBaselines(teamId).map((row) => ({ ...row, userId, teamId }));
+    return getMemoryBaselines(normalizedUserId).map((row) => ({ ...row, userId: normalizedUserId, teamId }));
   }
 
   const { playersContainer } = cosmos;
   const query = {
-    query: 'SELECT * FROM c WHERE c.type = @type AND c.teamId = @teamId',
+    query: 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId',
     parameters: [
       { name: '@type', value: 'playerBaseline' },
-      { name: '@teamId', value: teamId },
+      { name: '@userId', value: normalizedUserId },
     ],
   };
-  const result = await playersContainer.items.query(query).fetchAll();
-  let resources = Array.isArray(result.resources) ? result.resources : [];
-
-  if (resources.length === 0) {
-    const legacy = await playersContainer.items
-      .query({
-        query: 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId AND (NOT IS_DEFINED(c.teamId) OR c.teamId = "")',
-        parameters: [
-          { name: '@type', value: 'playerBaseline' },
-          { name: '@userId', value: userId },
-        ],
-      })
-      .fetchAll();
-    const legacyRows = Array.isArray(legacy.resources) ? legacy.resources : [];
-    if (legacyRows.length > 0) {
-      const now = new Date().toISOString();
-      for (const row of legacyRows) {
-        await playersContainer.items.upsert({ ...row, teamId, updatedAt: now }, { partitionKey: userId });
-      }
-      resources = legacyRows.map((row) => ({ ...row, teamId }));
-    }
-  }
-
-  return resources;
+  const result = await playersContainer.items.query(query, { partitionKey: normalizedUserId }).fetchAll();
+  return Array.isArray(result.resources) ? result.resources : [];
 };
 
 const listBaselines = async ({ userId, teamId }) => {
@@ -361,23 +452,126 @@ const listBaselines = async ({ userId, teamId }) => {
 };
 
 const getTeamBaselineDocs = async ({ userId, teamId }) => {
+  const normalizedUserId = requireUserId(userId);
   const cosmos = await getCosmos();
   if (!cosmos) return [];
   const { playersContainer } = cosmos;
   const query = {
-    query: 'SELECT * FROM c WHERE c.type = @type AND c.teamId = @teamId',
+    query: 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId',
     parameters: [
       { name: '@type', value: 'playerBaseline' },
-      { name: '@teamId', value: teamId },
+      { name: '@userId', value: normalizedUserId },
     ],
   };
-  const result = await playersContainer.items.query(query).fetchAll();
+  const result = await playersContainer.items.query(query, { partitionKey: normalizedUserId }).fetchAll();
   return Array.isArray(result.resources)
-    ? result.resources.filter((row) => normalizeId(row && row.userId) === userId)
+    ? result.resources
     : [];
 };
 
+const requireUserId = (userId) => {
+  const normalizedUserId = normalizeId(userId);
+  if (normalizedUserId) return normalizedUserId;
+  const error = new Error('userId is required.');
+  error.code = 'VALIDATION_ERROR';
+  throw error;
+};
+
+const getWriteVerificationMeta = () => {
+  const config = getConfig();
+  return {
+    db: config.databaseId,
+    container: config.playersContainerId,
+    note: 'Safe to delete old players container after verification.',
+  };
+};
+
+const logPlayersWriteVerification = (op, userId, count = 0) => {
+  const mode = String(process.env.NODE_ENV || '').trim().toLowerCase();
+  if (mode === 'test') return;
+  const meta = getWriteVerificationMeta();
+  console.log('[playersByUser][verify]', {
+    op,
+    userId: normalizeId(userId),
+    count: Number.isFinite(Number(count)) ? Number(count) : 0,
+    db: meta.db,
+    container: meta.container,
+    note: meta.note,
+  });
+};
+
+const queryBaselineDocsForUser = async ({ userId, baselineId }) => {
+  const normalizedUserId = requireUserId(userId);
+  const normalizedId = normalizeId(baselineId);
+  if (!normalizedId) return [];
+
+  const cosmos = await getCosmos();
+  if (!cosmos) {
+    const rows = getMemoryBaselines(normalizedUserId).filter((row) => {
+      const key = normalizeId(row.id || row.playerId || row.baselineId || row.name);
+      return key === normalizedId;
+    });
+    return rows.map((row) => ({ ...row, userId: normalizedUserId }));
+  }
+
+  const { playersContainer } = cosmos;
+  const result = await playersContainer.items
+    .query({
+      query: 'SELECT * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id OR c.id = @id)',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@userId', value: normalizedUserId },
+        { name: '@id', value: normalizedId },
+      ],
+    }, { partitionKey: normalizedUserId })
+    .fetchAll();
+  return Array.isArray(result.resources) ? result.resources : [];
+};
+
+const queryAnyUserBaselineDoc = async (baselineId) => {
+  const normalizedId = normalizeId(baselineId);
+  if (!normalizedId) return null;
+  const cosmos = await getCosmos();
+  if (!cosmos) return null;
+
+  const { playersContainer } = cosmos;
+  const result = await playersContainer.items
+    .query({
+      query: 'SELECT TOP 1 c.id, c.userId FROM c WHERE c.type = @type AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id OR c.id = @id)',
+      parameters: [
+        { name: '@type', value: 'playerBaseline' },
+        { name: '@id', value: normalizedId },
+      ],
+    })
+    .fetchAll();
+  const row = Array.isArray(result.resources) ? result.resources[0] : null;
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: normalizeId(row.id),
+    userId: normalizeId(row.userId),
+  };
+};
+
+const checkBaselineOwnership = async ({ userId, baselineId }) => {
+  const normalizedUserId = requireUserId(userId);
+  const normalizedId = normalizeId(baselineId);
+  if (!normalizedId) return { exists: false, owned: false };
+
+  const ownedRows = await queryBaselineDocsForUser({ userId: normalizedUserId, baselineId: normalizedId });
+  if (ownedRows.length > 0) {
+    return { exists: true, owned: true, ownerUserId: normalizedUserId };
+  }
+
+  const owner = await queryAnyUserBaselineDoc(normalizedId);
+  if (owner && owner.userId && owner.userId !== normalizedUserId) {
+    return { exists: true, owned: false, ownerUserId: owner.userId };
+  }
+
+  return { exists: false, owned: false };
+};
+
 const saveBaselines = async ({ userId, teamId, payload }) => {
+  const scopedUserId = requireUserId(userId);
   const body = payload && typeof payload === 'object' ? payload : {};
   const items = Array.isArray(body.players)
     ? body.players
@@ -394,12 +588,12 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
   const cosmos = await getCosmos();
   if (!cosmos) {
     const map = new Map();
-    for (const row of getMemoryBaselines(teamId)) {
+    for (const row of getMemoryBaselines(scopedUserId)) {
       map.set(normalizeId(row.id).toLowerCase(), { ...row });
     }
     for (const incoming of items) {
       const existing = map.get(normalizeId(incoming && (incoming.id || incoming.playerId || incoming.name)).toLowerCase()) || null;
-      const normalized = normalizeBaseline(incoming, { userId, teamId }, existing);
+      const normalized = normalizeBaseline(incoming, { userId: scopedUserId, teamId }, existing);
       if (!normalized) continue;
       map.set(normalizeId(normalized.baselineId).toLowerCase(), {
         ...normalized,
@@ -407,44 +601,49 @@ const saveBaselines = async ({ userId, teamId, payload }) => {
       });
     }
     const savedRows = [...map.values()].map((row) => ({ ...row, id: row.baselineId }));
-    memoryBaselinesByTeam.set(teamId, sortBaselines(savedRows));
-    return listBaselines({ userId, teamId });
+    memoryBaselinesByUser.set(scopedUserId, sortBaselines(savedRows));
+    logPlayersWriteVerification('save.memory', scopedUserId, savedRows.length);
+    return listBaselines({ userId: scopedUserId, teamId });
   }
 
   const { playersContainer } = cosmos;
   const now = new Date().toISOString();
+  let upsertedCount = 0;
   for (const incoming of items) {
     const incomingId = normalizeId(incoming && (incoming.id || incoming.playerId || incoming.baselineId || incoming.name));
     if (!incomingId) continue;
 
     const existingQuery = await playersContainer.items
       .query({
-        query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.teamId = @teamId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id)',
+        query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id)',
         parameters: [
           { name: '@type', value: 'playerBaseline' },
-          { name: '@teamId', value: teamId },
+          { name: '@userId', value: scopedUserId },
           { name: '@id', value: incomingId },
         ],
-      })
+      }, { partitionKey: scopedUserId })
       .fetchAll();
 
     const existing = Array.isArray(existingQuery.resources) ? existingQuery.resources[0] : null;
     const normalized = normalizeBaseline(
       { ...incoming, updatedAt: now },
-      { userId, teamId },
+      { userId: scopedUserId, teamId },
       existing
     );
     if (!normalized) continue;
 
     await playersContainer.items.upsert(normalized, {
-      partitionKey: userId,
+      partitionKey: scopedUserId,
     });
+    upsertedCount += 1;
   }
 
-  return listBaselines({ userId, teamId });
+  logPlayersWriteVerification('save.cosmos', scopedUserId, upsertedCount);
+  return listBaselines({ userId: scopedUserId, teamId });
 };
 
 const replaceBaselines = async ({ userId, teamId, payload }) => {
+  const scopedUserId = requireUserId(userId);
   const body = payload && typeof payload === 'object' ? payload : {};
   const items = Array.isArray(body.players)
     ? body.players
@@ -463,70 +662,81 @@ const replaceBaselines = async ({ userId, teamId, payload }) => {
     const nextRows = items
       .map((incoming, index) => normalizeBaseline(
         { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1 },
-        { userId, teamId },
+        { userId: scopedUserId, teamId },
         null
       ))
       .filter(Boolean)
       .map((row) => ({ ...row, id: row.baselineId }));
-    memoryBaselinesByTeam.set(teamId, sortBaselines(nextRows));
-    return listBaselines({ userId, teamId });
+    memoryBaselinesByUser.set(scopedUserId, sortBaselines(nextRows));
+    logPlayersWriteVerification('replace.memory', scopedUserId, nextRows.length);
+    return listBaselines({ userId: scopedUserId, teamId });
   }
 
   const { playersContainer } = cosmos;
-  const existingRows = await getTeamBaselineDocs({ userId, teamId });
+  const existingRows = await getTeamBaselineDocs({ userId: scopedUserId, teamId });
   for (const row of existingRows) {
     const docId = normalizeId(row && row.id);
     if (!docId) continue;
-    await playersContainer.item(docId, userId).delete();
+    await playersContainer.item(docId, scopedUserId).delete();
   }
 
   const now = new Date().toISOString();
+  let upsertedCount = 0;
   for (let index = 0; index < items.length; index += 1) {
     const incoming = items[index];
     const normalized = normalizeBaseline(
       { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1, updatedAt: now },
-      { userId, teamId },
+      { userId: scopedUserId, teamId },
       null
     );
     if (!normalized) continue;
-    await playersContainer.items.upsert(normalized, { partitionKey: userId });
+    await playersContainer.items.upsert(normalized, { partitionKey: scopedUserId });
+    upsertedCount += 1;
   }
 
-  return listBaselines({ userId, teamId });
+  logPlayersWriteVerification('replace.cosmos', scopedUserId, upsertedCount);
+  return listBaselines({ userId: scopedUserId, teamId });
 };
 
 const deleteBaselineById = async ({ userId, teamId, baselineId }) => {
+  const scopedUserId = requireUserId(userId);
   const normalizedId = normalizeId(baselineId);
-  if (!normalizedId) return listBaselines({ userId, teamId });
+  if (!normalizedId) return listBaselines({ userId: scopedUserId, teamId });
 
   const cosmos = await getCosmos();
   if (!cosmos) {
-    const current = getMemoryBaselines(teamId);
+    const current = getMemoryBaselines(scopedUserId);
     const filtered = current.filter((row) => normalizeId(row.id || row.playerId || row.baselineId || row.name) !== normalizedId);
-    memoryBaselinesByTeam.set(teamId, filtered);
-    return listBaselines({ userId, teamId });
+    if (filtered.length === current.length) {
+      const ownership = await checkBaselineOwnership({ userId: scopedUserId, baselineId: normalizedId });
+      if (ownership.exists && !ownership.owned) {
+        const error = new Error('Forbidden: baseline belongs to a different user.');
+        error.code = 403;
+        throw error;
+      }
+    }
+    memoryBaselinesByUser.set(scopedUserId, filtered);
+    logPlayersWriteVerification('delete.memory', scopedUserId, current.length - filtered.length);
+    return listBaselines({ userId: scopedUserId, teamId });
   }
 
   const { playersContainer } = cosmos;
-  const candidates = await playersContainer.items
-    .query({
-      query: 'SELECT * FROM c WHERE c.type = @type AND c.teamId = @teamId AND c.userId = @userId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id OR c.id = @id)',
-      parameters: [
-        { name: '@type', value: 'playerBaseline' },
-        { name: '@teamId', value: teamId },
-        { name: '@userId', value: userId },
-        { name: '@id', value: normalizedId },
-      ],
-    })
-    .fetchAll();
-
-  const rows = Array.isArray(candidates.resources) ? candidates.resources : [];
+  const rows = await queryBaselineDocsForUser({ userId: scopedUserId, baselineId: normalizedId });
+  if (rows.length === 0) {
+    const ownership = await checkBaselineOwnership({ userId: scopedUserId, baselineId: normalizedId });
+    if (ownership.exists && !ownership.owned) {
+      const error = new Error('Forbidden: baseline belongs to a different user.');
+      error.code = 403;
+      throw error;
+    }
+  }
   for (const row of rows) {
     const docId = normalizeId(row && row.id);
     if (!docId) continue;
-    await playersContainer.item(docId, userId).delete();
+    await playersContainer.item(docId, scopedUserId).delete();
   }
-  return listBaselines({ userId, teamId });
+  logPlayersWriteVerification('delete.cosmos', scopedUserId, rows.length);
+  return listBaselines({ userId: scopedUserId, teamId });
 };
 
 const resetBaselines = async ({ userId, teamId }) => {
@@ -546,6 +756,7 @@ module.exports = {
   saveBaselines,
   replaceBaselines,
   deleteBaselineById,
+  checkBaselineOwnership,
   resetBaselines,
   getStorageMode,
 };

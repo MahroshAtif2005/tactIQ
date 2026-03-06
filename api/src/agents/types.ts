@@ -4,6 +4,8 @@ import { FullMatchContext, ReplacementCandidate } from '../shared/matchContext';
 export type OrchestrateMode = 'auto' | 'full';
 export type OrchestrateRequestMode = 'route' | 'auto' | 'full';
 export type OrchestrateIntent = 'monitor' | 'substitution' | 'strategy' | 'full';
+export type OrchestrateDataMode = 'demo' | 'live';
+export type OrchestrateLlmMode = 'ai' | 'rules';
 export type RouterIntent = 'SUBSTITUTION' | 'BOWLING_NEXT' | 'BATTING_NEXT' | 'BOTH_NEXT' | 'SAFETY_ALERT' | 'GENERAL';
 export type AgentCode = 'RISK' | 'TACTICAL' | 'FATIGUE';
 export type LegacyAgentId = 'risk' | 'tactical' | 'fatigue';
@@ -61,6 +63,11 @@ export interface TacticalSubstitutionAdvice {
 export interface TacticalAgentInput {
   requestId: string;
   intent: OrchestrateIntent;
+  requestMode?: OrchestrateMode;
+  dataMode?: OrchestrateDataMode;
+  llmMode?: OrchestrateLlmMode;
+  userAction?: string;
+  signals?: Record<string, unknown>;
   teamMode?: 'BATTING' | 'BOWLING';
   focusRole?: 'BOWLER' | 'BATTER';
   matchContext: TacticalMatchContext;
@@ -144,6 +151,8 @@ export interface TacticalAgentResult {
 export interface OrchestrateRequest {
   mode?: OrchestrateMode;
   rawMode?: OrchestrateRequestMode;
+  dataMode?: OrchestrateDataMode;
+  llmMode?: OrchestrateLlmMode;
   intent?: OrchestrateIntent;
   teamMode?: 'BATTING' | 'BOWLING';
   focusRole?: 'BOWLER' | 'BATTER';
@@ -160,6 +169,8 @@ export interface OrchestrateRequest {
 export interface OrchestrateRequestBody {
   text?: string;
   mode?: OrchestrateRequestMode | string;
+  dataMode?: OrchestrateDataMode | string;
+  llmMode?: OrchestrateLlmMode | string;
   intent?: OrchestrateIntent | string;
   teamMode?: 'BATTING' | 'BOWLING' | string;
   focusRole?: 'BOWLER' | 'BATTER' | string;
@@ -227,6 +238,11 @@ export interface FinalRecommendation {
 }
 
 export interface OrchestrateResponse {
+  analysisId?: string;
+  analysisBundleId?: string;
+  summary?: string;
+  tacticalRecommendation?: string;
+  confidence?: number;
   fatigue?: FatigueAgentResponse;
   risk?: RiskAgentResponse;
   tactical?: TacticalAgentOutput;

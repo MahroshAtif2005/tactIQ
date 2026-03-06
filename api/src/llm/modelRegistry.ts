@@ -1,3 +1,5 @@
+import { loadAoaiEnv } from '../shared/env';
+
 export interface ModelRegistry {
   endpoint: string;
   apiKey: string;
@@ -28,10 +30,6 @@ const firstNonEmpty = (...values: Array<unknown>): string => {
   return '';
 };
 
-const normalizeEndpoint = (endpoint: string): string => endpoint.replace(/\/+$/, '');
-
-const readEnvAlias = (aliases: string[]): string => firstNonEmpty(...aliases.map((name) => process.env[name]));
-
 interface ResolvedAoaiEnv {
   endpoint: string;
   apiKey: string;
@@ -43,46 +41,28 @@ interface ResolvedAoaiEnv {
 }
 
 const resolveAoaiEnv = (): ResolvedAoaiEnv => {
-  const endpoint = normalizeEndpoint(
-    readEnvAlias([
-      'AZURE_OPENAI_ENDPOINT',
-      'AZURE_OPENAI_BASE',
-      'AZURE_OPENAI_BASE_URL',
-      'AOAI_ENDPOINT',
-      'OPENAI_ENDPOINT',
-    ])
-  );
-  const apiKey = readEnvAlias([
-    'AZURE_OPENAI_API_KEY',
-    'AZURE_OPENAI_KEY',
-    'AOAI_API_KEY',
-    'OPENAI_API_KEY',
-  ]);
-  const apiVersion =
-    readEnvAlias([
-      'AZURE_OPENAI_API_VERSION',
-      'AOAI_API_VERSION',
-      'OPENAI_API_VERSION',
-    ]) || '2024-02-15-preview';
-  const deployment = readEnvAlias([
-    'AZURE_OPENAI_DEPLOYMENT',
-    'AZURE_OPENAI_DEPLOYMENT_NAME',
-    'AOAI_DEPLOYMENT',
-    'AOAI_DEPLOYMENT_FAST',
-    'AOAI_DEPLOYMENT_STRONG',
-    'AZURE_OPENAI_MODEL',
-    'OPENAI_DEPLOYMENT',
-    'OPENAI_MODEL',
-  ]);
+  const base = loadAoaiEnv();
+  const endpoint = base.endpoint;
+  const apiKey = base.apiKey;
+  const apiVersion = base.apiVersion || '2024-02-15-preview';
+  const deployment = base.deployment;
   const fastDeployment =
-    readEnvAlias(['AOAI_DEPLOYMENT_FAST', 'AZURE_OPENAI_DEPLOYMENT_FAST']) || deployment;
+    firstNonEmpty(process.env.AOAI_DEPLOYMENT_FAST, process.env.AZURE_OPENAI_DEPLOYMENT_FAST, deployment);
   const strongDeployment =
-    readEnvAlias(['AOAI_DEPLOYMENT_STRONG', 'AZURE_OPENAI_DEPLOYMENT_STRONG']) || fastDeployment || deployment;
+    firstNonEmpty(
+      process.env.AOAI_DEPLOYMENT_STRONG,
+      process.env.AZURE_OPENAI_DEPLOYMENT_STRONG,
+      fastDeployment,
+      deployment
+    );
   const fallbackDeployment =
-    readEnvAlias(['AOAI_DEPLOYMENT_FALLBACK', 'AZURE_OPENAI_DEPLOYMENT_FALLBACK']) ||
-    strongDeployment ||
-    fastDeployment ||
-    deployment;
+    firstNonEmpty(
+      process.env.AOAI_DEPLOYMENT_FALLBACK,
+      process.env.AZURE_OPENAI_DEPLOYMENT_FALLBACK,
+      strongDeployment,
+      fastDeployment,
+      deployment
+    );
 
   // Keep canonical names hydrated so downstream modules can read one consistent key.
   if (endpoint) process.env.AZURE_OPENAI_ENDPOINT = endpoint;

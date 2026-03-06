@@ -1,4 +1,4 @@
-import { callLLMJsonWithRetry, LLMMessage } from '../llm/client';
+import { callLLMJsonWithRetry, LLMJsonResponseError, LLMMessage, LLMRequestError } from '../llm/client';
 import { getAoaiConfig } from '../llm/modelRegistry';
 import { routeModel } from '../llm/router';
 import { analyzeFatigueRuleBased } from '../shared/analysisProvider';
@@ -171,6 +171,34 @@ const deriveSeverityFromInput = (input: FatigueAgentRequest): 'LOW' | 'MED' | 'H
   if (injury === 'MED' || fatigue >= 4) return 'MED';
   return 'LOW';
 };
+const llmFallbackReason = (error: unknown): string => {
+  const message = normalizeText(error instanceof Error ? error.message : String(error || 'llm-error')).slice(0, 240);
+  let status: number | undefined;
+  let code = '';
+  let body = '';
+  if (error instanceof LLMRequestError) {
+    status = error.status;
+    code = String((error as LLMRequestError & { code?: unknown }).code || '').trim();
+    body = normalizeText(error.bodySnippet || '').slice(0, 200);
+  } else if (error instanceof LLMJsonResponseError) {
+    code = `json_${error.phase}`;
+    body = normalizeText(error.rawSnippet || '').slice(0, 200);
+  } else if (error && typeof error === 'object') {
+    const candidate = error as { status?: unknown; statusCode?: unknown; code?: unknown; bodySnippet?: unknown };
+    const statusParsed = Number(candidate.status ?? candidate.statusCode);
+    status = Number.isFinite(statusParsed) ? statusParsed : undefined;
+    code = String(candidate.code || '').trim();
+    body = normalizeText(String(candidate.bodySnippet || '')).slice(0, 200);
+  }
+  const suffix = [
+    typeof status === 'number' ? `status=${status}` : '',
+    code ? `code=${code}` : '',
+    body ? `body=${body}` : '',
+  ]
+    .filter(Boolean)
+    .join(';');
+  return suffix ? `llm-error:${message};${suffix}` : `llm-error:${message}`;
+};
 
 export function buildFatigueFallback(input: FatigueAgentRequest, reason: string): FatigueAgentRunResult {
   const fallback = analyzeFatigueRuleBased(input);
@@ -279,7 +307,6 @@ export async function runFatigueAgent(input: FatigueAgentRequest): Promise<Fatig
       fallbacksUsed: result.fallbacksUsed,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'llm-error';
-    return buildFatigueFallback(input, `llm-error:${message}`);
+    return buildFatigueFallback(input, llmFallbackReason(error));
   }
 }
