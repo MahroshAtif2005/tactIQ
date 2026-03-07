@@ -110,6 +110,7 @@ The current tactIQ web application is deployed using:
 
 ## Project Structure
 
+```text
 tactIQ
 │
 ├── src/                         # React + TypeScript frontend application
@@ -130,6 +131,7 @@ tactIQ
 ├── package.json                 # Project dependencies and scripts
 ├── vite.config.ts               # Vite build configuration
 
+```
 ---
 
 ## Use Cases
@@ -571,20 +573,24 @@ These visualizations allow coaches to make **proactive decisions instead of reac
 
 ## 9. Copilot Context-Aware Chat
 
-After the analysis is generated, coaches can interact with a **Copilot-style AI assistant**.
+After the analysis is generated, coaches can interact with a Copilot-style AI assistant.
 
-The Copilot chat can:
+### The Copilot chat can
 
 - explain why the AI reached a specific recommendation
 - explore alternative tactical scenarios
 - evaluate the risks of ignoring the recommendation
 - analyze match pressure or player workload in more detail
 
-Because the chat has access to the **current analysis context**, responses remain aligned with the tactical situation.
-This conversational layer helps coaches better understand the reasoning behind AI decisions and build confidence in the recommendation.
+### Why the chat remains context-aware
+
+The chat has access to the current analysis context, so responses stay aligned with the tactical situation.
+
+This conversational layer helps coaches understand the reasoning behind AI decisions and build confidence in the recommendation.
+
 ---
 
-## 9. Data Layer (Azure Cosmos DB)
+## 10. Data Layer (Azure Cosmos DB)
 
 tactIQ uses **Azure Cosmos DB** as the persistent data layer for user accounts, team rosters, and player intelligence.
 
@@ -603,7 +609,7 @@ This creates a **user-scoped player intelligence layer**, allowing tactIQ to bui
 
 ---
 
-## 10. Observability (Azure Application Insights)
+## 11. Observability (Azure Application Insights)
 
 tactIQ includes observability to monitor the AI pipeline and system behavior.
 
@@ -619,7 +625,7 @@ This telemetry helps monitor system performance and ensures the multi-agent pipe
 
 ---
 
-## 11. Copilot-Assisted Development & CI/CD
+## 12. Copilot-Assisted Development & CI/CD
 
 tactIQ development is accelerated using AI-assisted tooling and automated deployment workflows.
 
