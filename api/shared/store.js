@@ -10,7 +10,68 @@ try {
 const DEFAULT_DB = 'tactiq-db';
 const DEFAULT_PLAYERS_CONTAINER = 'playersByUser';
 const DEFAULT_USERS_CONTAINER = 'users';
+const DEFAULT_CHAT_CONTAINER = 'copilotChats';
 const VALID_ROLES = new Set(['BAT', 'FAST', 'SPIN', 'AR']);
+
+const COSMOS_ENV_KEYS = {
+  connectionString: [
+    'COSMOS_CONNECTION_STRING',
+    'AZURE_COSMOS_CONNECTION_STRING',
+    'AZURE_COSMOSDB_CONNECTION_STRING',
+  ],
+  endpoint: [
+    'COSMOS_ENDPOINT',
+    'AZURE_COSMOS_ENDPOINT',
+    'AZURE_COSMOSDB_ENDPOINT',
+  ],
+  key: [
+    'COSMOS_KEY',
+    'AZURE_COSMOS_KEY',
+    'AZURE_COSMOS_PRIMARY_KEY',
+    'AZURE_COSMOSDB_KEY',
+  ],
+  database: [
+    'COSMOS_DATABASE',
+    'COSMOS_DB',
+    'AZURE_COSMOS_DATABASE',
+    'COSMOS_DATABASE_NAME',
+    'COSMOS_DATABASE_ID',
+    'COSMOS_DB_NAME',
+  ],
+  playersContainer: [
+    'COSMOS_CONTAINER_PLAYERS',
+    'COSMOS_CONTAINER',
+    'AZURE_COSMOS_CONTAINER',
+    'AZURE_COSMOS_CONTAINER_PLAYERS',
+    'COSMOS_CONTAINER_NAME',
+    'COSMOS_CONTAINER_ID',
+  ],
+  usersContainer: [
+    'COSMOS_CONTAINER_USERS',
+    'AZURE_COSMOS_USERS_CONTAINER',
+    'AZURE_COSMOS_CONTAINER_USERS',
+  ],
+  chatContainer: [
+    'COSMOS_CONTAINER_CHAT',
+    'COSMOS_COPILOT_CHAT_CONTAINER',
+  ],
+};
+
+const REQUIRED_COSMOS_SETTINGS_ENDPOINT_KEY = [
+  'COSMOS_ENDPOINT',
+  'COSMOS_KEY',
+  'COSMOS_DB',
+  'COSMOS_CONTAINER_PLAYERS',
+];
+const REQUIRED_COSMOS_SETTINGS_CONNECTION_STRING = [
+  'COSMOS_CONNECTION_STRING',
+  'COSMOS_DB',
+  'COSMOS_CONTAINER_PLAYERS',
+];
+const OPTIONAL_COSMOS_SETTINGS = [
+  'COSMOS_CONTAINER_USERS',
+  'COSMOS_CONTAINER_CHAT',
+];
 
 const DEFAULT_BASELINES = [
   { id: 'J. Archer', name: 'J. Archer', role: 'FAST', sleep: 7.5, recovery: 45, fatigueLimit: 6, control: 80, speed: 9, power: 0, active: true, inRoster: true, orderIndex: 1 },
@@ -342,43 +403,13 @@ const getIdentity = (req) => {
 };
 
 const getConfig = () => {
-  const connectionStringResolved = resolveEnvValue(
-    'COSMOS_CONNECTION_STRING',
-    'AZURE_COSMOS_CONNECTION_STRING',
-    'AZURE_COSMOSDB_CONNECTION_STRING'
-  );
-  const endpointResolved = resolveEnvValue(
-    'COSMOS_ENDPOINT',
-    'AZURE_COSMOS_ENDPOINT',
-    'AZURE_COSMOSDB_ENDPOINT'
-  );
-  const keyResolved = resolveEnvValue(
-    'COSMOS_KEY',
-    'AZURE_COSMOS_KEY',
-    'AZURE_COSMOS_PRIMARY_KEY',
-    'AZURE_COSMOSDB_KEY'
-  );
-  const databaseResolved = resolveEnvValue(
-    'COSMOS_DATABASE',
-    'COSMOS_DB',
-    'AZURE_COSMOS_DATABASE',
-    'COSMOS_DATABASE_NAME',
-    'COSMOS_DATABASE_ID',
-    'COSMOS_DB_NAME'
-  );
-  const playersContainerResolved = resolveEnvValue(
-    'COSMOS_CONTAINER_PLAYERS',
-    'COSMOS_CONTAINER',
-    'AZURE_COSMOS_CONTAINER',
-    'AZURE_COSMOS_CONTAINER_PLAYERS',
-    'COSMOS_CONTAINER_NAME',
-    'COSMOS_CONTAINER_ID'
-  );
-  const usersContainerResolved = resolveEnvValue(
-    'COSMOS_CONTAINER_USERS',
-    'AZURE_COSMOS_USERS_CONTAINER',
-    'AZURE_COSMOS_CONTAINER_USERS'
-  );
+  const connectionStringResolved = resolveEnvValue(...COSMOS_ENV_KEYS.connectionString);
+  const endpointResolved = resolveEnvValue(...COSMOS_ENV_KEYS.endpoint);
+  const keyResolved = resolveEnvValue(...COSMOS_ENV_KEYS.key);
+  const databaseResolved = resolveEnvValue(...COSMOS_ENV_KEYS.database);
+  const playersContainerResolved = resolveEnvValue(...COSMOS_ENV_KEYS.playersContainer);
+  const usersContainerResolved = resolveEnvValue(...COSMOS_ENV_KEYS.usersContainer);
+  const chatContainerResolved = resolveEnvValue(...COSMOS_ENV_KEYS.chatContainer);
 
   const connectionString = connectionStringResolved.value;
   const endpoint = endpointResolved.value;
@@ -386,6 +417,7 @@ const getConfig = () => {
   const databaseId = databaseResolved.value || DEFAULT_DB;
   const playersContainerId = playersContainerResolved.value || DEFAULT_PLAYERS_CONTAINER;
   const usersContainerId = usersContainerResolved.value || DEFAULT_USERS_CONTAINER;
+  const chatContainerId = chatContainerResolved.value || DEFAULT_CHAT_CONTAINER;
 
   const hasAuth = Boolean(connectionString || (endpoint && key));
   return {
@@ -395,6 +427,7 @@ const getConfig = () => {
     databaseId,
     playersContainerId,
     usersContainerId,
+    chatContainerId,
     hasAuth,
     source: {
       connectionString: connectionStringResolved.source || null,
@@ -403,19 +436,60 @@ const getConfig = () => {
       databaseId: databaseResolved.source || null,
       playersContainerId: playersContainerResolved.source || null,
       usersContainerId: usersContainerResolved.source || null,
+      chatContainerId: chatContainerResolved.source || null,
     },
+  };
+};
+
+const getCosmosConfigReport = (config) => {
+  const usingConnectionString = Boolean(config.connectionString);
+  const authMode = usingConnectionString ? 'connection_string' : config.endpoint || config.key ? 'endpoint_key' : 'unconfigured';
+  const requiredAppSettings = usingConnectionString
+    ? [...REQUIRED_COSMOS_SETTINGS_CONNECTION_STRING]
+    : [...REQUIRED_COSMOS_SETTINGS_ENDPOINT_KEY];
+  const resolvedEnv = {
+    COSMOS_CONNECTION_STRING: Boolean(config.connectionString),
+    COSMOS_ENDPOINT: Boolean(config.endpoint),
+    COSMOS_KEY: Boolean(config.key),
+    COSMOS_DB: Boolean(config.source.databaseId),
+    COSMOS_CONTAINER_PLAYERS: Boolean(config.source.playersContainerId),
+    COSMOS_CONTAINER_USERS: Boolean(config.source.usersContainerId),
+    COSMOS_CONTAINER_CHAT: Boolean(config.source.chatContainerId),
+  };
+  const missingAuthKeys = [];
+  if (!usingConnectionString) {
+    if (!config.endpoint) missingAuthKeys.push('COSMOS_ENDPOINT');
+    if (!config.key) missingAuthKeys.push('COSMOS_KEY');
+  }
+  const missingRequiredAppSettings = requiredAppSettings.filter((key) => resolvedEnv[key] !== true);
+  return {
+    authMode,
+    usingConnectionString,
+    requiredAppSettings,
+    optionalAppSettings: [...OPTIONAL_COSMOS_SETTINGS],
+    resolvedEnv,
+    missingAuthKeys,
+    missingRequiredAppSettings,
   };
 };
 
 const getStorageDiagnostics = () => {
   const config = getConfig();
+  const configReport = getCosmosConfigReport(config);
   return {
     mode: cosmosEnabled ? 'cosmos' : 'memory',
     databaseId: config.databaseId,
     playersContainerId: config.playersContainerId,
     usersContainerId: config.usersContainerId,
+    chatContainerId: config.chatContainerId,
     endpointHost: getEndpointHost(config.endpoint),
     hasCosmosAuth: Boolean(config.hasAuth),
+    authMode: configReport.authMode,
+    requiredAppSettings: configReport.requiredAppSettings,
+    optionalAppSettings: configReport.optionalAppSettings,
+    missingAuthKeys: configReport.missingAuthKeys,
+    missingRequiredAppSettings: configReport.missingRequiredAppSettings,
+    resolvedEnv: configReport.resolvedEnv,
     cosmosClientLoaded: Boolean(CosmosClient),
     initFailure: normalizeId(lastCosmosInitFailure) || null,
     initFailureDetail: lastCosmosInitFailureDetail,
@@ -438,15 +512,21 @@ const logPlayersTrace = (op, detail = {}) => {
   });
 };
 
-const logCosmosConfigOnce = (config) => {
+const logCosmosConfigOnce = (config, configReport) => {
   if (cosmosConfigLogged) return;
   cosmosConfigLogged = true;
   console.log('[functions][cosmos] storage config', {
     database: config.databaseId,
     playersContainer: config.playersContainerId,
     usersContainer: config.usersContainerId,
+    chatContainer: config.chatContainerId,
     endpointHost: getEndpointHost(config.endpoint) || 'n/a',
     hasAuth: Boolean(config.hasAuth),
+    authMode: configReport.authMode,
+    requiredAppSettings: configReport.requiredAppSettings,
+    missingRequiredAppSettings: configReport.missingRequiredAppSettings,
+    missingAuthKeys: configReport.missingAuthKeys,
+    resolvedEnv: configReport.resolvedEnv,
     cosmosClientLoaded: Boolean(CosmosClient),
     source: config.source,
   });
@@ -457,22 +537,48 @@ const getCosmos = async () => {
 
   cosmosPromise = (async () => {
     const config = getConfig();
-    logCosmosConfigOnce(config);
+    const configReport = getCosmosConfigReport(config);
+    logCosmosConfigOnce(config, configReport);
     if (!CosmosClient || !config.hasAuth) {
       cosmosEnabled = false;
       const missingKeys = [];
       if (!CosmosClient) missingKeys.push('@azure/cosmos dependency');
-      if (!config.connectionString && !config.endpoint) missingKeys.push('COSMOS_CONNECTION_STRING|COSMOS_ENDPOINT|AZURE_COSMOS_ENDPOINT');
-      if (!config.connectionString && !config.key) missingKeys.push('COSMOS_KEY|AZURE_COSMOS_KEY');
+      if (!config.hasAuth) missingKeys.push(...configReport.missingAuthKeys);
       lastCosmosInitFailure = !CosmosClient ? 'cosmos_client_unavailable' : 'missing_cosmos_credentials';
+      const error = {
+        code: lastCosmosInitFailure,
+        message: !CosmosClient
+          ? 'Cosmos SDK dependency is unavailable in this runtime.'
+          : 'Missing required Cosmos credentials. Set COSMOS_ENDPOINT + COSMOS_KEY (or COSMOS_CONNECTION_STRING).',
+        missingKeys,
+        missingRequiredAppSettings: configReport.missingRequiredAppSettings,
+        requiredAppSettings: configReport.requiredAppSettings,
+        optionalAppSettings: configReport.optionalAppSettings,
+        authMode: configReport.authMode,
+      };
       lastCosmosInitFailureDetail = {
         reason: lastCosmosInitFailure,
         missingKeys,
+        missingRequiredAppSettings: configReport.missingRequiredAppSettings,
+        requiredAppSettings: configReport.requiredAppSettings,
+        optionalAppSettings: configReport.optionalAppSettings,
+        authMode: configReport.authMode,
+        resolvedEnv: configReport.resolvedEnv,
+        error,
         source: config.source,
       };
+      console.warn('[functions][cosmos] init skipped, using memory fallback', {
+        error,
+        db: config.databaseId,
+        playersContainer: config.playersContainerId,
+        usersContainer: config.usersContainerId,
+        endpointHost: getEndpointHost(config.endpoint) || 'n/a',
+        source: config.source,
+      });
       logPlayersTrace('cosmos.init.skip', {
         reason: lastCosmosInitFailure,
         missingKeys,
+        missingRequiredAppSettings: configReport.missingRequiredAppSettings,
       });
       return null;
     }
@@ -500,14 +606,30 @@ const getCosmos = async () => {
       cosmosEnabled = false;
       const details = toCosmosErrorDetails(error);
       lastCosmosInitFailure = details.message || 'cosmos_init_failed';
+      const errorMeta = {
+        code: 'cosmos_init_failed',
+        message: details.message || 'Cosmos initialization failed.',
+        statusCode: details.statusCode,
+        activityId: details.activityId,
+        requiredAppSettings: configReport.requiredAppSettings,
+        optionalAppSettings: configReport.optionalAppSettings,
+        authMode: configReport.authMode,
+      };
       lastCosmosInitFailureDetail = {
         ...details,
+        error: errorMeta,
+        requiredAppSettings: configReport.requiredAppSettings,
+        optionalAppSettings: configReport.optionalAppSettings,
+        authMode: configReport.authMode,
+        resolvedEnv: configReport.resolvedEnv,
         source: config.source,
       };
       console.error('[functions][cosmos] init failed, using memory fallback', {
         ...details,
+        error: errorMeta,
         db: config.databaseId,
         container: config.playersContainerId,
+        endpointHost: getEndpointHost(config.endpoint) || 'n/a',
       });
       logPlayersTrace('cosmos.init.failed', {
         reason: lastCosmosInitFailure,

@@ -399,6 +399,17 @@
     height: auto;
   }
 
+  .match-over-input::-webkit-outer-spin-button,
+  .match-over-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  .match-over-input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+
   [hidden]:where(:not([hidden="until-found"])) {
     display: none !important;
   }

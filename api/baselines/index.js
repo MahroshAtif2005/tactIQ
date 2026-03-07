@@ -24,6 +24,9 @@ const isDemoRequest = (req) =>
 
 const getStorageResponseMeta = () => {
   const diagnostics = getStorageDiagnostics();
+  const storageError = diagnostics.initFailureDetail && typeof diagnostics.initFailureDetail === 'object'
+    ? diagnostics.initFailureDetail.error || null
+    : null;
   const responseMeta = {
     source: diagnostics.mode,
     storage: {
@@ -31,16 +34,31 @@ const getStorageResponseMeta = () => {
       db: diagnostics.databaseId,
       container: diagnostics.playersContainerId,
       endpointHost: diagnostics.endpointHost || 'n/a',
+      authMode: diagnostics.authMode || null,
+      requiredAppSettings: diagnostics.requiredAppSettings || [],
+      optionalAppSettings: diagnostics.optionalAppSettings || [],
     },
   };
   if (diagnostics.mode === 'memory') {
     const reason = diagnostics.initFailure ? ` (${diagnostics.initFailure})` : '';
+    const missingKeysSuffix =
+      storageError && Array.isArray(storageError.missingKeys) && storageError.missingKeys.length > 0
+        ? ` Missing: ${storageError.missingKeys.join(', ')}.`
+        : '';
     responseMeta.warning =
-      `Cosmos unavailable${reason}. Using in-memory fallback only; data is not persisted to playersByUser.`;
+      `Cosmos unavailable${reason}. Using in-memory fallback only; data is not persisted to playersByUser.${missingKeysSuffix}`;
   }
   if (diagnostics.initFailure) {
     responseMeta.storageInitFailure = diagnostics.initFailure;
     responseMeta.storageInitFailureDetail = diagnostics.initFailureDetail || null;
+    responseMeta.storageError =
+      storageError ||
+      {
+        code: diagnostics.initFailure,
+        message: diagnostics.initFailure,
+        missingKeys: diagnostics.missingAuthKeys || diagnostics.missingRequiredAppSettings || [],
+        requiredAppSettings: diagnostics.requiredAppSettings || [],
+      };
   }
   return responseMeta;
 };

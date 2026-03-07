@@ -8447,7 +8447,10 @@ function Dashboard({
                aria-label="Wickets"
              />
            </span>
-           <span className="flex items-center gap-1.5">
+           <span
+             className="flex items-center gap-1.5"
+             style={{ marginLeft: '-6px', marginRight: '10px' }}
+           >
              OVER
              <input
                type="number"
@@ -8459,12 +8462,21 @@ function Dashboard({
                  const nextBalls = Math.min(totalBalls, oversToBalls(e.target.value));
                  updateMatchState({ ballsBowled: nextBalls });
                }}
-               className="w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+               className="match-over-input w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+               style={{
+                 minWidth: '72px',
+                 padding: '6px 18px',
+                 textAlign: 'center',
+                 display: 'inline-flex',
+                 alignItems: 'center',
+                 justifyContent: 'center',
+                 boxSizing: 'border-box',
+               }}
                aria-label="Current over"
              />
              /
              <span className="w-12 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center">{resolvedTotalOvers}</span>
-             <span className="text-slate-500 ml-2.5">balls</span>
+             <span className="text-slate-500 ml-2.5" style={{ marginLeft: '14px' }}>balls</span>
              <input
                type="number"
                min={0}

@@ -72,7 +72,23 @@ module.exports = async function usersEnsure(context, req) {
         db: postEnsureDiagnostics.databaseId,
         container: postEnsureDiagnostics.playersContainerId,
         endpointHost: postEnsureDiagnostics.endpointHost || 'n/a',
+        authMode: postEnsureDiagnostics.authMode || null,
+        requiredAppSettings: postEnsureDiagnostics.requiredAppSettings || [],
+        optionalAppSettings: postEnsureDiagnostics.optionalAppSettings || [],
       },
+      ...(postEnsureDiagnostics.initFailure
+        ? {
+            storageError:
+              (postEnsureDiagnostics.initFailureDetail && postEnsureDiagnostics.initFailureDetail.error) ||
+              {
+                code: postEnsureDiagnostics.initFailure,
+                message: postEnsureDiagnostics.initFailure,
+                missingKeys:
+                  postEnsureDiagnostics.missingAuthKeys || postEnsureDiagnostics.missingRequiredAppSettings || [],
+                requiredAppSettings: postEnsureDiagnostics.requiredAppSettings || [],
+              },
+          }
+        : {}),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
