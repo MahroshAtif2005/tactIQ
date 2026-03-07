@@ -33,6 +33,7 @@ const getStorageResponseMeta = () => {
       mode: diagnostics.mode,
       db: diagnostics.databaseId,
       container: diagnostics.playersContainerId,
+      requestedContainer: diagnostics.requestedPlayersContainerId || diagnostics.playersContainerId,
       endpointHost: diagnostics.endpointHost || 'n/a',
       authMode: diagnostics.authMode || null,
       requiredAppSettings: diagnostics.requiredAppSettings || [],

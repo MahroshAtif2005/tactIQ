@@ -1,20 +1,10 @@
 import { isDemoModeEnabled } from '../auth/swaAuth';
+import { DEMO_ROSTER_PLAYER_IDS } from '../data/demoRoster';
 
 const ROSTER_STORAGE_KEY = 'tactiq_roster_ids_v1';
 const DEMO_ROSTER_STORAGE_KEY = 'tactiq_demo_players_v1';
 const BASELINE_DRAFT_STORAGE_KEY = 'tactiq_baseline_drafts_v1';
-const DEFAULT_DEMO_ROSTER_IDS = [
-  'J. Archer',
-  'R. Khan',
-  'M. Starc',
-  'H. Ali',
-  'S. Khan',
-  'B. Stokes',
-  'V. Kohli',
-  'B. Azam',
-  'K. Williamson',
-  'G. Maxwell',
-] as const;
+const DEFAULT_DEMO_ROSTER_IDS = [...DEMO_ROSTER_PLAYER_IDS] as const;
 
 const normalizeId = (value: unknown): string => String(value || '').trim();
 const keyOf = (value: string): string => normalizeId(value).toLowerCase();

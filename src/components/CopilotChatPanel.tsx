@@ -294,6 +294,7 @@ export default function CopilotChatPanel({
       }
       const response = await postCopilotChat(basePayload);
       const reply = String(response?.reply || '').trim() || 'No reply returned from Copilot.';
+      const responseMode = String(response?.mode || '').trim().toLowerCase();
       const responseSource = String(response?.source || '').trim().toLowerCase() === 'ai' ? 'ai' : 'fallback';
       const assistantTurn: CopilotTurn = {
         id: nextTurnId(),
@@ -303,7 +304,9 @@ export default function CopilotChatPanel({
       setMessages((prev) => [...prev, assistantTurn]);
       setRuntimeSource(responseSource);
       setRuntimeNote(
-        responseSource === 'fallback'
+        responseMode === 'domain_guard'
+          ? 'Copilot is domain-restricted to match tactics, fatigue, workload, and injury-risk guidance.'
+          : responseSource === 'fallback'
           ? 'Copilot response came from fallback/local mode.'
           : null
       );

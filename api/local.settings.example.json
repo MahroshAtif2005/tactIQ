@@ -30,8 +30,6 @@
     "COSMOS_DATABASE": "tactiq-db",
     "AZURE_COSMOS_DATABASE": "tactiq-db",
     "COSMOS_CONTAINER_PLAYERS": "playersByUser",
-    "COSMOS_CONTAINER": "playersByUser",
-    "AZURE_COSMOS_CONTAINER": "playersByUser",
     "COSMOS_CONTAINER_USERS": "users",
     "CORS": "http://localhost:5173,https://*.azurestaticapps.net",
     "CORSCREDENTIALS": "false",

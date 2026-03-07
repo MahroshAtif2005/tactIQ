@@ -40,11 +40,7 @@ const COSMOS_ENV_KEYS = {
   ],
   playersContainer: [
     'COSMOS_CONTAINER_PLAYERS',
-    'COSMOS_CONTAINER',
-    'AZURE_COSMOS_CONTAINER',
     'AZURE_COSMOS_CONTAINER_PLAYERS',
-    'COSMOS_CONTAINER_NAME',
-    'COSMOS_CONTAINER_ID',
   ],
   usersContainer: [
     'COSMOS_CONTAINER_USERS',
@@ -78,6 +74,15 @@ const DEFAULT_BASELINES = [
   { id: 'R. Khan', name: 'R. Khan', role: 'SPIN', sleep: 7.1, recovery: 40, fatigueLimit: 6, control: 86, speed: 8, power: 0, active: true, inRoster: true, orderIndex: 2 },
   { id: 'M. Starc', name: 'M. Starc', role: 'FAST', sleep: 6.8, recovery: 50, fatigueLimit: 6, control: 79, speed: 9, power: 0, active: true, inRoster: true, orderIndex: 3 },
 ];
+
+const BASELINE_LIMITS = {
+  sleep: { min: 0, max: 12 },
+  recovery: { min: 0, max: 120 },
+  fatigueLimit: { min: 0, max: 10 },
+  control: { min: 0, max: 100 },
+  speed: { min: 0, max: 15 },
+  power: { min: 0, max: 10 },
+};
 
 const memoryUsers = new Map();
 const memoryBaselinesByUser = new Map();
@@ -213,26 +218,100 @@ const getJwtClaim = (payload, ...keys) => {
   return '';
 };
 
+const normalizeNameKey = (value) => normalizeId(value).toLowerCase();
+
+const toLookupTokens = (value) => {
+  const tokens = new Set();
+  if (!value || typeof value !== 'object') return tokens;
+  const add = (entry) => {
+    const normalized = normalizeId(entry);
+    if (!normalized) return;
+    tokens.add(normalized);
+    tokens.add(normalized.toLowerCase());
+  };
+  add(value.id);
+  add(value.playerId);
+  add(value.baselineId);
+  add(value.name);
+  return tokens;
+};
+
+const getIncomingStableId = (record, existingRecord) => {
+  const existingId = normalizeId(existingRecord && existingRecord.id);
+  if (existingId) return existingId;
+  const incomingId = normalizeId(record && (record.id || record.playerId));
+  if (incomingId) return incomingId;
+  return randomUUID();
+};
+
 const normalizeBaseline = (raw, scope = {}, existing = null) => {
   const record = raw && typeof raw === 'object' ? raw : {};
-  const baselineId = normalizeId(record.id || record.playerId || record.baselineId || record.name);
-  if (!baselineId) return null;
-  const now = new Date().toISOString();
   const existingRecord = existing && typeof existing === 'object' ? existing : {};
+  const name = String(
+    record.name ||
+    existingRecord.name ||
+    record.baselineId ||
+    record.playerId ||
+    existingRecord.baselineId ||
+    existingRecord.playerId ||
+    ''
+  ).trim();
+  if (!name) return null;
+  const stableId = getIncomingStableId(record, existingRecord);
+  const legacyBaselineId = normalizeId(
+    record.baselineId || existingRecord.baselineId || existingRecord.playerId || existingRecord.name || name
+  );
+  const now = new Date().toISOString();
 
-  const sleep = parseNumber(record.sleep ?? record.sleepHoursToday, parseNumber(existingRecord.sleep, 7, 0, 12), 0, 12);
-  const recovery = parseNumber(record.recovery ?? record.recoveryMinutes, parseNumber(existingRecord.recovery, 45, 0, 240), 0, 240);
-  const fatigueLimit = parseNumber(record.fatigueLimit, parseNumber(existingRecord.fatigueLimit, 6, 0, 10), 0, 10);
-  const control = parseNumber(record.control ?? record.controlBaseline, parseNumber(existingRecord.control, 78, 0, 100), 0, 100);
-  const speed = parseNumber(record.speed, parseNumber(existingRecord.speed, 7, 0, 100), 0, 100);
-  const power = parseNumber(record.power, parseNumber(existingRecord.power, 0, 0, 100), 0, 100);
+  const sleep = parseNumber(
+    record.sleep ?? record.sleepHoursToday,
+    parseNumber(existingRecord.sleep, 7, BASELINE_LIMITS.sleep.min, BASELINE_LIMITS.sleep.max),
+    BASELINE_LIMITS.sleep.min,
+    BASELINE_LIMITS.sleep.max
+  );
+  const recovery = parseNumber(
+    record.recovery ?? record.recoveryMinutes,
+    parseNumber(existingRecord.recovery, 45, BASELINE_LIMITS.recovery.min, BASELINE_LIMITS.recovery.max),
+    BASELINE_LIMITS.recovery.min,
+    BASELINE_LIMITS.recovery.max
+  );
+  const fatigueLimit = parseNumber(
+    record.fatigueLimit,
+    parseNumber(
+      existingRecord.fatigueLimit,
+      6,
+      BASELINE_LIMITS.fatigueLimit.min,
+      BASELINE_LIMITS.fatigueLimit.max
+    ),
+    BASELINE_LIMITS.fatigueLimit.min,
+    BASELINE_LIMITS.fatigueLimit.max
+  );
+  const control = parseNumber(
+    record.control ?? record.controlBaseline,
+    parseNumber(existingRecord.control, 78, BASELINE_LIMITS.control.min, BASELINE_LIMITS.control.max),
+    BASELINE_LIMITS.control.min,
+    BASELINE_LIMITS.control.max
+  );
+  const speed = parseNumber(
+    record.speed,
+    parseNumber(existingRecord.speed, 7, BASELINE_LIMITS.speed.min, BASELINE_LIMITS.speed.max),
+    BASELINE_LIMITS.speed.min,
+    BASELINE_LIMITS.speed.max
+  );
+  const power = parseNumber(
+    record.power,
+    parseNumber(existingRecord.power, 0, BASELINE_LIMITS.power.min, BASELINE_LIMITS.power.max),
+    BASELINE_LIMITS.power.min,
+    BASELINE_LIMITS.power.max
+  );
   const orderIndexRaw = Number(record.orderIndex ?? existingRecord.orderIndex ?? 0);
 
   return {
-    id: normalizeId(existingRecord.id) || randomUUID(),
-    baselineId,
-    playerId: baselineId,
-    name: String(record.name || existingRecord.name || baselineId).trim() || baselineId,
+    id: stableId,
+    baselineId: legacyBaselineId || stableId,
+    playerId: stableId,
+    name,
+    nameKey: normalizeNameKey(name),
     role: normalizeRole(record.role || existingRecord.role),
     sleep,
     recovery,
@@ -259,11 +338,11 @@ const baselineForClient = (doc) => {
     teamId: normalizeId(doc && doc.teamId),
   }, doc);
   if (!normalized) return null;
-  const baselineId = normalized.baselineId;
+  const stableId = normalizeId(normalized.id || normalized.playerId);
   return {
-    id: baselineId,
-    baselineId,
-    playerId: baselineId,
+    id: stableId,
+    baselineId: normalized.baselineId,
+    playerId: stableId,
     name: normalized.name,
     role: normalized.role,
     sleep: normalized.sleep,
@@ -415,7 +494,8 @@ const getConfig = () => {
   const endpoint = endpointResolved.value;
   const key = keyResolved.value;
   const databaseId = databaseResolved.value || DEFAULT_DB;
-  const playersContainerId = playersContainerResolved.value || DEFAULT_PLAYERS_CONTAINER;
+  const requestedPlayersContainerId = playersContainerResolved.value || DEFAULT_PLAYERS_CONTAINER;
+  const playersContainerId = DEFAULT_PLAYERS_CONTAINER;
   const usersContainerId = usersContainerResolved.value || DEFAULT_USERS_CONTAINER;
   const chatContainerId = chatContainerResolved.value || DEFAULT_CHAT_CONTAINER;
 
@@ -438,6 +518,10 @@ const getConfig = () => {
       usersContainerId: usersContainerResolved.source || null,
       chatContainerId: chatContainerResolved.source || null,
     },
+    requestedPlayersContainerId:
+      requestedPlayersContainerId && requestedPlayersContainerId !== DEFAULT_PLAYERS_CONTAINER
+        ? requestedPlayersContainerId
+        : null,
   };
 };
 
@@ -470,6 +554,7 @@ const getCosmosConfigReport = (config) => {
     resolvedEnv,
     missingAuthKeys,
     missingRequiredAppSettings,
+    requestedPlayersContainerId: config.requestedPlayersContainerId,
   };
 };
 
@@ -494,6 +579,7 @@ const getStorageDiagnostics = () => {
     initFailure: normalizeId(lastCosmosInitFailure) || null,
     initFailureDetail: lastCosmosInitFailureDetail,
     configSource: config.source,
+    requestedPlayersContainerId: config.requestedPlayersContainerId,
   };
 };
 
@@ -515,6 +601,12 @@ const logPlayersTrace = (op, detail = {}) => {
 const logCosmosConfigOnce = (config, configReport) => {
   if (cosmosConfigLogged) return;
   cosmosConfigLogged = true;
+  if (config.requestedPlayersContainerId) {
+    console.warn('[functions][cosmos] ignoring non-standard players container override', {
+      requested: config.requestedPlayersContainerId,
+      enforced: DEFAULT_PLAYERS_CONTAINER,
+    });
+  }
   console.log('[functions][cosmos] storage config', {
     database: config.databaseId,
     playersContainer: config.playersContainerId,
@@ -529,6 +621,7 @@ const logCosmosConfigOnce = (config, configReport) => {
     resolvedEnv: configReport.resolvedEnv,
     cosmosClientLoaded: Boolean(CosmosClient),
     source: config.source,
+    requestedPlayersContainerId: config.requestedPlayersContainerId,
   });
 };
 
@@ -651,6 +744,71 @@ const sortBaselines = (rows) => {
     .map((entry) => entry.row);
 };
 
+const pickMoreRecentDoc = (current, candidate) => {
+  if (!current) return candidate;
+  const currentUpdated = Date.parse(String(current.updatedAt || current.createdAt || ''));
+  const candidateUpdated = Date.parse(String(candidate.updatedAt || candidate.createdAt || ''));
+  if (Number.isFinite(candidateUpdated) && Number.isFinite(currentUpdated)) {
+    return candidateUpdated >= currentUpdated ? candidate : current;
+  }
+  if (Number.isFinite(candidateUpdated)) return candidate;
+  return current;
+};
+
+const dedupeBaselineDocsForUser = (docs, userId) => {
+  const byNameAndRole = new Map();
+  const duplicateGroups = new Map();
+  for (const doc of docs) {
+    const normalized = normalizeBaseline(doc, { userId: normalizeId(userId) }, doc);
+    if (!normalized) continue;
+    const nameRoleKey = `${normalizeNameKey(normalized.name)}|${normalizeId(normalized.role).toLowerCase()}`;
+    const existingByName = byNameAndRole.get(nameRoleKey);
+    if (existingByName) {
+      const key = `name:${nameRoleKey}`;
+      const list = duplicateGroups.get(key) || [];
+      list.push(summarizeBaselineDocForLog(doc));
+      duplicateGroups.set(key, list);
+    }
+    byNameAndRole.set(nameRoleKey, pickMoreRecentDoc(existingByName, doc));
+  }
+
+  const dedupedDocs = [...byNameAndRole.values()];
+  const duplicateKeys = [...duplicateGroups.keys()];
+  if (duplicateKeys.length > 0) {
+    logPlayersTrace('baselines.duplicates.detected', {
+      userId: normalizeId(userId),
+      duplicateKeys,
+      duplicateCount: duplicateKeys.length,
+      sample: duplicateGroups.get(duplicateKeys[0]) || [],
+    });
+  }
+  return dedupedDocs;
+};
+
+const buildExistingBaselineIndexes = (docs = []) => {
+  const byStableId = new Map();
+  const byLookupToken = new Map();
+  const byName = new Map();
+  const byNameAndRole = new Map();
+
+  docs.forEach((doc) => {
+    if (!doc || typeof doc !== 'object') return;
+    const stableId = normalizeId(doc.id);
+    if (stableId) byStableId.set(stableId, doc);
+    toLookupTokens(doc).forEach((token) => {
+      byLookupToken.set(token, doc);
+    });
+    const nameKey = normalizeNameKey(doc.name);
+    if (nameKey) byName.set(nameKey, doc);
+    const roleToken = normalizeId(doc.role).toLowerCase();
+    if (nameKey && roleToken) {
+      byNameAndRole.set(`${nameKey}|${roleToken}`, doc);
+    }
+  });
+
+  return { byStableId, byLookupToken, byName, byNameAndRole };
+};
+
 const getMemoryBaselines = (userId) => {
   const key = normalizeId(userId);
   if (!memoryBaselinesByUser.has(key)) {
@@ -759,7 +917,8 @@ const queryBaselinesByScope = async ({ userId, teamId }) => {
 
 const listBaselines = async ({ userId, teamId }) => {
   const docs = await queryBaselinesByScope({ userId, teamId });
-  const normalized = docs
+  const dedupedDocs = dedupeBaselineDocsForUser(docs, userId);
+  const normalized = dedupedDocs
     .map((doc) => baselineForClient(doc))
     .filter(Boolean);
   return sortBaselines(normalized);
@@ -903,30 +1062,54 @@ const saveBaselines = async ({ userId, teamId, userEmail, payload }) => {
 
   const cosmos = await getCosmos();
   if (!cosmos) {
-    const map = new Map();
-    for (const row of getMemoryBaselines(scopedUserId)) {
-      map.set(normalizeId(row.id).toLowerCase(), { ...row });
-    }
+    const existingRows = getMemoryBaselines(scopedUserId).map((row) => ({ ...row }));
+    const existingIndexes = buildExistingBaselineIndexes(existingRows);
+    const map = new Map(existingRows.map((row) => [normalizeId(row.id), row]));
+    let insertedCount = 0;
+    let updatedCount = 0;
     for (const incoming of items) {
-      const existing = map.get(normalizeId(incoming && (incoming.id || incoming.playerId || incoming.name)).toLowerCase()) || null;
+      const incomingRecord = incoming && typeof incoming === 'object' ? incoming : {};
+      const incomingId = normalizeId(incomingRecord.id || incomingRecord.playerId);
+      const incomingName = normalizeNameKey(incomingRecord.name);
+      const incomingRoleToken = normalizeId(incomingRecord.role).toLowerCase();
+      const lookupToken = normalizeId(incomingRecord.baselineId || incomingRecord.name || incomingId);
+      const existing =
+        existingIndexes.byStableId.get(incomingId) ||
+        existingIndexes.byLookupToken.get(lookupToken) ||
+        existingIndexes.byNameAndRole.get(`${incomingName}|${incomingRoleToken}`) ||
+        existingIndexes.byName.get(incomingName) ||
+        null;
       const normalized = normalizeBaseline(
-        incoming,
+        incomingRecord,
         { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
         existing
       );
       if (!normalized) continue;
-      map.set(normalizeId(normalized.baselineId).toLowerCase(), {
-        ...normalized,
-        id: normalized.baselineId,
-      });
+      const stableId = normalizeId(normalized.id);
+      const wasExisting = Boolean(existing);
+      if (wasExisting) {
+        updatedCount += 1;
+      } else {
+        insertedCount += 1;
+      }
+      map.set(stableId, normalized);
+      existingIndexes.byStableId.set(stableId, normalized);
+      toLookupTokens(normalized).forEach((token) => existingIndexes.byLookupToken.set(token, normalized));
+      existingIndexes.byName.set(normalizeNameKey(normalized.name), normalized);
+      existingIndexes.byNameAndRole.set(
+        `${normalizeNameKey(normalized.name)}|${normalizeId(normalized.role).toLowerCase()}`,
+        normalized
+      );
     }
-    const savedRows = [...map.values()].map((row) => ({ ...row, id: row.baselineId }));
+    const savedRows = [...map.values()];
     memoryBaselinesByUser.set(scopedUserId, sortBaselines(savedRows));
     logPlayersTrace('baselines.save.memory', {
       userId: scopedUserId,
       teamId: normalizeId(teamId),
       incomingCount: items.length,
       savedCount: savedRows.length,
+      insertedCount,
+      updatedCount,
       sampleDoc: summarizeBaselineDocForLog(savedRows[0] || null),
     });
     logPlayersWriteVerification('save.memory', scopedUserId, savedRows.length);
@@ -934,27 +1117,27 @@ const saveBaselines = async ({ userId, teamId, userEmail, payload }) => {
   }
 
   const { playersContainer } = cosmos;
+  const existingRows = await getTeamBaselineDocs({ userId: scopedUserId, teamId });
+  const existingIndexes = buildExistingBaselineIndexes(existingRows);
   const now = new Date().toISOString();
   let upsertedCount = 0;
+  let insertedCount = 0;
+  let updatedCount = 0;
   let sampleSavedDoc = null;
   for (const incoming of items) {
-    const incomingId = normalizeId(incoming && (incoming.id || incoming.playerId || incoming.baselineId || incoming.name));
-    if (!incomingId) continue;
-
-    const existingQuery = await playersContainer.items
-      .query({
-        query: 'SELECT TOP 1 * FROM c WHERE c.type = @type AND c.userId = @userId AND (c.baselineId = @id OR c.playerId = @id OR c.name = @id)',
-        parameters: [
-          { name: '@type', value: 'playerBaseline' },
-          { name: '@userId', value: scopedUserId },
-          { name: '@id', value: incomingId },
-        ],
-      }, { partitionKey: scopedUserId })
-      .fetchAll();
-
-    const existing = Array.isArray(existingQuery.resources) ? existingQuery.resources[0] : null;
+    const incomingRecord = incoming && typeof incoming === 'object' ? incoming : {};
+    const incomingId = normalizeId(incomingRecord.id || incomingRecord.playerId);
+    const incomingName = normalizeNameKey(incomingRecord.name);
+    const incomingRoleToken = normalizeId(incomingRecord.role).toLowerCase();
+    const lookupToken = normalizeId(incomingRecord.baselineId || incomingRecord.name || incomingId);
+    const existing =
+      existingIndexes.byStableId.get(incomingId) ||
+      existingIndexes.byLookupToken.get(lookupToken) ||
+      existingIndexes.byNameAndRole.get(`${incomingName}|${incomingRoleToken}`) ||
+      existingIndexes.byName.get(incomingName) ||
+      null;
     const normalized = normalizeBaseline(
-      { ...incoming, updatedAt: now },
+      { ...incomingRecord, updatedAt: now },
       { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
       existing
     );
@@ -965,6 +1148,19 @@ const saveBaselines = async ({ userId, teamId, userEmail, payload }) => {
     });
     if (!sampleSavedDoc) sampleSavedDoc = summarizeBaselineDocForLog(normalized);
     upsertedCount += 1;
+    if (existing) {
+      updatedCount += 1;
+    } else {
+      insertedCount += 1;
+    }
+    const stableId = normalizeId(normalized.id);
+    existingIndexes.byStableId.set(stableId, normalized);
+    toLookupTokens(normalized).forEach((token) => existingIndexes.byLookupToken.set(token, normalized));
+    existingIndexes.byName.set(normalizeNameKey(normalized.name), normalized);
+    existingIndexes.byNameAndRole.set(
+      `${normalizeNameKey(normalized.name)}|${normalizeId(normalized.role).toLowerCase()}`,
+      normalized
+    );
   }
 
   logPlayersTrace('baselines.save.cosmos', {
@@ -972,6 +1168,8 @@ const saveBaselines = async ({ userId, teamId, userEmail, payload }) => {
     teamId: normalizeId(teamId),
     incomingCount: items.length,
     upsertedCount,
+    insertedCount,
+    updatedCount,
     sampleDoc: sampleSavedDoc,
   });
   logPlayersWriteVerification('save.cosmos', scopedUserId, upsertedCount);
@@ -995,14 +1193,20 @@ const replaceBaselines = async ({ userId, teamId, userEmail, payload }) => {
 
   const cosmos = await getCosmos();
   if (!cosmos) {
+    const existingRows = getMemoryBaselines(scopedUserId).map((row) => ({ ...row }));
+    const existingIndexes = buildExistingBaselineIndexes(existingRows);
     const nextRows = items
       .map((incoming, index) => normalizeBaseline(
         { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1 },
         { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
-        null
+        existingIndexes.byStableId.get(normalizeId(incoming?.id || incoming?.playerId))
+          || existingIndexes.byLookupToken.get(normalizeId(incoming?.baselineId || incoming?.name))
+          || existingIndexes.byNameAndRole.get(`${normalizeNameKey(incoming?.name)}|${normalizeId(incoming?.role).toLowerCase()}`)
+          || existingIndexes.byName.get(normalizeNameKey(incoming?.name))
+          || null
       ))
       .filter(Boolean)
-      .map((row) => ({ ...row, id: row.baselineId }));
+      .map((row) => ({ ...row }));
     memoryBaselinesByUser.set(scopedUserId, sortBaselines(nextRows));
     logPlayersTrace('baselines.replace.memory', {
       userId: scopedUserId,
@@ -1024,14 +1228,22 @@ const replaceBaselines = async ({ userId, teamId, userEmail, payload }) => {
   }
 
   const now = new Date().toISOString();
+  const existingIndexes = buildExistingBaselineIndexes(existingRows);
   let upsertedCount = 0;
   let sampleSavedDoc = null;
   for (let index = 0; index < items.length; index += 1) {
     const incoming = items[index];
+    const incomingRecord = incoming && typeof incoming === 'object' ? incoming : {};
+    const existing =
+      existingIndexes.byStableId.get(normalizeId(incomingRecord.id || incomingRecord.playerId))
+      || existingIndexes.byLookupToken.get(normalizeId(incomingRecord.baselineId || incomingRecord.name))
+      || existingIndexes.byNameAndRole.get(`${normalizeNameKey(incomingRecord.name)}|${normalizeId(incomingRecord.role).toLowerCase()}`)
+      || existingIndexes.byName.get(normalizeNameKey(incomingRecord.name))
+      || null;
     const normalized = normalizeBaseline(
-      { ...(incoming && typeof incoming === 'object' ? incoming : {}), orderIndex: incoming?.orderIndex ?? index + 1, updatedAt: now },
+      { ...incomingRecord, orderIndex: incomingRecord.orderIndex ?? index + 1, updatedAt: now },
       { userId: scopedUserId, userKey: scopedUserId, userEmail, teamId },
-      null
+      existing
     );
     if (!normalized) continue;
     await playersContainer.items.upsert(normalized, { partitionKey: scopedUserId });

@@ -23,7 +23,8 @@ import {
   UserMinus,
   Cpu,
   HelpCircle,
-  Info
+  Info,
+  User
 } from 'lucide-react';
 import { motion, AnimatePresence, useMotionValue, useSpring, useTransform, useMotionTemplate } from 'motion/react';
 import {
@@ -889,22 +890,59 @@ const baselineRoleToPlayerRole = (role: BaselineRole): Player['role'] => {
   return 'All-rounder';
 };
 
+const BASELINE_METRIC_LIMITS = {
+  sleep: { min: 0, max: 12 },
+  recovery: { min: 0, max: 120 },
+  fatigueLimit: { min: 0, max: 10 },
+  control: { min: 0, max: 100 },
+  speed: { min: 0, max: 15 },
+  power: { min: 0, max: 10 },
+} as const;
+
 const normalizeBaselineRecord = (baseline: Partial<Baseline>): Baseline => ({
-  id: normalizeBaselineId(baseline.id || baseline.playerId || baseline.name),
-  playerId: normalizeBaselineId(baseline.playerId || baseline.id || baseline.name),
+  id: normalizeBaselineId(baseline.id || baseline.playerId || baseline.baselineId || baseline.name),
+  playerId: normalizeBaselineId(baseline.playerId || baseline.id || baseline.baselineId || baseline.name),
   name: String(baseline.name || baseline.id || baseline.playerId || 'Unknown Player').trim() || 'Unknown Player',
   role: baseline.role,
   isActive: baseline.isActive ?? baseline.active ?? true,
   inRoster: Boolean((baseline as Baseline).inRoster),
-  sleepHoursToday: clamp(safeNum(baseline.sleepHoursToday ?? baseline.sleep, 7), 0, 12),
-  recoveryMinutes: clamp(safeNum(baseline.recoveryMinutes ?? baseline.recovery, 45), 0, 240),
-  fatigueLimit: clamp(safeNum(baseline.fatigueLimit, 6), 0, 10),
-  controlBaseline: clamp(safeNum(baseline.controlBaseline ?? baseline.control, 78), 0, 100),
-  speed: clamp(safeNum(baseline.speed, 7), 0, 100),
-  power: clamp(safeNum(baseline.power, 6), 0, 100),
-  sleep: clamp(safeNum(baseline.sleep ?? baseline.sleepHoursToday, 7), 0, 12),
-  recovery: clamp(safeNum(baseline.recovery ?? baseline.recoveryMinutes, 45), 0, 240),
-  control: clamp(safeNum(baseline.control ?? baseline.controlBaseline, 78), 0, 100),
+  sleepHoursToday: clamp(
+    safeNum(baseline.sleepHoursToday ?? baseline.sleep, 7),
+    BASELINE_METRIC_LIMITS.sleep.min,
+    BASELINE_METRIC_LIMITS.sleep.max
+  ),
+  recoveryMinutes: clamp(
+    safeNum(baseline.recoveryMinutes ?? baseline.recovery, 45),
+    BASELINE_METRIC_LIMITS.recovery.min,
+    BASELINE_METRIC_LIMITS.recovery.max
+  ),
+  fatigueLimit: clamp(
+    safeNum(baseline.fatigueLimit, 6),
+    BASELINE_METRIC_LIMITS.fatigueLimit.min,
+    BASELINE_METRIC_LIMITS.fatigueLimit.max
+  ),
+  controlBaseline: clamp(
+    safeNum(baseline.controlBaseline ?? baseline.control, 78),
+    BASELINE_METRIC_LIMITS.control.min,
+    BASELINE_METRIC_LIMITS.control.max
+  ),
+  speed: clamp(safeNum(baseline.speed, 7), BASELINE_METRIC_LIMITS.speed.min, BASELINE_METRIC_LIMITS.speed.max),
+  power: clamp(safeNum(baseline.power, 6), BASELINE_METRIC_LIMITS.power.min, BASELINE_METRIC_LIMITS.power.max),
+  sleep: clamp(
+    safeNum(baseline.sleep ?? baseline.sleepHoursToday, 7),
+    BASELINE_METRIC_LIMITS.sleep.min,
+    BASELINE_METRIC_LIMITS.sleep.max
+  ),
+  recovery: clamp(
+    safeNum(baseline.recovery ?? baseline.recoveryMinutes, 45),
+    BASELINE_METRIC_LIMITS.recovery.min,
+    BASELINE_METRIC_LIMITS.recovery.max
+  ),
+  control: clamp(
+    safeNum(baseline.control ?? baseline.controlBaseline, 78),
+    BASELINE_METRIC_LIMITS.control.min,
+    BASELINE_METRIC_LIMITS.control.max
+  ),
   active: baseline.active ?? baseline.isActive ?? true,
   orderIndex: Math.max(0, Math.floor(safeNum(baseline.orderIndex, 0))),
   createdAt: baseline.createdAt,
@@ -1269,9 +1307,14 @@ const resolveRosterIdsFromBaselines = (candidateIds: string[], baselines: Baseli
   const activeIdByKey = new Map<string, string>();
   ordered.forEach((row) => {
     const canonicalId = normalizeBaselineId(row.id || row.playerId || row.name);
-    const key = baselineKey(canonicalId);
-    if (!key || activeIdByKey.has(key)) return;
-    activeIdByKey.set(key, canonicalId);
+    const idKey = baselineKey(canonicalId);
+    const nameKey = baselineKey(row.name);
+    if (idKey && !activeIdByKey.has(idKey)) {
+      activeIdByKey.set(idKey, canonicalId);
+    }
+    if (nameKey && !activeIdByKey.has(nameKey)) {
+      activeIdByKey.set(nameKey, canonicalId);
+    }
   });
 
   const seen = new Set<string>();
@@ -1491,6 +1534,8 @@ const COPILOT_ANALYSIS_TTL_MS = 2 * 60 * 60 * 1000;
 
 const readDemoSessionFlag = (): boolean => {
   if (typeof window === 'undefined') return false;
+  const currentPath = String(window.location.pathname || '').trim();
+  if (isDemoPath(currentPath)) return true;
   try {
     const raw = String(window.sessionStorage.getItem(DEMO_SESSION_STORAGE_KEY) || '').trim().toLowerCase();
     if (raw === 'true') return true;
@@ -1499,6 +1544,28 @@ const readDemoSessionFlag = (): boolean => {
     // Ignore storage read failures.
   }
   return isDemoModeEnabled();
+};
+
+const readDemoRosterIdsForBootstrap = (): string[] => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(DEMO_ROSTER_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    const resolved: string[] = [];
+    parsed.forEach((entry) => {
+      const normalized = normalizeBaselineId(entry);
+      const key = baselineKey(normalized);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      resolved.push(normalized);
+    });
+    return resolved;
+  } catch {
+    return [];
+  }
 };
 
 const persistDemoSessionFlag = (enabled: boolean): void => {
@@ -1520,6 +1587,40 @@ export default function App() {
   const initialStoredMatchMode = useMemo(() => readStoredMatchMode(), []);
   const initialPath = useMemo(() => (typeof window === 'undefined' ? '/' : String(window.location.pathname || '')), []);
   const initialDemoMode = useMemo(() => readDemoSessionFlag(), []);
+  const initialDemoBootstrap = useMemo(() => {
+    if (!initialDemoMode) {
+      return {
+        baselines: [] as Baseline[],
+        rosterIds: [] as string[],
+        players: [] as Player[],
+        activePlayerId: '',
+      };
+    }
+
+    const seededBaselines = orderBaselinesForDisplay(ensureDemoBaselinesSeeded());
+    const rosterFromBaselines = seededBaselines
+      .map((row) => normalizeBaselineRecord(row))
+      .filter((row) => row.inRoster === true)
+      .map((row) => normalizeBaselineId(row.id || row.playerId || row.name));
+    const persistedRosterIds = readDemoRosterIdsForBootstrap();
+    const resolvedRosterIds = resolveRosterIdsFromBaselines(
+      persistedRosterIds.length > 0 ? persistedRosterIds : rosterFromBaselines,
+      seededBaselines
+    );
+    const seededPlayers = hydrateDismissalStateFromSession(
+      buildRosterPlayersFromBaselines([], seededBaselines, resolvedRosterIds)
+    );
+    const persistedActiveId = readStoredActivePlayerId();
+    const activePlayerId = seededPlayers.find((player) => player.id === persistedActiveId)?.id
+      || seededPlayers[0]?.id
+      || '';
+    return {
+      baselines: seededBaselines,
+      rosterIds: resolvedRosterIds,
+      players: seededPlayers,
+      activePlayerId,
+    };
+  }, [initialDemoMode]);
   const isAuthPathOnLoad = useMemo(() => {
     return isAuthPath(initialPath);
   }, [initialPath]);
@@ -1556,8 +1657,10 @@ export default function App() {
     ballsBowled: 56,
     wickets: 3
   });
-  const [players, setPlayers] = useState<Player[]>([]);
-  const [activePlayerId, setActivePlayerId] = useState<string>(() => readStoredActivePlayerId());
+  const [players, setPlayers] = useState<Player[]>(() => initialDemoBootstrap.players);
+  const [activePlayerId, setActivePlayerId] = useState<string>(
+    () => initialDemoBootstrap.activePlayerId || readStoredActivePlayerId()
+  );
   const [agentState, setAgentState] = useState<'idle' | 'thinking' | 'done' | 'offline' | 'invalid'>('idle');
   const [runMode, setRunMode] = useState<RunMode>('auto');
   const [agentWarning, setAgentWarning] = useState<string | null>(null);
@@ -1584,14 +1687,16 @@ export default function App() {
   const [baselineSource, setBaselineSource] = useState<'cosmos' | 'fallback'>('fallback');
   const [baselineWarning, setBaselineWarning] = useState<string | null>(null);
   const [rosterMutationError, setRosterMutationError] = useState<string | null>(null);
-  const [workingBaselines, setWorkingBaselines] = useState<Baseline[]>([]);
-  const [matchRosterIds, setMatchRosterIds] = useState<string[]>(() => getRosterIds());
-  const [isLoadingRosterPlayers, setIsLoadingRosterPlayers] = useState(true);
+  const [workingBaselines, setWorkingBaselines] = useState<Baseline[]>(() => initialDemoBootstrap.baselines);
+  const [matchRosterIds, setMatchRosterIds] = useState<string[]>(() => initialDemoBootstrap.rosterIds);
+  const [isLoadingRosterPlayers, setIsLoadingRosterPlayers] = useState<boolean>(() => !initialDemoMode);
   const rosterLoadRequestIdRef = useRef(0);
   const rosterInitializedRef = useRef(false);
   const matchRosterIdsRef = useRef<string[]>([]);
   const teamModeLockedRef = useRef(Boolean(initialStoredMatchMode));
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [isProfileTriggerHovered, setIsProfileTriggerHovered] = useState(false);
+  const [isProfileActionHovered, setIsProfileActionHovered] = useState(false);
   const profileMenuRef = useRef<HTMLDivElement | null>(null);
   const fatigueRequestSeq = useRef(0);
   const fatigueAbortRef = useRef<AbortController | null>(null);
@@ -1731,6 +1836,12 @@ export default function App() {
   }, [isProfileOpen]);
 
   useEffect(() => {
+    if (isProfileOpen) return;
+    setIsProfileTriggerHovered(false);
+    setIsProfileActionHovered(false);
+  }, [isProfileOpen]);
+
+  useEffect(() => {
     logSessionDebug('state_change');
   }, [logSessionDebug]);
 
@@ -1754,6 +1865,8 @@ export default function App() {
     }
 
     if (sessionMode === 'demo') {
+      setDemoModeEnabled(true);
+      persistDemoSessionFlag(true);
       ensureDemoBaselinesSeeded();
       if (!onDemoPath) {
         window.history.replaceState(null, '', '/demo');
@@ -1981,9 +2094,15 @@ export default function App() {
     const applyBaselinesToRoster = (rows: Baseline[], reason: 'mount' | 'event') => {
       const orderedRows = orderBaselinesForDisplay(rows);
       const previousRosterIds = matchRosterIdsRef.current;
+      const rosterIdsFromBaselines = orderedRows
+        .map((row) => normalizeBaselineRecord(row))
+        .filter((row) => row.inRoster === true)
+        .map((row) => normalizeBaselineId(row.id || row.playerId || row.name));
       const baseRosterIds = rosterInitializedRef.current
         ? previousRosterIds
-        : getRosterIds();
+        : isDemoSession
+          ? getRosterIds()
+          : rosterIdsFromBaselines;
       const resolvedIds = resolveRosterIdsFromBaselines(baseRosterIds, orderedRows);
       const rosterIdSet = new Set(resolvedIds.map((id) => baselineKey(id)));
       const syncedBaselines = orderedRows.map((row) => {
@@ -2020,7 +2139,9 @@ export default function App() {
     const loadFromBackend = async (reason: 'mount' | 'event') => {
       const requestId = rosterLoadRequestIdRef.current + 1;
       rosterLoadRequestIdRef.current = requestId;
-      setIsLoadingRosterPlayers(true);
+      if (!isDemoSession) {
+        setIsLoadingRosterPlayers(true);
+      }
       if (import.meta.env.DEV) {
         console.log('[roster-sync] fetch start', { requestId, reason });
       }
@@ -2073,7 +2194,7 @@ export default function App() {
     return () => {
       window.removeEventListener(BASELINES_CHANGED_EVENT, handleLocalEvent);
     };
-  }, [isAppUnlocked]);
+  }, [isAppUnlocked, isDemoSession]);
 
   useEffect(() => {
     const next = new Map(baselineCacheRef.current);
@@ -2439,9 +2560,11 @@ export default function App() {
 
   const applyMatchRosterIds = useCallback((nextIdsInput: string[]): string[] => {
     const resolvedIds = applyRosterIdsToState(nextIdsInput, 'explicit_user_action');
-    setRosterIds(resolvedIds);
+    if (isDemoSession) {
+      setRosterIds(resolvedIds);
+    }
     return resolvedIds;
-  }, [applyRosterIdsToState]);
+  }, [applyRosterIdsToState, isDemoSession]);
 
   const deleteRosterPlayer = (rosterPlayerId: string) => {
     const normalizedId = normalizeBaselineId(rosterPlayerId);
@@ -2465,13 +2588,18 @@ export default function App() {
       });
     }
     const removedRosterIndex = previousRosterIds.findIndex((id) => baselineKey(id) === normalizedKey);
-    const nextIds = removeFromRosterSession(normalizedId, previousRosterIds);
+    const nextIds = isDemoSession
+      ? removeFromRosterSession(normalizedId, previousRosterIds)
+      : previousRosterIds.filter((id) => baselineKey(id) !== normalizedKey);
     const nextResolvedIds = applyRosterIdsToState(nextIds, 'roster_remove');
     const nextKeys = nextIds.map((id) => baselineKey(id));
     const resolvedKeys = nextResolvedIds.map((id) => baselineKey(id));
     if (
-      nextKeys.length !== resolvedKeys.length ||
-      nextKeys.some((key, index) => key !== resolvedKeys[index])
+      isDemoSession &&
+      (
+        nextKeys.length !== resolvedKeys.length ||
+        nextKeys.some((key, index) => key !== resolvedKeys[index])
+      )
     ) {
       setRosterIds(nextResolvedIds);
     }
@@ -2495,6 +2623,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!isDemoSession) return;
     const syncRosterFromLocalStorage = () => {
       const storedIds = getRosterIds();
       const currentIds = matchRosterIdsRef.current;
@@ -2520,7 +2649,7 @@ export default function App() {
       window.removeEventListener('storage', handleStorage);
       window.removeEventListener('focus', syncRosterFromLocalStorage);
     };
-  }, [applyMatchRosterIds]);
+  }, [applyMatchRosterIds, isDemoSession]);
 
   const handleAddOver = () => {
     if (!activePlayer) return;
@@ -4202,9 +4331,15 @@ export default function App() {
         .map((row) => normalizeBaselineRecord(row))
         .map((row) => baselineKey(row.id || row.playerId || row.name))
     );
+    const rosterIdsFromBaselines = orderedBaselines
+      .map((row) => normalizeBaselineRecord(row))
+      .filter((row) => row.inRoster === true)
+      .map((row) => normalizeBaselineId(row.id || row.playerId || row.name));
     const baseRosterIds = rosterInitializedRef.current
       ? previousRosterIds
-      : getRosterIds();
+      : isDemoSession
+        ? getRosterIds()
+        : rosterIdsFromBaselines;
     const seen = new Set(baseRosterIds.map((id) => baselineKey(id)));
     const additions = (options?.addToRosterIds || [])
       .map((id) => normalizeBaselineId(id))
@@ -4231,7 +4366,7 @@ export default function App() {
     setBaselineSource(source);
     setBaselineWarning(warning || null);
     setMatchRosterIds(resolvedRosterIds);
-    if ((options?.addToRosterIds || []).length > 0) {
+    if (isDemoSession && (options?.addToRosterIds || []).length > 0) {
       setRosterIds(resolvedRosterIds);
     }
     setPlayers((prev) => {
@@ -4317,45 +4452,230 @@ export default function App() {
               )}
               
               {/* Profile Dropdown */}
-              <div ref={profileMenuRef} className="relative">
-                <button type="button" 
+              <div
+                ref={profileMenuRef}
+                style={{
+                  position: 'relative',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                <button
+                  type="button"
                   onClick={() => setIsProfileOpen(!isProfileOpen)}
-                  className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-slate-700 text-xs font-medium text-slate-400 hover:text-white hover:border-emerald-500 transition-colors"
+                  onMouseEnter={() => setIsProfileTriggerHovered(true)}
+                  onMouseLeave={() => setIsProfileTriggerHovered(false)}
+                  onFocus={() => setIsProfileTriggerHovered(true)}
+                  onBlur={() => setIsProfileTriggerHovered(false)}
+                  aria-label="Open profile menu"
+                  aria-haspopup="menu"
+                  aria-expanded={isProfileOpen}
+                  style={{
+                    width: '40px',
+                    height: '40px',
+                    borderRadius: '999px',
+                    border: isProfileOpen || isProfileTriggerHovered
+                      ? '1px solid rgba(45, 212, 191, 0.5)'
+                      : '1px solid rgba(100, 116, 139, 0.72)',
+                    background: isProfileOpen || isProfileTriggerHovered
+                      ? 'linear-gradient(180deg, rgba(22, 45, 73, 0.97) 0%, rgba(15, 34, 57, 0.97) 100%)'
+                      : 'linear-gradient(180deg, rgba(17, 28, 48, 0.97) 0%, rgba(12, 21, 37, 0.97) 100%)',
+                    color: isProfileOpen || isProfileTriggerHovered ? '#d7fff4' : '#c6d3e8',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    cursor: 'pointer',
+                    boxShadow: isProfileOpen || isProfileTriggerHovered
+                      ? '0 10px 24px rgba(5, 18, 37, 0.5), 0 0 0 1px rgba(45, 212, 191, 0.16)'
+                      : '0 6px 18px rgba(2, 6, 23, 0.35)',
+                    transition: 'all 180ms ease',
+                  }}
                 >
-                  C
+                  <User size={24} strokeWidth={2} />
                 </button>
 
                 <AnimatePresence>
                   {isProfileOpen && (
-                    <motion.div 
-                      initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                    <motion.div
+                      initial={{ opacity: 0, y: 10, scale: 0.96 }}
                       animate={{ opacity: 1, y: 0, scale: 1 }}
-                      exit={{ opacity: 0, y: 10, scale: 0.95 }}
-                      className="absolute right-0 mt-2 w-56 bg-[#0F172A] border border-white/10 rounded-xl shadow-2xl p-4 z-50"
+                      exit={{ opacity: 0, y: 10, scale: 0.96 }}
+                      style={{
+                        position: 'absolute',
+                        top: 'calc(100% + 10px)',
+                        right: 0,
+                        width: '260px',
+                        maxWidth: 'calc(100vw - 16px)',
+                        padding: '17px',
+                        borderRadius: '14px',
+                        border: '1px solid rgba(125, 147, 178, 0.25)',
+                        background:
+                          'linear-gradient(180deg, rgba(15, 27, 46, 0.985) 0%, rgba(11, 22, 39, 0.985) 100%)',
+                        boxShadow:
+                          '0 16px 34px rgba(2, 8, 23, 0.52), 0 0 0 1px rgba(15, 23, 42, 0.42), inset 0 1px 0 rgba(255,255,255,0.03)',
+                        backdropFilter: 'blur(10px)',
+                        zIndex: 220,
+                        overflow: 'hidden',
+                      }}
                     >
-                      <div className="space-y-2">
-                        <p className="text-sm font-bold text-white">tactIQ Coach Assist</p>
-                        <p className="text-xs leading-relaxed text-slate-300">
-                          Multi-agent tactical AI that combines fatigue, risk, and match context to recommend safer, smarter moves in real time.
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '6px',
+                          minWidth: 0,
+                        }}
+                      >
+                        <p
+                          style={{
+                            margin: 0,
+                            color: '#f8fafc',
+                            fontSize: '16px',
+                            fontWeight: 650,
+                            lineHeight: 1.2,
+                            whiteSpace: 'normal',
+                            wordBreak: 'normal',
+                            overflowWrap: 'normal',
+                            hyphens: 'none',
+                          }}
+                        >
+                          tactIQ Coach Assist
                         </p>
-                        <p className="text-[11px] text-slate-500">
-                          Azure-Powered Multi-Agent Decision System
+                        <p
+                          style={{
+                            margin: 0,
+                            color: 'rgba(226, 232, 240, 0.88)',
+                            fontSize: '12.5px',
+                            lineHeight: 1.45,
+                            whiteSpace: 'normal',
+                            wordBreak: 'normal',
+                            overflowWrap: 'normal',
+                            hyphens: 'none',
+                          }}
+                        >
+                          Multi-agent tactical AI for match-state, fatigue, and risk-aware coaching.
                         </p>
-                        {isAppUnlocked && (
-                          <div className="pt-2 mt-2 border-t border-white/10">
-                            <p className="text-[11px] text-slate-400 truncate">
-                              {sessionMode === 'demo' ? 'Demo Coach' : authUser?.name || authUser?.email || authUser?.userId || 'Coach'}
-                            </p>
-                            <button
-                              type="button"
-                              onClick={handleProfilePrimaryAction}
-                              className="mt-2 w-full rounded-md border border-white/15 bg-white/[0.04] text-slate-200 text-xs font-medium py-1.5 hover:bg-white/[0.08] transition-colors"
-                            >
-                              {sessionMode === 'demo' ? 'Exit Demo' : 'Sign out'}
-                            </button>
-                          </div>
-                        )}
                       </div>
+
+                      <div
+                        style={{
+                          marginTop: '12px',
+                          marginBottom: '10px',
+                          height: '1px',
+                          background: 'rgba(148, 163, 184, 0.18)',
+                        }}
+                      />
+
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: '10px',
+                        }}
+                      >
+                        <span
+                          style={{
+                            color: 'rgba(148, 163, 184, 0.9)',
+                            fontSize: '11px',
+                            letterSpacing: '0.08em',
+                            textTransform: 'uppercase',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          MODE
+                        </span>
+                        <span
+                          style={{
+                            color:
+                              sessionMode === 'demo'
+                                ? '#d6fff3'
+                                : sessionMode === 'authenticated'
+                                  ? '#cff8ee'
+                                  : '#e2e8f0',
+                            background:
+                              sessionMode === 'demo'
+                                ? 'rgba(45, 212, 191, 0.14)'
+                                : sessionMode === 'authenticated'
+                                  ? 'rgba(20, 184, 166, 0.14)'
+                                  : 'rgba(100, 116, 139, 0.18)',
+                            border:
+                              sessionMode === 'demo'
+                                ? '1px solid rgba(45, 212, 191, 0.34)'
+                                : sessionMode === 'authenticated'
+                                  ? '1px solid rgba(20, 184, 166, 0.34)'
+                                  : '1px solid rgba(148, 163, 184, 0.28)',
+                            borderRadius: '999px',
+                            padding: '4px 10px',
+                            fontSize: '10px',
+                            fontWeight: 600,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {sessionMode === 'demo' ? 'Demo Mode' : sessionMode === 'authenticated' ? 'Signed in' : 'Guest'}
+                        </span>
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: '10px',
+                          marginBottom: '10px',
+                          height: '1px',
+                          background: 'rgba(148, 163, 184, 0.18)',
+                        }}
+                      />
+
+                      {isAppUnlocked && (
+                        <button
+                          type="button"
+                          onClick={handleProfilePrimaryAction}
+                          onMouseEnter={() => setIsProfileActionHovered(true)}
+                          onMouseLeave={() => setIsProfileActionHovered(false)}
+                          onFocus={() => setIsProfileActionHovered(true)}
+                          onBlur={() => setIsProfileActionHovered(false)}
+                          style={{
+                            width: '100%',
+                            minHeight: '40px',
+                            marginTop: '2px',
+                            padding: '10px 12px',
+                            borderRadius: '12px',
+                            border:
+                              sessionMode === 'demo'
+                                ? '1px solid rgba(45, 212, 191, 0.42)'
+                                : '1px solid rgba(56, 189, 248, 0.4)',
+                            background:
+                              sessionMode === 'demo'
+                                ? isProfileActionHovered
+                                  ? 'linear-gradient(180deg, rgba(20, 116, 106, 0.52) 0%, rgba(13, 53, 67, 0.7) 100%)'
+                                  : 'linear-gradient(180deg, rgba(18, 72, 89, 0.5) 0%, rgba(13, 49, 64, 0.65) 100%)'
+                                : isProfileActionHovered
+                                  ? 'linear-gradient(180deg, rgba(14, 77, 112, 0.52) 0%, rgba(10, 54, 84, 0.72) 100%)'
+                                  : 'linear-gradient(180deg, rgba(13, 59, 92, 0.48) 0%, rgba(10, 47, 74, 0.68) 100%)',
+                            color: sessionMode === 'demo' ? '#ddfff6' : '#e2f3ff',
+                            fontSize: '13px',
+                            fontWeight: 650,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '8px',
+                            cursor: 'pointer',
+                            boxShadow:
+                              sessionMode === 'demo'
+                                ? isProfileActionHovered
+                                  ? '0 12px 24px rgba(8, 42, 50, 0.35), 0 0 0 1px rgba(45, 212, 191, 0.18)'
+                                  : '0 10px 22px rgba(8, 34, 44, 0.28)'
+                                : isProfileActionHovered
+                                  ? '0 12px 24px rgba(7, 37, 61, 0.35), 0 0 0 1px rgba(56, 189, 248, 0.18)'
+                                  : '0 10px 22px rgba(6, 29, 49, 0.28)',
+                            transition: 'all 180ms ease',
+                          }}
+                        >
+                          <LogOut size={14} />
+                          {sessionMode === 'demo' ? 'Exit Demo' : 'Sign Out'}
+                        </button>
+                      )}
                     </motion.div>
                   )}
                 </AnimatePresence>
@@ -5085,7 +5405,6 @@ function FatigueForecastChart({
                   x={riskCrossPoint.overAhead}
                   stroke="rgba(251,191,36,0.35)"
                   strokeDasharray="4 4"
-                  label={{ value: 'Risk jump', position: 'top', fill: 'rgba(251,191,36,0.85)', fontSize: 10 }}
                 />
               )}
               <Line
@@ -5356,9 +5675,22 @@ interface ConfirmSwitchOverlayProps {
   suggestion: SuggestedBowlerRecommendation | null;
   onSwitch: () => void;
   onCancel: () => void;
+  title?: string;
+  prompt?: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
 }
 
-function ConfirmSwitchOverlay({ open, suggestion, onSwitch, onCancel }: ConfirmSwitchOverlayProps) {
+function ConfirmSwitchOverlay({
+  open,
+  suggestion,
+  onSwitch,
+  onCancel,
+  title,
+  prompt,
+  confirmLabel = 'Switch',
+  cancelLabel = 'Cancel',
+}: ConfirmSwitchOverlayProps) {
   useEffect(() => {
     if (!open) return;
     const handleEscape = (event: KeyboardEvent) => {
@@ -5429,7 +5761,7 @@ function ConfirmSwitchOverlay({ open, suggestion, onSwitch, onCancel }: ConfirmS
               color: '#F8FAFC',
             }}
           >
-            Coach suggests switching to: {suggestion.bowlerName}
+            {title || `Coach suggests switching to: ${suggestion.bowlerName}`}
           </h3>
         </div>
         {suggestion.reason && (
@@ -5442,6 +5774,18 @@ function ConfirmSwitchOverlay({ open, suggestion, onSwitch, onCancel }: ConfirmS
             }}
           >
             {suggestion.reason}
+          </p>
+        )}
+        {prompt && (
+          <p
+            style={{
+              margin: '0 0 14px',
+              fontSize: '12px',
+              lineHeight: 1.4,
+              color: '#E2E8F0',
+            }}
+          >
+            {prompt}
           </p>
         )}
         <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
@@ -5459,7 +5803,7 @@ function ConfirmSwitchOverlay({ open, suggestion, onSwitch, onCancel }: ConfirmS
               cursor: 'pointer',
             }}
           >
-            Cancel
+            {cancelLabel}
           </button>
           <button
             type="button"
@@ -5475,7 +5819,7 @@ function ConfirmSwitchOverlay({ open, suggestion, onSwitch, onCancel }: ConfirmS
               cursor: 'pointer',
             }}
           >
-            Switch
+            {confirmLabel}
           </button>
         </div>
       </div>
@@ -5701,6 +6045,10 @@ function Dashboard({
   const [showRotateBowlerConfirm, setShowRotateBowlerConfirm] = useState(false);
   const [rotateBowlerSuggestion, setRotateBowlerSuggestion] = useState<SuggestedBowlerRecommendation | null>(null);
   const [rotateBowlerNotice, setRotateBowlerNotice] = useState<string | null>(null);
+  const [showNextBatterConfirm, setShowNextBatterConfirm] = useState(false);
+  const [recommendedNextBatter, setRecommendedNextBatter] = useState<SuggestedBowlerRecommendation | null>(null);
+  const [nextBatterNotice, setNextBatterNotice] = useState<string | null>(null);
+  const [isSuggestingNextBatter, setIsSuggestingNextBatter] = useState(false);
   const [fullAnalysisRunPending, setFullAnalysisRunPending] = useState(false);
   const [fullAnalysisExecuted, setFullAnalysisExecuted] = useState(false);
   const [analysisExecuted, setAnalysisExecuted] = useState(false);
@@ -5758,6 +6106,10 @@ function Dashboard({
     setCopilotResetToken((value) => value + 1);
     setShowRotateBowlerConfirm(false);
     setRotateBowlerSuggestion(null);
+    setShowNextBatterConfirm(false);
+    setRecommendedNextBatter(null);
+    setNextBatterNotice(null);
+    setIsSuggestingNextBatter(false);
     setFullAnalysisRunPending(false);
     setFullAnalysisExecuted(false);
     setAnalysisExecuted(false);
@@ -5832,6 +6184,10 @@ function Dashboard({
     setShowCopilotChat(false);
     setShowFullAnalysisInfo(false);
     setShowDismissAnalysisInfo(false);
+    setShowNextBatterConfirm(false);
+    setRecommendedNextBatter(null);
+    setNextBatterNotice(null);
+    setIsSuggestingNextBatter(false);
     setFullAnalysisRunPending(false);
     setFullAnalysisExecuted(false);
     setAnalysisExecuted(false);
@@ -7709,6 +8065,11 @@ function Dashboard({
     const timeoutId = window.setTimeout(() => setRotateBowlerNotice(null), 2200);
     return () => window.clearTimeout(timeoutId);
   }, [rotateBowlerNotice]);
+  useEffect(() => {
+    if (!nextBatterNotice) return;
+    const timeoutId = window.setTimeout(() => setNextBatterNotice(null), 2600);
+    return () => window.clearTimeout(timeoutId);
+  }, [nextBatterNotice]);
   const handleScore = (runValue: number, ballDirection: 1 | -1 = 1) => {
     if (!activePlayer || isActivePlayerOut) return;
 
@@ -8197,31 +8558,104 @@ function Dashboard({
     [clampedStrainIndex, primeCoachAutoScroll, runAgent, teamMode]
   );
 
-  const runCoachWithFallback = useCallback(async (): Promise<{ recommendation: SuggestedBowlerRecommendation | null; raw?: OrchestrateResponse }> => {
+  const eligibleReplacementBatters = useMemo(
+    () => {
+      const activeIdKey = baselineKey(activePlayer?.id || '');
+      return players.filter((player) => {
+        if (player.inRoster === false) return false;
+        if (!isEligibleForMode(player, 'BATTING')) return false;
+        if (baselineKey(player.id) === activeIdKey) return false;
+        if (resolveDismissalStatus(player) === 'OUT') return false;
+        if (player.isUnfit || player.isManuallyUnfit || player.isInjured) return false;
+        return true;
+      });
+    },
+    [activePlayer?.id, players]
+  );
+
+  const rankFallbackNextBatter = useCallback((candidates: Player[]): SuggestedBowlerRecommendation | null => {
+    if (candidates.length === 0) return null;
+    const normalizeSkillScore = (value: unknown, fallback: number): number => {
+      const metric = Math.max(0, safeNum(value, fallback));
+      return metric > 10 ? clamp(metric / 100, 0, 1) : clamp(metric / 10, 0, 1);
+    };
+    const pressureGap = Math.max(0, requiredRunRate - currentRunRate);
+    const needsAcceleration =
+      pressureGap > 0.6 || pressureIndex >= 6 || matchContext.phase === 'Death';
+    const wicketsUnderPressure = matchState.wickets >= 5;
+
+    const scored = candidates
+      .map((player) => {
+        const fatigueScore = 1 - clamp(safeNum(player.fatigue, 5) / 10, 0, 1);
+        const recoveryScore =
+          player.hrRecovery === 'Good' ? 1 : player.hrRecovery === 'Moderate' ? 0.6 : 0.35;
+        const controlScore = normalizeSkillScore(player.controlBaseline, 76);
+        const powerScore = normalizeSkillScore(player.power, 6);
+        const speedScore = normalizeSkillScore(player.speed, 6);
+        const riskPenalty =
+          player.injuryRisk === 'Critical' || player.injuryRisk === 'High'
+            ? 0.2
+            : player.injuryRisk === 'Medium'
+              ? 0.08
+              : 0;
+        const accelerationScore = (powerScore * 0.58) + (speedScore * 0.22) + (controlScore * 0.2);
+        const stabilityScore = (controlScore * 0.5) + (fatigueScore * 0.35) + (recoveryScore * 0.15);
+        const styleScore = needsAcceleration
+          ? (accelerationScore * 0.62) + (stabilityScore * 0.38)
+          : wicketsUnderPressure
+            ? (stabilityScore * 0.72) + (accelerationScore * 0.28)
+            : (stabilityScore * 0.56) + (accelerationScore * 0.44);
+        const readinessScore = (fatigueScore * 0.6) + (recoveryScore * 0.4);
+        const totalScore = styleScore + (readinessScore * 0.35) - riskPenalty;
+        return { player, totalScore };
+      })
+      .sort((a, b) => {
+        if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
+        return a.player.name.localeCompare(b.player.name);
+      });
+
+    const best = scored[0]?.player;
+    if (!best) return null;
+    const reason = needsAcceleration
+      ? `Best fit for the ${matchContext.phase.toLowerCase()} phase and target pace.`
+      : wicketsUnderPressure
+        ? 'Best fit to stabilize scoring while preserving wickets.'
+        : 'Best fit for current pressure and tactical batting continuity.';
+    return {
+      bowlerId: best.id,
+      bowlerName: best.name,
+      reason,
+    };
+  }, [currentRunRate, matchContext.phase, matchState.wickets, pressureIndex, requiredRunRate]);
+
+  const runCoachWithFallback = useCallback(async (
+    mode: TeamMode = 'BOWLING'
+  ): Promise<{ recommendation: SuggestedBowlerRecommendation | null; raw?: OrchestrateResponse }> => {
+    const logPrefix = mode === 'BATTING' ? 'next-batter' : 'rotate-bowler';
     if (import.meta.env.DEV) {
-      console.log('[rotate-bowler] click');
+      console.log(`[${logPrefix}] click`);
     }
 
-    const routeResult = await runCoachAgentAuto('BOWLING');
+    const routeResult = await runCoachAgentAuto(mode);
     const routeSuggestion =
       routeResult?.suggestedBowler
-      || (routeResult?.response ? normalizeSuggestedBowler(routeResult.response, players, activePlayer?.id, 'BOWLING') : null);
+      || (routeResult?.response ? normalizeSuggestedBowler(routeResult.response, players, activePlayer?.id, mode) : null);
     if (routeResult?.response && routeSuggestion) {
       return { recommendation: routeSuggestion, raw: routeResult.response };
     }
 
     if (import.meta.env.DEV) {
-      console.log('[rotate-bowler] falling back to full analysis');
+      console.log(`[${logPrefix}] falling back to full analysis`);
     }
 
     const fullResult = await runAgent('full', 'button_click', {
-      teamMode: 'BOWLING',
-      focusRole: 'BOWLER',
+      teamMode: mode,
+      focusRole: mode === 'BATTING' ? 'BATTER' : 'BOWLER',
       strainIndex: clampedStrainIndex,
     });
     const fullSuggestion =
       fullResult?.suggestedBowler
-      || (fullResult?.response ? normalizeSuggestedBowler(fullResult.response, players, activePlayer?.id, 'BOWLING') : null);
+      || (fullResult?.response ? normalizeSuggestedBowler(fullResult.response, players, activePlayer?.id, mode) : null);
     if (fullResult?.response && fullSuggestion) {
       return { recommendation: fullSuggestion, raw: fullResult.response };
     }
@@ -8261,6 +8695,103 @@ function Dashboard({
     closeRotateBowlerConfirm();
   }, [activePlayer, closeRotateBowlerConfirm, players, rotateBowlerSuggestion, setActivePlayerId, setTeamMode]);
 
+  const closeNextBatterConfirm = useCallback(() => {
+    setShowNextBatterConfirm(false);
+    setRecommendedNextBatter(null);
+  }, []);
+
+  const confirmNextBatterSwitch = useCallback(() => {
+    if (!recommendedNextBatter) return;
+    const suggestedIdKey = baselineKey(recommendedNextBatter.bowlerId);
+    const suggestedNameKey = baselineKey(recommendedNextBatter.bowlerName);
+    const resolvedPlayer =
+      players.find((player) => baselineKey(player.id) === suggestedIdKey)
+      || players.find((player) => baselineKey(player.name) === suggestedNameKey);
+    const suggestedPlayer =
+      resolvedPlayer &&
+      eligibleReplacementBatters.some((candidate) => baselineKey(candidate.id) === baselineKey(resolvedPlayer.id))
+        ? resolvedPlayer
+        : null;
+
+    if (!suggestedPlayer) {
+      setNextBatterNotice('No eligible replacement batter available.');
+      closeNextBatterConfirm();
+      return;
+    }
+
+    if (activePlayer && baselineKey(activePlayer.id) === baselineKey(suggestedPlayer.id)) {
+      setNextBatterNotice('Already selected.');
+      closeNextBatterConfirm();
+      return;
+    }
+
+    setTeamMode('BATTING');
+    setActivePlayerId(suggestedPlayer.id);
+    setNextBatterNotice(`Switched to ${suggestedPlayer.name}.`);
+    closeNextBatterConfirm();
+  }, [
+    activePlayer,
+    closeNextBatterConfirm,
+    eligibleReplacementBatters,
+    players,
+    recommendedNextBatter,
+    setActivePlayerId,
+    setTeamMode,
+  ]);
+
+  const handleSuggestNextBatter = useCallback(async () => {
+    if (isSuggestingNextBatter || agentState === 'thinking') return;
+    setNextBatterNotice(null);
+    setShowNextBatterConfirm(false);
+    setRecommendedNextBatter(null);
+
+    if (eligibleReplacementBatters.length === 0) {
+      setNextBatterNotice('No eligible replacement batter available.');
+      return;
+    }
+
+    setIsSuggestingNextBatter(true);
+    try {
+      const coachResult = await runCoachWithFallback('BATTING');
+      const eligibleIdKeys = new Set(eligibleReplacementBatters.map((player) => baselineKey(player.id)));
+      let suggestion = coachResult.recommendation;
+
+      if (suggestion) {
+        const resolved = resolveSuggestionPlayer(suggestion, players);
+        const resolvedIdKey = baselineKey(resolved?.id || '');
+        if (!resolved || !eligibleIdKeys.has(resolvedIdKey)) {
+          suggestion = null;
+        }
+      }
+
+      if (!suggestion) {
+        suggestion = rankFallbackNextBatter(eligibleReplacementBatters);
+      }
+
+      if (!suggestion) {
+        setNextBatterNotice('No eligible replacement batter available.');
+        return;
+      }
+
+      setRecommendedNextBatter(suggestion);
+      setShowNextBatterConfirm(true);
+    } catch (error) {
+      if (import.meta.env.DEV) {
+        console.error('[next-batter] suggest failed', error);
+      }
+      setNextBatterNotice('Unable to generate next batter recommendation right now.');
+    } finally {
+      setIsSuggestingNextBatter(false);
+    }
+  }, [
+    agentState,
+    eligibleReplacementBatters,
+    isSuggestingNextBatter,
+    players,
+    rankFallbackNextBatter,
+    runCoachWithFallback,
+  ]);
+
   const handleRotateBowler = useCallback(async () => {
     setRotateBowlerNotice(null);
     const rotationPool = players.filter(
@@ -8273,7 +8804,7 @@ function Dashboard({
       return;
     }
 
-    const coachResult = await runCoachWithFallback();
+    const coachResult = await runCoachWithFallback('BOWLING');
     let suggestion = coachResult.recommendation;
     if (suggestion) {
       const resolved = resolveSuggestionPlayer(suggestion, players);
@@ -8462,21 +8993,12 @@ function Dashboard({
                  const nextBalls = Math.min(totalBalls, oversToBalls(e.target.value));
                  updateMatchState({ ballsBowled: nextBalls });
                }}
-               className="match-over-input w-14 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-               style={{
-                 minWidth: '72px',
-                 padding: '6px 18px',
-                 textAlign: 'center',
-                 display: 'inline-flex',
-                 alignItems: 'center',
-                 justifyContent: 'center',
-                 boxSizing: 'border-box',
-               }}
+               className="over-input w-[90px] min-w-[90px] bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                aria-label="Current over"
              />
              /
              <span className="w-12 bg-slate-900/40 border border-white/10 rounded px-1.5 py-0.5 font-mono text-slate-200 text-center">{resolvedTotalOvers}</span>
-             <span className="text-slate-500 ml-2.5" style={{ marginLeft: '14px' }}>balls</span>
+             <span className="text-slate-500 ml-3">balls</span>
              <input
                type="number"
                min={0}
@@ -8934,7 +9456,7 @@ function Dashboard({
                           </div>
 
                           {/* Prevent click flicker: controls stay as local React updates and use explicit button types (no implicit form submit/remount). */}
-                          <div className="flex items-center justify-start gap-4">
+                          <div className="flex flex-wrap items-center justify-start gap-4">
                             <button
                               type="button"
                               onClick={() => runBattingGuardedAction(() => setBatterDismissalStatus('OUT'))}
@@ -8968,7 +9490,21 @@ function Dashboard({
                             >
                               Reset Innings
                             </button>
+
+                            <button
+                              type="button"
+                              onClick={() => runBattingGuardedAction(() => {
+                                void handleSuggestNextBatter();
+                              })}
+                              disabled={isSuggestingNextBatter || agentState === 'thinking'}
+                              className={`dismissal-pill ${pill} ${isSuggestingNextBatter || agentState === 'thinking' ? 'opacity-60 cursor-not-allowed' : ''}`}
+                            >
+                              {isSuggestingNextBatter ? 'Analyzing...' : 'AI Suggest Next Batter'}
+                            </button>
                           </div>
+                          {nextBatterNotice && (
+                            <p className="text-[11px] text-amber-300">{nextBatterNotice}</p>
+                          )}
                         </div>
                       </div>
                     </PanelCard>
@@ -10073,6 +10609,15 @@ function Dashboard({
         onSwitch={handleSwitchToSuggestedBowler}
         onCancel={closeRotateBowlerConfirm}
       />
+      <ConfirmSwitchOverlay
+        open={showNextBatterConfirm && Boolean(recommendedNextBatter)}
+        suggestion={recommendedNextBatter}
+        onSwitch={confirmNextBatterSwitch}
+        onCancel={closeNextBatterConfirm}
+        title={recommendedNextBatter ? `Recommended Next Batter: ${recommendedNextBatter.bowlerName}` : undefined}
+        prompt={recommendedNextBatter ? `Switch to ${recommendedNextBatter.bowlerName}?` : undefined}
+        confirmLabel="Confirm / Switch"
+      />
       <MatchModeGuardOverlay
         open={showMatchModeGuard}
         onSwitch={handleSwitchToBattingAndContinue}
@@ -10135,6 +10680,8 @@ const createDraftRowKey = (): string => {
   return `row-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
+const createPersistentPlayerId = (): string => `plr-${createDraftRowKey()}`;
+
 const baselineToDraftRow = (baseline: Baseline, rosterIdSet?: Set<string>): BaselineDraftRow => {
   const normalized = normalizeBaselineRecord(baseline);
   const name = String(normalized.name || normalized.playerId || normalized.id || '').trim();
@@ -10147,13 +10694,13 @@ const baselineToDraftRow = (baseline: Baseline, rosterIdSet?: Set<string>): Base
     name,
     role: normalized.role,
     active: Boolean(normalized.isActive),
-    inRoster: Boolean(rosterIdSet?.has(resolvedRosterKey)),
-    sleep: clamp(safeNum(normalized.sleepHoursToday, 7), 0, 12),
-    recovery: clamp(safeNum(normalized.recoveryMinutes, 45), 0, 240),
-    fatigueLimit: clamp(safeNum(normalized.fatigueLimit, 6), 0, 10),
-    control: clamp(safeNum(normalized.controlBaseline, 78), 0, 100),
-    speed: clamp(safeNum(normalized.speed, 7), 0, 100),
-    power: clamp(safeNum(normalized.power, 6), 0, 100),
+    inRoster: rosterIdSet ? Boolean(rosterIdSet.has(resolvedRosterKey)) : Boolean(normalized.inRoster),
+    sleep: clamp(safeNum(normalized.sleepHoursToday, 7), BASELINE_METRIC_LIMITS.sleep.min, BASELINE_METRIC_LIMITS.sleep.max),
+    recovery: clamp(safeNum(normalized.recoveryMinutes, 45), BASELINE_METRIC_LIMITS.recovery.min, BASELINE_METRIC_LIMITS.recovery.max),
+    fatigueLimit: clamp(safeNum(normalized.fatigueLimit, 6), BASELINE_METRIC_LIMITS.fatigueLimit.min, BASELINE_METRIC_LIMITS.fatigueLimit.max),
+    control: clamp(safeNum(normalized.controlBaseline, 78), BASELINE_METRIC_LIMITS.control.min, BASELINE_METRIC_LIMITS.control.max),
+    speed: clamp(safeNum(normalized.speed, 7), BASELINE_METRIC_LIMITS.speed.min, BASELINE_METRIC_LIMITS.speed.max),
+    power: clamp(safeNum(normalized.power, 6), BASELINE_METRIC_LIMITS.power.min, BASELINE_METRIC_LIMITS.power.max),
     orderIndex: parseBaselineOrderIndex(normalized.orderIndex),
     createdAt: normalized.createdAt,
     updatedAt: normalized.updatedAt,
@@ -10168,15 +10715,18 @@ const draftRowToBaseline = (row: BaselineDraftRow): Baseline | null => {
   return normalizeBaselineRecord({
     id: resolvedId,
     playerId: resolvedId,
+    baselineId: resolvedId,
     name,
     role: row.role,
+    active: row.active,
     isActive: row.active,
-    sleepHoursToday: clamp(safeNum(row.sleep, 7), 0, 12),
-    recoveryMinutes: clamp(safeNum(row.recovery, 45), 0, 240),
-    fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), 0, 10),
-    controlBaseline: clamp(safeNum(row.control, 78), 0, 100),
-    speed: clamp(safeNum(row.speed, 7), 0, 100),
-    power: clamp(safeNum(row.power, 6), 0, 100),
+    inRoster: row.inRoster,
+    sleepHoursToday: clamp(safeNum(row.sleep, 7), BASELINE_METRIC_LIMITS.sleep.min, BASELINE_METRIC_LIMITS.sleep.max),
+    recoveryMinutes: clamp(safeNum(row.recovery, 45), BASELINE_METRIC_LIMITS.recovery.min, BASELINE_METRIC_LIMITS.recovery.max),
+    fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), BASELINE_METRIC_LIMITS.fatigueLimit.min, BASELINE_METRIC_LIMITS.fatigueLimit.max),
+    controlBaseline: clamp(safeNum(row.control, 78), BASELINE_METRIC_LIMITS.control.min, BASELINE_METRIC_LIMITS.control.max),
+    speed: clamp(safeNum(row.speed, 7), BASELINE_METRIC_LIMITS.speed.min, BASELINE_METRIC_LIMITS.speed.max),
+    power: clamp(safeNum(row.power, 6), BASELINE_METRIC_LIMITS.power.min, BASELINE_METRIC_LIMITS.power.max),
     orderIndex: parseBaselineOrderIndex(row.orderIndex),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -10215,18 +10765,20 @@ function Baselines({
           name: String(row.name || ''),
           role: row.role,
           active: Boolean(row.active),
-          sleep: clamp(safeNum(row.sleep, 7), 0, 12),
-          recovery: clamp(safeNum(row.recovery, 45), 0, 240),
-          fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), 0, 10),
-          control: clamp(safeNum(row.control, 78), 0, 100),
-          speed: clamp(safeNum(row.speed, 7), 0, 100),
-          power: clamp(safeNum(row.power, 6), 0, 100),
+          inRoster: Boolean(row.inRoster),
+          sleep: clamp(safeNum(row.sleep, 7), BASELINE_METRIC_LIMITS.sleep.min, BASELINE_METRIC_LIMITS.sleep.max),
+          recovery: clamp(safeNum(row.recovery, 45), BASELINE_METRIC_LIMITS.recovery.min, BASELINE_METRIC_LIMITS.recovery.max),
+          fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), BASELINE_METRIC_LIMITS.fatigueLimit.min, BASELINE_METRIC_LIMITS.fatigueLimit.max),
+          control: clamp(safeNum(row.control, 78), BASELINE_METRIC_LIMITS.control.min, BASELINE_METRIC_LIMITS.control.max),
+          speed: clamp(safeNum(row.speed, 7), BASELINE_METRIC_LIMITS.speed.min, BASELINE_METRIC_LIMITS.speed.max),
+          power: clamp(safeNum(row.power, 6), BASELINE_METRIC_LIMITS.power.min, BASELINE_METRIC_LIMITS.power.max),
           orderIndex: parseBaselineOrderIndex(row.orderIndex),
         }))
         .map((row) => ({
           name: row.name,
           role: row.role,
           active: row.active,
+          inRoster: row.inRoster,
           sleep: row.sleep,
           recovery: row.recovery,
           fatigueLimit: row.fatigueLimit,
@@ -10258,23 +10810,23 @@ function Baselines({
       const control = safeNum(row.control, Number.NaN);
       const speed = safeNum(row.speed, Number.NaN);
       const power = safeNum(row.power, Number.NaN);
-      if (!Number.isFinite(sleep) || sleep < 0 || sleep > 12) {
+      if (!Number.isFinite(sleep) || sleep < BASELINE_METRIC_LIMITS.sleep.min || sleep > BASELINE_METRIC_LIMITS.sleep.max) {
         return `Row ${index + 1}: Sleep must be between 0 and 12.`;
       }
-      if (!Number.isFinite(recovery) || recovery < 0 || recovery > 240) {
-        return `Row ${index + 1}: Recovery must be between 0 and 240.`;
+      if (!Number.isFinite(recovery) || recovery < BASELINE_METRIC_LIMITS.recovery.min || recovery > BASELINE_METRIC_LIMITS.recovery.max) {
+        return `Row ${index + 1}: Recovery must be between 0 and 120.`;
       }
-      if (!Number.isFinite(fatigueLimit) || fatigueLimit < 0 || fatigueLimit > 10) {
+      if (!Number.isFinite(fatigueLimit) || fatigueLimit < BASELINE_METRIC_LIMITS.fatigueLimit.min || fatigueLimit > BASELINE_METRIC_LIMITS.fatigueLimit.max) {
         return `Row ${index + 1}: Fatigue Limit must be between 0 and 10.`;
       }
-      if (!Number.isFinite(control) || control < 0 || control > 100) {
+      if (!Number.isFinite(control) || control < BASELINE_METRIC_LIMITS.control.min || control > BASELINE_METRIC_LIMITS.control.max) {
         return `Row ${index + 1}: Control must be between 0 and 100.`;
       }
-      if (!Number.isFinite(speed) || speed < 0 || speed > 100) {
-        return `Row ${index + 1}: Speed must be between 0 and 100.`;
+      if (!Number.isFinite(speed) || speed < BASELINE_METRIC_LIMITS.speed.min || speed > BASELINE_METRIC_LIMITS.speed.max) {
+        return `Row ${index + 1}: Speed must be between 0 and 15.`;
       }
-      if (!Number.isFinite(power) || power < 0 || power > 100) {
-        return `Row ${index + 1}: Power must be between 0 and 100.`;
+      if (!Number.isFinite(power) || power < BASELINE_METRIC_LIMITS.power.min || power > BASELINE_METRIC_LIMITS.power.max) {
+        return `Row ${index + 1}: Power must be between 0 and 10.`;
       }
     }
     return null;
@@ -10334,11 +10886,6 @@ function Baselines({
         entry._localId === row._localId ? { ...entry, inRoster: checked } : entry
       )
     );
-    setSavedBaselines((prev) =>
-      prev.map((entry) =>
-        entry._localId === row._localId ? { ...entry, inRoster: checked } : entry
-      )
-    );
     if (import.meta.env.DEV) {
       console.log('[ACTIVATE BASELINE]', {
         id: resolvedId,
@@ -10355,7 +10902,9 @@ function Baselines({
     try {
       const response = await getBaselinesWithMeta();
       const sourceRows = orderBaselinesForDisplay(response.baselines);
-      const rosterIdSet = new Set((matchRosterIds.length > 0 ? matchRosterIds : getRosterIds()).map((id) => baselineKey(id)));
+      const rosterIdSet = demoMode
+        ? new Set((matchRosterIds.length > 0 ? matchRosterIds : getRosterIds()).map((id) => baselineKey(id)))
+        : undefined;
       const normalized = sourceRows.map((row) => baselineToDraftRow(row, rosterIdSet));
       setSavedBaselines(normalized);
       setDraftBaselines(normalized.map((row) => ({ ...row })));
@@ -10393,6 +10942,7 @@ function Baselines({
   }, []);
 
   useEffect(() => {
+    if (!demoMode) return;
     const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
     const syncRow = (row: BaselineDraftRow): BaselineDraftRow => {
       const resolvedId = normalizeBaselineId(row.id || row.name);
@@ -10403,7 +10953,7 @@ function Baselines({
     };
     setDraftBaselines((prev) => prev.map(syncRow));
     setSavedBaselines((prev) => prev.map(syncRow));
-  }, [matchRosterIds]);
+  }, [demoMode, matchRosterIds]);
 
   useEffect(() => {
     setBaselineDraftCache(draftBaselines.map((row) => ({ ...row })));
@@ -10447,25 +10997,64 @@ function Baselines({
 
   const updateDraft = (localId: string, updates: Partial<BaselineDraftRow>) => {
     // Keep name as raw editable text during typing; normalize only on save.
-    setDraftBaselines((prev) =>
-      {
-        const nextRows = prev.map((row) => {
+    const boundedUpdates: Partial<BaselineDraftRow> = { ...updates };
+    if (Object.prototype.hasOwnProperty.call(updates, 'sleep')) {
+      boundedUpdates.sleep = clamp(
+        safeNum(updates.sleep, 0),
+        BASELINE_METRIC_LIMITS.sleep.min,
+        BASELINE_METRIC_LIMITS.sleep.max
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'recovery')) {
+      boundedUpdates.recovery = clamp(
+        safeNum(updates.recovery, 0),
+        BASELINE_METRIC_LIMITS.recovery.min,
+        BASELINE_METRIC_LIMITS.recovery.max
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'fatigueLimit')) {
+      boundedUpdates.fatigueLimit = clamp(
+        safeNum(updates.fatigueLimit, 0),
+        BASELINE_METRIC_LIMITS.fatigueLimit.min,
+        BASELINE_METRIC_LIMITS.fatigueLimit.max
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'control')) {
+      boundedUpdates.control = clamp(
+        safeNum(updates.control, 0),
+        BASELINE_METRIC_LIMITS.control.min,
+        BASELINE_METRIC_LIMITS.control.max
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'speed')) {
+      boundedUpdates.speed = clamp(
+        safeNum(updates.speed, 0),
+        BASELINE_METRIC_LIMITS.speed.min,
+        BASELINE_METRIC_LIMITS.speed.max
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'power')) {
+      boundedUpdates.power = clamp(
+        safeNum(updates.power, 0),
+        BASELINE_METRIC_LIMITS.power.min,
+        BASELINE_METRIC_LIMITS.power.max
+      );
+    }
+    setDraftBaselines((prev) => {
+      const nextRows = prev.map((row) => {
         if (row._localId !== localId) return row;
-        const nextName = updates.name !== undefined ? String(updates.name) : row.name;
-        const trimmedName = nextName.trim();
-        const derivedDraftId = row._isDraft ? (trimmedName.length > 0 ? trimmedName : '') : row.id;
+        const stableRowId = String(row.id || '').trim() || `plr-${row._localId}`;
         return {
           ...row,
-          ...updates,
-          name: nextName,
-          id: derivedDraftId,
-          inRoster: updates.inRoster !== undefined ? Boolean(updates.inRoster) : row.inRoster,
+          ...boundedUpdates,
+          name: boundedUpdates.name !== undefined ? String(boundedUpdates.name) : row.name,
+          id: stableRowId,
+          inRoster: boundedUpdates.inRoster !== undefined ? Boolean(boundedUpdates.inRoster) : row.inRoster,
         };
       });
-        syncDraftToRoster(nextRows);
-        return nextRows;
-      }
-    );
+      syncDraftToRoster(nextRows);
+      return nextRows;
+    });
     setSuccessMessage(null);
   };
 
@@ -10478,7 +11067,7 @@ function Baselines({
       const nextRow: BaselineDraftRow = {
         _localId: localId,
         _isDraft: true,
-        id: '',
+        id: createPersistentPlayerId(),
         name: '',
         role: 'BAT',
         active: true,
@@ -10700,7 +11289,11 @@ function Baselines({
             <GlowingBackButton onClick={onBack} />
           </div>
           <h2 className="text-3xl font-bold text-white">Player Baseline Models</h2>
-          <p className="text-slate-400 mt-1">Roster selection is session-based (local to this device). Baseline metrics are saved to Cosmos DB when you click Save Changes.</p>
+          <p className="text-slate-400 mt-1">
+            {demoMode
+              ? 'Demo mode keeps player data in localStorage only.'
+              : 'Baseline and roster fields are saved to Cosmos playersByUser when you click Save Changes.'}
+          </p>
         </div>
         <div className="flex gap-4">
           <button type="button"
@@ -10832,13 +11425,10 @@ function Baselines({
                    </td>
                  </tr>
 	               ) : (
-                 draftBaselines.map((p) => {
+                draftBaselines.map((p) => {
                   const isActive = p.inRoster === true;
-                  const isPersisted = !p._isDraft;
                   const trimmedName = p.name.trim();
-                  const idDisplay = p._isDraft
-                    ? (trimmedName ? trimmedName : '—')
-                    : (p.id || trimmedName || '—');
+                  const idDisplay = p.id || trimmedName || '—';
                   const rosterStatus = isActive
                     ? { label: 'In roster', color: 'text-indigo-200 bg-indigo-500/15 border-indigo-400/35' }
                     : { label: 'Not in roster', color: 'text-slate-300 bg-slate-700/30 border-slate-600/40' };
@@ -10854,13 +11444,8 @@ function Baselines({
                          type="text" 
                          placeholder="Enter player name..."
                          value={p.name}
-                         readOnly={isPersisted}
                          onChange={(e) => updateDraft(p._localId, { name: e.target.value })}
-                         className={`bg-transparent font-bold focus:outline-none border-b py-1 transition-colors w-full ${
-                           isPersisted
-                             ? 'text-slate-300 border-transparent cursor-not-allowed'
-                             : 'text-white border-transparent focus:border-emerald-500'
-                         }`}
+                         className="bg-transparent font-bold focus:outline-none border-b py-1 transition-colors w-full text-white border-transparent focus:border-emerald-500"
                        />
                    </td>
                    <td className="px-4 py-4">
@@ -10904,6 +11489,7 @@ function Baselines({
                        <input 
                          type="number" 
                          min="0"
+                         max="120"
                          value={p.recovery}
                          onChange={(e) => updateDraft(p._localId, { recovery: Number(e.target.value) })}
                          className="w-12 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
@@ -10932,7 +11518,7 @@ function Baselines({
                    <td className="px-4 py-4 text-center">
                      <input 
                        type="number" 
-                       min="0" max="100"
+                       min="0" max="15"
                        value={p.speed}
                        onChange={(e) => updateDraft(p._localId, { speed: Number(e.target.value) })}
                        className="w-12 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"
@@ -10941,7 +11527,7 @@ function Baselines({
                    <td className="px-4 py-4 text-center">
                      <input 
                        type="number" 
-                       min="0" max="100"
+                       min="0" max="10"
                        value={p.power}
                        onChange={(e) => updateDraft(p._localId, { power: Number(e.target.value) })}
                        className="w-12 bg-transparent text-center text-white font-mono focus:text-emerald-400 focus:outline-none"

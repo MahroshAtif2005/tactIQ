@@ -108,6 +108,364 @@ const parseUpstreamCode = (rawBody) => {
   }
 };
 
+const DOMAIN_REFUSAL_REPLY =
+  "I'm designed to help with cricket tactics, player performance, match analysis, workload, fatigue, recovery, and injury-risk decisions. Ask me anything in the cricket and coaching domain.";
+
+const DOMAIN_ALLOWED_KEYWORDS = [
+  'cricket',
+  'cricketer',
+  'cricketers',
+  'match',
+  'all-time',
+  'all time',
+  'greatest',
+  'goat',
+  'inning',
+  'innings',
+  'test cricket',
+  'odi',
+  't20',
+  'ipl',
+  'world cup',
+  'over',
+  'overs',
+  'death overs',
+  'death-over',
+  'bowler',
+  'bowlers',
+  'batter',
+  'batters',
+  'batsman',
+  'batsmen',
+  'all-rounder',
+  'all rounder',
+  'spinner',
+  'spinners',
+  'pace',
+  'fast bowler',
+  'seam',
+  'swing',
+  'fielding',
+  'captaincy',
+  'batting order',
+  'finisher',
+  'finishers',
+  'anchor',
+  'anchors',
+  'player comparison',
+  'compare players',
+  'best player',
+  'best bowler',
+  'best batter',
+  'batting',
+  'bowling',
+  'wicket',
+  'field',
+  'target',
+  'strike rate',
+  'economy rate',
+  'dot ball',
+  'boundary',
+  'run rate',
+  'pressure',
+  'phase',
+  'powerplay',
+  'death over',
+  'rotation',
+  'tactical',
+  'strategy',
+  'fatigue',
+  'strain',
+  'workload',
+  'load management',
+  'training load',
+  'recovery',
+  'injury',
+  'injuries',
+  'sports medicine',
+  'performance science',
+  'biomechanics',
+  'biomechanic',
+  'mechanics',
+  'bowling mechanics',
+  'batting strain',
+  'readiness',
+  'rehab',
+  'prehab',
+  'conditioning',
+  'soft tissue',
+  'hamstring',
+  'side strain',
+  'stress fracture',
+  'back stress',
+  'shoulder',
+  'elbow',
+  'wrist',
+  'ankle',
+  'knee',
+  'no-ball',
+  'noball',
+  'fitness',
+  'readiness',
+  'risk',
+  'spell',
+  'coach',
+];
+
+const DOMAIN_BLOCKED_KEYWORDS = [
+  'movie',
+  'movies',
+  'netflix',
+  'series',
+  'cinema',
+  'song',
+  'music',
+  'politics',
+  'election',
+  'president',
+  'government',
+  'trivia',
+  'general knowledge',
+  'capital of',
+  'recipe',
+  'restaurant',
+  'travel',
+  'weather',
+  'bitcoin',
+  'crypto',
+  'stock',
+  'investment',
+  'dating',
+  'relationship',
+  'joke',
+  'meme',
+  'football',
+  'soccer',
+  'basketball',
+  'tennis',
+  'hockey',
+  'baseball',
+  'nfl',
+  'nba',
+];
+
+const FOLLOW_UP_PATTERNS = [
+  /are you sure/,
+  /are u sure/,
+  /are you even ai/,
+  /are u even ai/,
+  /\bwhy\b/,
+  /\bexplain\b/,
+  /\belaborate\b/,
+  /\bwhat if\b/,
+  /\bhow sure\b/,
+  /\bcan you justify\b/,
+];
+
+const includesKeyword = (text, keyword) => {
+  if (!text || !keyword) return false;
+  return text.includes(keyword);
+};
+
+const DOMAIN_INTENT_KEYWORDS = [
+  'cricket',
+  'cricketer',
+  'greatest',
+  'all-time',
+  'all time',
+  'goat',
+  't20',
+  'odi',
+  'test cricket',
+  'ipl',
+  'world cup',
+  'strike rate',
+  'economy rate',
+  'death over',
+  'death overs',
+  'powerplay',
+  'captaincy',
+  'fielding',
+  'all-rounder',
+  'all rounder',
+  'spinner',
+  'pace',
+  'fast bowler',
+  'player comparison',
+  'best player',
+  'best bowler',
+  'best batter',
+  'bowling',
+  'batting',
+  'bowler',
+  'bowlers',
+  'batter',
+  'batters',
+  'batsman',
+  'batsmen',
+  'wicket',
+  'over',
+  'spell',
+  'tactical',
+  'strategy',
+  'pressure',
+  'run rate',
+  'fatigue',
+  'workload',
+  'training load',
+  'load management',
+  'recovery',
+  'strain',
+  'injur',
+  'risk',
+  'sports medicine',
+  'biomechan',
+  'mechanics',
+  'readiness',
+  'performance science',
+  'no-ball',
+  'noball',
+];
+
+const collectAllowedKeywordHits = (normalizedMessage) =>
+  DOMAIN_ALLOWED_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
+
+const collectBlockedKeywordHits = (normalizedMessage) =>
+  DOMAIN_BLOCKED_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
+
+const collectDomainIntentHits = (normalizedMessage) =>
+  DOMAIN_INTENT_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
+
+const hasCopilotContextSignals = (snapshot) => {
+  const matchContext = asRecord(snapshot.matchContext);
+  const telemetry = asRecord(snapshot.telemetry);
+  const players = asRecord(snapshot.players);
+  const coachOutput = asRecord(snapshot.coachOutput);
+  return Boolean(
+    Object.keys(matchContext).length > 0 ||
+      Object.keys(telemetry).length > 0 ||
+      Object.keys(players).length > 0 ||
+      Object.keys(coachOutput).length > 0
+  );
+};
+
+const classifyCopilotDomain = (message, history, snapshot) => {
+  const normalizedMessage = String(message || '').trim().toLowerCase();
+  const allowedHits = collectAllowedKeywordHits(normalizedMessage);
+  const blockedHits = collectBlockedKeywordHits(normalizedMessage);
+  const domainIntentHits = collectDomainIntentHits(normalizedMessage);
+  const followUpDetected = FOLLOW_UP_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
+  const hasRecentTurns = Array.isArray(history) && history.length > 0;
+  const hasContextSignals = hasCopilotContextSignals(snapshot);
+  const hasDomainIntent = domainIntentHits.length > 0;
+
+  if (blockedHits.length > 0 && !hasDomainIntent) {
+    return {
+      allowed: false,
+      reason: 'blocked_keyword',
+      allowedHits,
+      blockedHits,
+      domainIntentHits,
+      followUpDetected,
+    };
+  }
+
+  if (hasDomainIntent) {
+    return {
+      allowed: true,
+      reason: 'allowed_domain_intent',
+      allowedHits,
+      blockedHits,
+      domainIntentHits,
+      followUpDetected,
+    };
+  }
+
+  if (allowedHits.length > 0) {
+    return {
+      allowed: true,
+      reason: 'allowed_keyword',
+      allowedHits,
+      blockedHits,
+      domainIntentHits,
+      followUpDetected,
+    };
+  }
+
+  if (followUpDetected && (hasRecentTurns || hasContextSignals)) {
+    return {
+      allowed: true,
+      reason: 'contextual_follow_up',
+      allowedHits,
+      blockedHits,
+      domainIntentHits,
+      followUpDetected,
+    };
+  }
+
+  return {
+    allowed: false,
+    reason: 'out_of_domain',
+    allowedHits,
+    blockedHits,
+    domainIntentHits,
+    followUpDetected,
+  };
+};
+
+const buildCopilotSystemPrompt = () =>
+  [
+    'You are tactIQ Coach Copilot, a cricket tactical and performance intelligence assistant.',
+    'You are not a general chatbot.',
+    'You can answer questions about live match state, cricket tactics, format strategy (T20/ODI/Test), player comparisons, and cricket performance science.',
+    'Also answer questions about fatigue, workload, recovery, readiness, biomechanics, and injury-risk in cricket.',
+    'Ground responses in provided context when relevant, but do not force match-state references when the user asks broader cricket knowledge questions.',
+    'Do not invent unavailable metrics; if a key value is missing, state that briefly.',
+    'Your response style must be coach-facing: clear answer, cricket-specific reasoning, subtle signal, and practical implication.',
+    'Be concise but insightful (typically 3-6 sentences).',
+    'If a question is unrelated to this domain, refuse politely and redirect to cricket match guidance.',
+  ].join(' ');
+
+const buildCopilotSignalSummary = (snapshot) => {
+  const matchContextSnapshot = asRecord(snapshot.matchContextSnapshot);
+  const matchContext = asRecord(snapshot.matchContext);
+  const telemetry = asRecord(snapshot.telemetry);
+  const players = asRecord(snapshot.players);
+  const coachOutput = asRecord(snapshot.coachOutput);
+  const tacticalRecommendation = asRecord(coachOutput.tacticalRecommendation);
+  const combinedDecision = asRecord(coachOutput.combinedDecision);
+
+  const lines = [
+    `mode=${toText(matchContext.matchMode, matchContextSnapshot.matchMode, 'unknown')}`,
+    `format=${toText(matchContext.format, matchContextSnapshot.format, 'unknown')}`,
+    `phase=${toText(matchContext.phase, matchContextSnapshot.phase, 'unknown')}`,
+    `score=${toText(matchContext.scoreRuns, matchContextSnapshot.scoreRuns, '?')}/${toText(matchContext.wicketsInHand, matchContextSnapshot.wickets, '?')}`,
+    `overs=${toText(matchContext.overs, matchContextSnapshot.overs, '?')}.${toText(matchContext.balls, matchContextSnapshot.balls, '0')}`,
+    `requiredRunRate=${toText(matchContext.requiredRunRate, matchContextSnapshot.requiredRunRate, 'n/a')}`,
+    `selectedPlayer=${toText(telemetry.playerName, players.bowler, players.striker, 'unknown')}`,
+    `role=${toText(telemetry.role, 'unknown')}`,
+    `fatigueIndex=${toText(telemetry.fatigueIndex, 'n/a')}`,
+    `strainIndex=${toText(telemetry.strainIndex, 'n/a')}`,
+    `injuryRisk=${toText(telemetry.injuryRisk, 'n/a')}`,
+    `noBallRisk=${toText(telemetry.noBallRisk, 'n/a')}`,
+    `heartRateRecovery=${toText(telemetry.heartRateRecovery, 'n/a')}`,
+    `latestAction=${toText(
+      tacticalRecommendation.nextAction,
+      tacticalRecommendation.primary,
+      combinedDecision.immediateAction,
+      'n/a'
+    )}`,
+    `latestRationale=${toText(
+      tacticalRecommendation.why,
+      combinedDecision.rationale,
+      coachOutput.summary,
+      'n/a'
+    )}`,
+  ];
+
+  return lines.join('\n');
+};
+
 const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
   const coachOutput = asRecord(payload.coachOutput);
   const tacticalRecommendation = asRecord(coachOutput.tacticalRecommendation);
@@ -211,6 +569,38 @@ module.exports = async function copilotChat(context, req) {
     historyTurns: history.length,
   });
 
+  const domain = classifyCopilotDomain(message, history, contextSnapshot);
+  context.log?.('[copilot-chat] domain_guard', {
+    traceId,
+    routeCalled,
+    allowed: domain.allowed,
+    reason: domain.reason,
+    allowedHits: domain.allowedHits,
+    blockedHits: domain.blockedHits,
+    domainIntentHits: domain.domainIntentHits,
+    followUpDetected: domain.followUpDetected,
+  });
+
+  if (!domain.allowed) {
+    return respond(
+      jsonResponse(
+        200,
+        {
+          ok: true,
+          source: 'fallback',
+          mode: 'domain_guard',
+          routeCalled,
+          fallbackReason: `domain_guard:${domain.reason}`,
+          analysisIdUsed,
+          reply: DOMAIN_REFUSAL_REPLY,
+          messagesUsed: Math.min(10, countUserTurns(history) + 1),
+        },
+        {},
+        req
+      )
+    );
+  }
+
   const aoai = resolveAoaiRuntimeConfig();
   const requestUrl = buildAoaiChatUrl(aoai);
   const aiPathSelected = Boolean(aoai.ok && requestUrl);
@@ -257,15 +647,12 @@ module.exports = async function copilotChat(context, req) {
     );
   }
 
-  const systemPrompt = [
-    'You are tactIQ Copilot, a cricket tactical assistant.',
-    'Use the latest match context JSON as supporting context, but answer the current user message directly.',
-    'Do not recycle static tactical text; adapt to the exact user question and recent chat turns.',
-    'Keep responses concise, practical, and coaching-focused.',
-  ].join(' ');
+  const systemPrompt = buildCopilotSystemPrompt();
+  const signalSummary = buildCopilotSignalSummary(contextSnapshot);
 
   const messages = [
     { role: 'system', content: systemPrompt },
+    { role: 'system', content: `High-signal coaching context:\n${signalSummary}` },
     { role: 'system', content: `Current tactIQ context snapshot JSON:\n${contextJson}` },
     ...history.map((turn) => ({ role: turn.role, content: turn.content })),
     { role: 'user', content: message },

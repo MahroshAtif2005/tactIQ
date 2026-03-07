@@ -16,8 +16,6 @@
     "COSMOS_DATABASE": "tactiq-db",
     "AZURE_COSMOS_DATABASE": "tactiq-db",
     "COSMOS_CONTAINER_PLAYERS": "playersByUser",
-    "COSMOS_CONTAINER": "playersByUser",
-    "AZURE_COSMOS_CONTAINER": "playersByUser",
     "COSMOS_CONTAINER_USERS": "users",
     "AZURE_OPENAI_ENDPOINT": "",
     "AZURE_OPENAI_BASE_URL": "",

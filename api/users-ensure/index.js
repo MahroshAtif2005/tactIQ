@@ -71,6 +71,7 @@ module.exports = async function usersEnsure(context, req) {
         mode: postEnsureDiagnostics.mode,
         db: postEnsureDiagnostics.databaseId,
         container: postEnsureDiagnostics.playersContainerId,
+        requestedContainer: postEnsureDiagnostics.requestedPlayersContainerId || postEnsureDiagnostics.playersContainerId,
         endpointHost: postEnsureDiagnostics.endpointHost || 'n/a',
         authMode: postEnsureDiagnostics.authMode || null,
         requiredAppSettings: postEnsureDiagnostics.requiredAppSettings || [],

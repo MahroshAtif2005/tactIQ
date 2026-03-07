@@ -1,6 +1,7 @@
 import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalAgentResponse } from '../types/agents';
 import { Baseline, PlayerBaseline } from '../types/baseline';
 import { isDemoModeEnabled } from '../auth/swaAuth';
+import { cloneDemoBaselineSeed } from '../data/demoRoster';
 import { ensureDemoRosterSeeded, resetDemoRosterToDefaults } from './rosterStorage';
 
 export type ApiClientErrorKind = 'network' | 'timeout' | 'cors' | 'http' | 'parse';
@@ -748,6 +749,14 @@ const toNumberOr = (value: unknown, fallback: number): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 };
+const BASELINE_LIMITS = {
+  sleep: { min: 0, max: 12 },
+  recovery: { min: 0, max: 120 },
+  fatigueLimit: { min: 0, max: 10 },
+  control: { min: 0, max: 100 },
+  speed: { min: 0, max: 15 },
+  power: { min: 0, max: 10 },
+} as const;
 const normalizeOrderIndex = (value: unknown): number => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
@@ -758,6 +767,7 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
   if (!raw || typeof raw !== 'object') return null;
   const item = raw as Record<string, unknown>;
   const id = String(item.id || item.playerId || '').trim();
+  const baselineId = String(item.baselineId || item.playerId || item.id || '').trim();
   const roleRaw = String(item.role || '').trim().toUpperCase();
   if (!id) return null;
   const role = roleRaw === 'FAST' || roleRaw === 'SPIN' || roleRaw === 'BAT' || roleRaw === 'AR' ? roleRaw : 'FAST';
@@ -782,19 +792,34 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
 
   return {
     id,
+    baselineId: baselineId || id,
     playerId: id,
     name,
     role,
     isActive,
-    sleepHoursToday: Number.isFinite(sleepHoursToday) ? clamp(sleepHoursToday, 0, 12) : 7,
-    recoveryMinutes: Number.isFinite(recoveryMinutes) ? clamp(recoveryMinutes, 0, 240) : 45,
-    fatigueLimit: Number.isFinite(fatigueLimit) ? clamp(fatigueLimit, 0, 10) : 6,
-    controlBaseline: Number.isFinite(controlBaseline) ? clamp(controlBaseline, 0, 100) : 78,
-    speed: Number.isFinite(speed) ? clamp(speed, 0, 100) : 7,
-    power: Number.isFinite(power) ? clamp(power, 0, 100) : 6,
-    sleep: Number.isFinite(sleepHoursToday) ? clamp(sleepHoursToday, 0, 12) : 7,
-    recovery: Number.isFinite(recoveryMinutes) ? clamp(recoveryMinutes, 0, 240) : 45,
-    control: Number.isFinite(controlBaseline) ? clamp(controlBaseline, 0, 100) : 78,
+    sleepHoursToday: Number.isFinite(sleepHoursToday)
+      ? clamp(sleepHoursToday, BASELINE_LIMITS.sleep.min, BASELINE_LIMITS.sleep.max)
+      : 7,
+    recoveryMinutes: Number.isFinite(recoveryMinutes)
+      ? clamp(recoveryMinutes, BASELINE_LIMITS.recovery.min, BASELINE_LIMITS.recovery.max)
+      : 45,
+    fatigueLimit: Number.isFinite(fatigueLimit)
+      ? clamp(fatigueLimit, BASELINE_LIMITS.fatigueLimit.min, BASELINE_LIMITS.fatigueLimit.max)
+      : 6,
+    controlBaseline: Number.isFinite(controlBaseline)
+      ? clamp(controlBaseline, BASELINE_LIMITS.control.min, BASELINE_LIMITS.control.max)
+      : 78,
+    speed: Number.isFinite(speed) ? clamp(speed, BASELINE_LIMITS.speed.min, BASELINE_LIMITS.speed.max) : 7,
+    power: Number.isFinite(power) ? clamp(power, BASELINE_LIMITS.power.min, BASELINE_LIMITS.power.max) : 6,
+    sleep: Number.isFinite(sleepHoursToday)
+      ? clamp(sleepHoursToday, BASELINE_LIMITS.sleep.min, BASELINE_LIMITS.sleep.max)
+      : 7,
+    recovery: Number.isFinite(recoveryMinutes)
+      ? clamp(recoveryMinutes, BASELINE_LIMITS.recovery.min, BASELINE_LIMITS.recovery.max)
+      : 45,
+    control: Number.isFinite(controlBaseline)
+      ? clamp(controlBaseline, BASELINE_LIMITS.control.min, BASELINE_LIMITS.control.max)
+      : 78,
     active: isActive,
     inRoster,
     orderIndex: normalizeOrderIndex(item.orderIndex),
@@ -806,210 +831,15 @@ const normalizeBaseline = (raw: unknown): Baseline | null => {
 const DEMO_BASELINES_STORAGE_KEY = 'tactiq_demo_baselines_v1';
 const LEGACY_DEMO_BASELINES_STORAGE_KEY = 'tactiq:demoBaselines';
 const DEMO_SEEDED_STORAGE_KEY = 'tactiq_demo_seeded_v1';
-const DEFAULT_DEMO_BASELINES: Baseline[] = [
-  {
-    id: 'J. Archer',
-    playerId: 'J. Archer',
-    name: 'J. Archer',
-    role: 'FAST',
-    sleepHoursToday: 7.5,
-    recoveryMinutes: 45,
-    fatigueLimit: 6,
-    controlBaseline: 80,
-    speed: 9,
-    power: 0,
-    sleep: 7.5,
-    recovery: 45,
-    control: 80,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 1,
-  },
-  {
-    id: 'R. Khan',
-    playerId: 'R. Khan',
-    name: 'R. Khan',
-    role: 'SPIN',
-    sleepHoursToday: 7.1,
-    recoveryMinutes: 40,
-    fatigueLimit: 6,
-    controlBaseline: 86,
-    speed: 8,
-    power: 0,
-    sleep: 7.1,
-    recovery: 40,
-    control: 86,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 2,
-  },
-  {
-    id: 'M. Starc',
-    playerId: 'M. Starc',
-    name: 'M. Starc',
-    role: 'FAST',
-    sleepHoursToday: 6.8,
-    recoveryMinutes: 50,
-    fatigueLimit: 6,
-    controlBaseline: 79,
-    speed: 9,
-    power: 0,
-    sleep: 6.8,
-    recovery: 50,
-    control: 79,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 3,
-  },
-  {
-    id: 'H. Ali',
-    playerId: 'H. Ali',
-    name: 'H. Ali',
-    role: 'FAST',
-    sleepHoursToday: 7.2,
-    recoveryMinutes: 42,
-    fatigueLimit: 6,
-    controlBaseline: 77,
-    speed: 8,
-    power: 0,
-    sleep: 7.2,
-    recovery: 42,
-    control: 77,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 4,
-  },
-  {
-    id: 'S. Khan',
-    playerId: 'S. Khan',
-    name: 'S. Khan',
-    role: 'SPIN',
-    sleepHoursToday: 7.4,
-    recoveryMinutes: 48,
-    fatigueLimit: 6,
-    controlBaseline: 84,
-    speed: 7,
-    power: 0,
-    sleep: 7.4,
-    recovery: 48,
-    control: 84,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 5,
-  },
-  {
-    id: 'B. Stokes',
-    playerId: 'B. Stokes',
-    name: 'B. Stokes',
-    role: 'AR',
-    sleepHoursToday: 7.0,
-    recoveryMinutes: 50,
-    fatigueLimit: 6,
-    controlBaseline: 76,
-    speed: 7,
-    power: 8,
-    sleep: 7.0,
-    recovery: 50,
-    control: 76,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 6,
-  },
-  {
-    id: 'V. Kohli',
-    playerId: 'V. Kohli',
-    name: 'V. Kohli',
-    role: 'BAT',
-    sleepHoursToday: 7.8,
-    recoveryMinutes: 55,
-    fatigueLimit: 7,
-    controlBaseline: 90,
-    speed: 6,
-    power: 8,
-    sleep: 7.8,
-    recovery: 55,
-    control: 90,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 7,
-  },
-  {
-    id: 'B. Azam',
-    playerId: 'B. Azam',
-    name: 'B. Azam',
-    role: 'BAT',
-    sleepHoursToday: 7.6,
-    recoveryMinutes: 52,
-    fatigueLimit: 7,
-    controlBaseline: 89,
-    speed: 6,
-    power: 7,
-    sleep: 7.6,
-    recovery: 52,
-    control: 89,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 8,
-  },
-  {
-    id: 'K. Williamson',
-    playerId: 'K. Williamson',
-    name: 'K. Williamson',
-    role: 'BAT',
-    sleepHoursToday: 7.7,
-    recoveryMinutes: 54,
-    fatigueLimit: 7,
-    controlBaseline: 88,
-    speed: 6,
-    power: 6,
-    sleep: 7.7,
-    recovery: 54,
-    control: 88,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 9,
-  },
-  {
-    id: 'G. Maxwell',
-    playerId: 'G. Maxwell',
-    name: 'G. Maxwell',
-    role: 'AR',
-    sleepHoursToday: 7.3,
-    recoveryMinutes: 47,
-    fatigueLimit: 6,
-    controlBaseline: 74,
-    speed: 6,
-    power: 9,
-    sleep: 7.3,
-    recovery: 47,
-    control: 74,
-    active: true,
-    isActive: true,
-    inRoster: true,
-    orderIndex: 10,
-  },
-];
-
-const cloneDemoBaselines = (rows: Baseline[]): Baseline[] => rows.map((entry) => ({ ...entry }));
-
 const readDemoBaselines = (): Baseline[] => {
-  if (typeof window === 'undefined') return cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+  if (typeof window === 'undefined') return cloneDemoBaselineSeed();
   try {
     const raw = window.localStorage.getItem(DEMO_BASELINES_STORAGE_KEY);
     const legacyRaw = raw ? null : window.localStorage.getItem(LEGACY_DEMO_BASELINES_STORAGE_KEY);
     const candidateRaw = raw || legacyRaw;
     const seededFlag = String(window.localStorage.getItem(DEMO_SEEDED_STORAGE_KEY) || '').trim().toLowerCase() === 'true';
     if (!candidateRaw) {
-      const seeded = cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+      const seeded = cloneDemoBaselineSeed();
       writeDemoBaselines(seeded);
       window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
       return seeded;
@@ -1023,12 +853,12 @@ const readDemoBaselines = (): Baseline[] => {
       }
       return normalized;
     }
-    const seeded = cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+    const seeded = cloneDemoBaselineSeed();
     writeDemoBaselines(seeded);
     window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
     return seeded;
   } catch {
-    const seeded = cloneDemoBaselines(DEFAULT_DEMO_BASELINES);
+    const seeded = cloneDemoBaselineSeed();
     writeDemoBaselines(seeded);
     try {
       window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
@@ -1132,14 +962,22 @@ export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal)
   }
   const players: PlayerBaseline[] = baselines.map((row) => ({
     id: String(row.id || row.playerId || '').trim(),
+    playerId: String(row.playerId || row.id || '').trim(),
+    baselineId: String((row as Record<string, unknown>).baselineId || row.id || row.playerId || '').trim(),
     type: 'playerBaseline',
     role: row.role,
-    sleep: clamp(toNumberOr(row.sleep ?? row.sleepHoursToday, 7), 0, 12),
-    recovery: clamp(toNumberOr(row.recovery ?? row.recoveryMinutes, 45), 0, 240),
-    fatigueLimit: clamp(toNumberOr(row.fatigueLimit, 6), 0, 10),
-    control: clamp(toNumberOr(row.control ?? row.controlBaseline, 78), 0, 100),
-    speed: clamp(toNumberOr(row.speed, 7), 0, 100),
-    power: clamp(toNumberOr(row.power, 0), 0, 100),
+    sleep: clamp(toNumberOr(row.sleep ?? row.sleepHoursToday, 7), BASELINE_LIMITS.sleep.min, BASELINE_LIMITS.sleep.max),
+    recovery: clamp(toNumberOr(row.recovery ?? row.recoveryMinutes, 45), BASELINE_LIMITS.recovery.min, BASELINE_LIMITS.recovery.max),
+    fatigueLimit: clamp(
+      toNumberOr(row.fatigueLimit, 6),
+      BASELINE_LIMITS.fatigueLimit.min,
+      BASELINE_LIMITS.fatigueLimit.max
+    ),
+    control: clamp(toNumberOr(row.control ?? row.controlBaseline, 78), BASELINE_LIMITS.control.min, BASELINE_LIMITS.control.max),
+    speed: clamp(toNumberOr(row.speed, 7), BASELINE_LIMITS.speed.min, BASELINE_LIMITS.speed.max),
+    power: clamp(toNumberOr(row.power, 0), BASELINE_LIMITS.power.min, BASELINE_LIMITS.power.max),
+    active: typeof row.active === 'boolean' ? row.active : row.isActive,
+    inRoster: typeof row.inRoster === 'boolean' ? row.inRoster : undefined,
     name: String(row.name || row.id || row.playerId || '').trim() || undefined,
     ...(normalizeOrderIndex(row.orderIndex) > 0 ? { orderIndex: normalizeOrderIndex(row.orderIndex) } : {}),
     createdAt: row.createdAt,
@@ -1251,7 +1089,7 @@ export async function resetBaselines(signal?: AbortSignal): Promise<void> {
         // Ignore storage failures in restricted browser modes.
       }
     }
-    writeDemoBaselines(cloneDemoBaselines(DEFAULT_DEMO_BASELINES));
+    writeDemoBaselines(cloneDemoBaselineSeed());
     resetDemoRosterToDefaults();
     if (typeof window !== 'undefined') {
       try {

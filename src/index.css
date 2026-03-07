@@ -399,15 +399,41 @@
     height: auto;
   }
 
-  .match-over-input::-webkit-outer-spin-button,
-  .match-over-input::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
+  .over-input {
+    box-sizing: border-box;
+    line-height: 1.25rem;
+    font-size: inherit;
   }
 
-  .match-over-input[type="number"] {
+  .over-input::-webkit-outer-spin-button,
+  .over-input::-webkit-inner-spin-button {
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease;
+    height: auto;
+  }
+
+  .over-input:hover::-webkit-outer-spin-button,
+  .over-input:hover::-webkit-inner-spin-button,
+  .over-input:focus::-webkit-outer-spin-button,
+  .over-input:focus::-webkit-inner-spin-button,
+  .over-input:focus-visible::-webkit-outer-spin-button,
+  .over-input:focus-visible::-webkit-inner-spin-button {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .over-input[type="number"] {
+    appearance: auto;
     -moz-appearance: textfield;
-    appearance: textfield;
+    box-sizing: border-box;
+  }
+
+  .over-input[type="number"]:hover,
+  .over-input[type="number"]:focus,
+  .over-input[type="number"]:focus-visible {
+    -moz-appearance: number-input;
   }
 
   [hidden]:where(:not([hidden="until-found"])) {

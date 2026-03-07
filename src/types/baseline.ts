@@ -2,6 +2,8 @@ export type BaselineRole = 'FAST' | 'SPIN' | 'BAT' | 'AR';
 
 export interface PlayerBaseline {
   id: string;
+  playerId?: string;
+  baselineId?: string;
   type?: 'playerBaseline';
   role: BaselineRole;
   sleep: number;
