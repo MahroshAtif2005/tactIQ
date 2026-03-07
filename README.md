@@ -40,7 +40,11 @@ It converts match context and player state into coach like actionable guidance.
 
 ### Role Based Context
 - Different logic for batters and bowlers  
-- Tactical panels that adapt to the selected player role  
+- Tactical panels that adapt to the selected player role
+
+
+tactIQ introduces a router based multi-agent architecture that dynamically selects specialized AI agents based on live match signals.
+Instead of running a single model prompt, the system orchestrates fatigue analysis, injury risk assessment, and tactical reasoning agents to produce explainable coaching decisions.
 
 ---
 
@@ -55,463 +59,565 @@ The goal is not just to show numbers but to guide decisions.
 
 ---
 
+
 ## Tech Stack
 
-- Frontend React + TypeScript + Vite  
-- UI Components Radix UI + Tailwind CSS  
-- Icons Lucide React  
-- Backend Azure Functions
-- Azure OpenAI 
+| Layer | Technology | Purpose |
+|------|-------------|---------|
+| Frontend | React + TypeScript + Vite | Interactive analytics dashboard and UI |
+| Hosting | Azure Static Web Apps | Cloud hosting for the frontend application |
+| Backend | Azure Functions | Serverless API layer and multi-agent orchestration |
+| Authentication | Microsoft Identity | Secure user login and session management |
+| Database | Azure Cosmos DB | Stores players, coaches, match sessions, and AI recommendations |
+| AI Engine | Azure OpenAI Service | Powers fatigue analysis, risk assessment, and tactical reasoning |
+| CI/CD | GitHub Actions | Automated build and deployment pipeline |
+| Development | GitHub Copilot | AI-assisted development workflow |
+
+---
+
+## Microsoft AI & Azure Architecture
+
+| Technology | Role in tactIQ |
+|-------------|----------------|
+| **Azure OpenAI Service** | Core AI reasoning engine powering the Fatigue, Injury Risk, and Tactical agents that generate explainable coaching recommendations |
+| **Azure Functions** | Serverless orchestration layer that builds match context, coordinates the multi-agent pipeline, and executes AI decision workflows |
+| **Azure Static Web Apps** | Hosts the tactIQ analytics dashboard and securely integrates the frontend with the Azure Functions API layer |
+| **Azure Cosmos DB** | Persistent storage for user accounts, team rosters, player baselines, and historical workload intelligence |
+| **Router-Based Multi-Agent Architecture** | tactIQ dynamically selects and executes specialist agents (Fatigue, Risk, Tactical) based on live match signals, supporting both smart routing and full parallel analysis modes |
+| **Context-Aware Copilot Chat** | Allows coaches to interact with the AI analysis, understand recommendations, and explore alternative tactical scenarios |
+| **GitHub Copilot** | AI-assisted development used to accelerate UI implementation, backend APIs, and agent orchestration logic |
+| **GitHub Actions** | CI/CD pipeline that automatically builds and deploys tactIQ to Azure |
 
 ---
 
 ## Use Cases
 
-- Live tactical coaching support  
-- Player workload management  
-- Substitution decision systems  
-- AI sports assistant platforms  
-- Simulation and strategy tools  
-
+- Live tactical coaching support during matches  
+- Player fatigue monitoring and workload management  
+- Injury risk awareness and player safety decision support  
+- Substitution and rotation decision guidance  
+- Match situation analysis (on-track vs under-pressure states)  
+- Performance projection and tactical timing indicators  
+- Context-aware Copilot chat for deeper tactical explanation and scenario exploration  
+- Visual analytics dashboards for fatigue trends and match pressure signals
+  
 ---
+## Run Locally
 
-## Run locally
+tactIQ runs with a serverless Azure Functions backend and a React + Vite frontend.
 
-This project runs with:
+- Backend (Azure Functions): http://localhost:7071
+- Frontend (Vite): http://localhost:5173
+- Frontend API base: /api (same-origin)
 
-- **Backend (Azure Functions):** `http://localhost:7071`
-- **Frontend (Vite):** `http://localhost:5173`
-- **Frontend API base:** `/api` (same-origin). Vite proxies `/api` to Functions in local dev.
+In local development, Vite automatically proxies `/api/*` requests to the Azure Functions backend.
 
 ---
 
 ## Install Dependencies
 
-From the project root:
+From the project root run:
 
-```bash
-npm install
+npm install  
 npm --prefix api install
-```
 
 ---
 
 ## Configure Environment
 
-Set required keys in `api/local.settings.json` under `Values`:
+Create or update `api/local.settings.json` with the required environment variables.
 
-```json
+Example configuration:
+
 {
+  "IsEncrypted": false,
   "Values": {
     "AZURE_OPENAI_ENDPOINT": "https://<resource>.openai.azure.com/",
     "AZURE_OPENAI_API_KEY": "<key>",
     "AZURE_OPENAI_DEPLOYMENT": "<deployment-name>",
     "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
-    "CORS_ALLOWED_ORIGINS": "http://localhost:5173"
+    "CORS_ALLOWED_ORIGINS": "http://localhost:5173",
+    "COSMOS_ENDPOINT": "<cosmos-endpoint>",
+    "COSMOS_KEY": "<cosmos-key>",
+    "COSMOS_DB": "<database-name>",
+    "COSMOS_CONTAINER_PLAYERS": "<container-name>"
   }
 }
-```
+
+These settings enable Azure OpenAI agent reasoning and Cosmos DB persistence.
 
 ---
 
-## Start Backend (API)
+## Start Backend (Azure Functions)
 
-Terminal 1:
+Open Terminal 1:
 
-```bash
-cd api
-npm install
+cd api  
+npm install  
 func start
-```
 
-Backend runs on `http://localhost:7071`.
+Backend runs on:
+
+http://localhost:7071
 
 ---
 
 ## Start Frontend (Vite)
 
-Terminal 2 (project root):
+Open Terminal 2 (project root):
 
-```bash
-npm install
+npm install  
 npm run dev
-```
 
-Frontend runs on `http://localhost:5173`.
+Frontend runs on:
+
+http://localhost:5173
 
 ---
 
 ## Frontend API Configuration
 
-In the root `.env` file (frontend environment):
+Create a `.env` file in the project root with:
 
-```env
 VITE_API_BASE_URL=/api
-```
 
-In local dev, Vite proxy forwards `/api/*` to `http://localhost:7071/*`.
-In Azure Static Web Apps deployment, `/api/*` is routed by SWA to Functions.
+During development:
+
+/api/* → http://localhost:7071/*
+
+In Azure Static Web Apps deployment, `/api/*` is automatically routed to Azure Functions.
 
 ---
 
-## Manual Verification
+## Manual API Verification
 
-Test API connectivity:
+Test backend endpoints:
 
-```bash
-# Health check
+Health check  
 curl http://localhost:7071/api/health
 
-# Get baselines
+Retrieve player baselines  
 curl http://localhost:7071/api/baselines
 
-# Test orchestrate endpoint
-curl -X POST http://localhost:7071/api/orchestrate \
-  -H "Content-Type: application/json" \
-  -d '{"context":{}}'
-```
+Run agent orchestration  
+curl -X POST http://localhost:7071/api/orchestrate -H "Content-Type: application/json" -d '{"context":{}}'
 
 ---
 
 ## Available Local API Endpoints
 
-- `GET  http://localhost:7071/api/health`
-- `POST http://localhost:7071/api/orchestrate`
-- `GET  http://localhost:7071/api/baselines`
-- `POST http://localhost:7071/api/baselines`
-- `POST http://localhost:7071/api/users/ensure`
+GET  /api/health  
+POST /api/orchestrate  
+GET  /api/baselines  
+POST /api/baselines  
+POST /api/users/ensure
 
 ---
 
 ## Important Notes
 
-- Do **not** run any other service on port `7071` while the backend is running.
-- If you modify `.env`, restart the backend and frontend.
-- Frontend should call `/api/*` only (same-origin); do not hardcode `http://localhost:7071` in browser calls.
+- Ensure no other service is running on port 7071 when starting Azure Functions.
+- Restart the backend and frontend if environment variables change.
+- Frontend requests should always call `/api/*` rather than hardcoding the backend URL.
 - Demo mode stores baselines in browser localStorage and bypasses Cosmos writes by design.
-- `GET /api/baselines` now returns storage diagnostics (`source`, `storage`, optional `warning`) so you can confirm reads/writes are hitting `playersByUser` and not memory fallback.
-- In production, set Cosmos app settings in SWA/Functions using either `COSMOS_*` or `AZURE_COSMOS_*` aliases (`ENDPOINT`, `KEY`, optional `CONNECTION_STRING`, `DB`, `CONTAINER_PLAYERS`).
+- In production, configure Cosmos DB and Azure OpenAI credentials using Azure application settings.
 
+  ## tactIQ system architecture
 
-                                     ARCHITECTURE (tactIQ)
-                   (Microsoft Foundry + Agent Framework + Azure Services + GitHub/Copilot)
-```txt
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ USERS (Coach / Analyst / Judges)                                             │
-│ Web UI: Vite + React                                                        │
-│  - Dashboard: Match context + Players + Signals                              │
-│  - Controls: "Run Selected Agent" | "Run All Agents"                         │
-│  - Output: Agent cards + Final Recommendation + Trace/Router info            │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                   │ HTTPS
-                                   ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ AZURE CLOUD                                                                  │
-│                                                                              │
-│  ┌───────────────────────────────┐        REST        ┌────────────────────┐ │
-│  │ Azure App Service (Web/API)   │ ───────────────▶   │ Node.js/Express API│ │
-│  │  - Hosts UI + API endpoints   │                    │  - Validates inputs │ │
-│  │  - Public demo endpoint       │                    │  - Builds session   │ │
-│  └───────────────────────────────┘                    │    context          │ │
-│                                                       │  - Endpoints:       │ │
-│                                                       │    /api/orchestrate │ │
-│                                                       │    /api/agent/:name │ │
-│                                                       └─────────┬──────────┘ │
-│                                                                 │ invokes
-│                                                                 ▼
-│  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │ MICROSOFT AGENT FRAMEWORK (Agent Runtime + Tools)                        │ │
-│  │  - Supervisor/Orchestrator Agent                                         │ │
-│  │     • conversation state + routing policy                                │ │
-│  │     • can run: single specialist OR full multi-agent pass                │ │
-│  │  - Specialist Agents (callable tools)                                    │ │
-│  │     1) Fatigue Agent  → workload + recovery drift                         │ │
-│  │     2) Risk Agent     → injury/no-ball risk + alerts                      │ │
-│  │     3) Tactical Agent → substitution + next-action recommendations        │ │
-│  │  - Final Recommendation Synthesizer                                      │ │
-│  │     • merges outputs into one decision + confidence + rationale           │ │
-│  └───────────────────────────────┬─────────────────────────────────────────┘ │
-│                                  │ model calls                              │
-│                                  ▼                                          │
-│  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │ MICROSOFT AI FOUNDRY (Azure AI Foundry / Azure OpenAI)                    │ │
-│  │  - Model deployments + secure endpoints                                   │ │
-│  │  - Policy/Router Layer (optional)                                         │ │
-│  │     • intent detection                                                    │ │
-│  │     • cost/latency-aware model choice                                     │ │
-│  │     • safe fallback routing                                               │ │
-│  └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │ AZURE COSMOS DB (Primary Data Store)                                      │ │
-│  │  Stores:                                                                  │ │
-│  │   - Baseline Player Model (active/inactive flags)                         │ │
-│  │   - Rosters per team/match                                                │ │
-│  │   - Match state snapshots (overs, wickets, partnerships, etc.)            │ │
-│  │   - Agent runs + outputs (trace logs + structured results)                │ │
-│  │   - Recommendations history + feedback (coach accept/reject)              │ │
-│  │                                                                           │ │
-│  │  Read/Write patterns:                                                     │ │
-│  │   - UI → API: roster edits, run agent requests                            │ │
-│  │   - API ↔ Cosmos: persist roster + match state + agent results            │ │
-│  │   - Orchestrator/Agents: fetch context, write outputs + traces            │ │
-│  └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Response: JSON (agent cards + final decision + trace + saved run id)         │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ UI "ANALYSIS OUTPUT" PANEL                                                   │
-│  - Shows router intent + signals                                              │
-│  - Shows agent status: skipped / ok / fallback                                │
-│  - Shows final recommendation + confidence                                    │
-│  - Links: "View saved run" (Cosmos run id)                                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-DEV + DELIVERY TOOLING (MICROSOFT + GITHUB)
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ GitHub Repo                                                                   │
-│  - Source code, issues, README, architecture diagram                          │
-│ GitHub Actions (CI/CD)                                                        │
-│  - Build + deploy to Azure App Service                                        │
-│ GitHub Copilot                                                                │
-│  - Assisted coding: UI, API endpoints, Agent Framework glue, tests, refactors │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-
-````
 ```mermaid
-flowchart TB
-Coach[Coach] --> UI[Web UI]
-UI --> API[Backend API]
-API --> CTX[Orchestrator]
-CTX --> ROUTER[Model Router]
-ROUTER --> FAT[Fatigue Agent]
-ROUTER --> RISK[Injury Risk Agent]
-ROUTER --> TAC[Tactical Agent]
-FAT --> AOAI[Azure OpenAI]
-RISK --> AOAI
-TAC --> AOAI
-ROUTER --> AOAI
-CTX --> COSMOS[Cosmos DB]
-API --> INSIGHTS[Application Insights]
-Repo[GitHub Repo] --> Copilot[Copilot Agent Mode]
-Copilot --> CI[GitHub Actions]
-CI --> API
+flowchart TD
+    U[Coach / Analyst / Judge] --> FE[React Frontend UI<br/>Batting • Bowling • Copilot • Advanced View]
+
+    FE --> AUTH[User Login / Session State]
+    FE --> API[Azure Functions API Layer]
+
+    subgraph Frontend Experience
+        FE1[Match Dashboard]
+        FE2[Coach Agent Trigger]
+        FE3[Copilot Chat]
+        FE4[Advanced View / Debug Telemetry]
+    end
+
+    FE --> FE1
+    FE --> FE2
+    FE --> FE3
+    FE --> FE4
+
+    API --> ORCH[Coach Orchestrator / Router]
+
+    ORCH --> MODE{Run Mode}
+    MODE -->|Smart Route| ROUTER[Signal-based Routing Logic]
+    MODE -->|Full Analysis| PARA[Force Parallel Agent Execution]
+
+    ROUTER --> FAT[Fatigue Agent]
+    ROUTER --> RISK[Injury Risk Agent]
+    ROUTER --> TAC[Tactical Recommendation Agent]
+
+    PARA --> FAT
+    PARA --> RISK
+    PARA --> TAC
+
+    FAT --> AOAI[Azure OpenAI]
+    RISK --> AOAI
+    TAC --> AOAI
+
+    API --> DB[(Cosmos DB / App Data Store)]
+    ORCH --> DB
+    FAT --> DB
+    RISK --> DB
+    TAC --> DB
+
+    FE3 --> COPI[Coprocessed Copilot Q&A Context]
+    COPI --> API
+    COPI --> AOAI
+    COPI --> DB
+
+    DB --> DATA[Players • Coaches • Match State<br/>Baselines • Decisions • Chat Context]
+
+    FAT --> COMBINE[Result Aggregator]
+    RISK --> COMBINE
+    TAC --> COMBINE
+
+    COMBINE --> RESP[Structured Tactical Output]
+    RESP --> API
+    API --> FE
+
+    FE --> OUT1[Fatigue Analysis Card]
+    FE --> OUT2[Injury Risk Card]
+    FE --> OUT3[Tactical Recommendation]
+    FE --> OUT4[Advanced View: Agents Selected / Debug Status]
+
 ```
+## Microsoft architecture
+```mermaid
+flowchart LR
+    DEV[Developer] --> GH[GitHub Repository]
+    DEV --> COP[GitHub Copilot / Agent-assisted Development]
 
-#  System Flow
+    GH --> CI[GitHub Actions CI/CD]
+    CI --> SWA[Azure Static Web Apps]
+    CI --> FUNC[Azure Functions Deployment]
 
-tactIQ is an AI tactical coaching system that runs a multi-agent analysis pipeline on live match context.  
-It supports two execution modes:
+    USER[Coach / Analyst / Judge Browser] --> SWA
+    SWA --> AUTH[Microsoft Identity / Login Layer]
+    SWA --> FUNC
 
-- **Auto Mode (Model Router)** → runs only the required agents based on workload signals  
-- **Run Full Analysis** → forces Fatigue, Injury Risk, and Tactical agents to run together for a complete coaching briefing  
+    FUNC --> AOAI[Azure OpenAI Service]
+    FUNC --> COSMOS[Azure Cosmos DB]
 
-Both modes follow the same core flow.
+    COSMOS --> STORE[Players • Coaches • Match Sessions<br/>Recommendations • Copilot Context]
+
+    FUNC --> ORCH[Agent Orchestration Layer]
+    ORCH --> AG1[Fatigue Agent]
+    ORCH --> AG2[Risk Agent]
+    ORCH --> AG3[Tactical Agent]
+
+    AG1 --> AOAI
+    AG2 --> AOAI
+    AG3 --> AOAI
+
+    SWA --> UX[Premium Cricket Analytics UI]
+    FUNC --> TELE[Telemetry / Debug Output / Advanced View]
+
+    COP -. accelerates .-> GH
+    AOAI --> RESP[AI-Generated Recommendations]
+    RESP --> FUNC
+    FUNC --> SWA
+```
+tactIQ follows an agentic AI architecture pattern, where specialized AI agents collaborate through an orchestration layer to produce explainable decisions
+
+# System Flow
+
+tactIQ is an AI-powered tactical coaching platform that runs a **multi-agent analysis pipeline** on live match context.  
+The system combines workload analytics, historical player baselines, and contextual match intelligence to generate explainable tactical recommendations.
+
+tactIQ supports two execution modes:
+
+- **Auto Mode (Model Router)** → dynamically selects which agents should run based on workload and match signals  
+- **Run Full Analysis** → forces Fatigue, Injury Risk, and Tactical agents to run together to generate a full coaching briefing  
+
+Both modes follow the same core decision pipeline.
 
 ---
 
 ## 1. Coach Interaction (Web UI)
 
-The coach:
+The coach interacts with tactIQ through the analytics dashboard.
 
-- selects the **match state** (batting or bowling)  
-- chooses players from the **roster**  
-- can **add new players**, which automatically creates a baseline entry in **Azure Cosmos DB**  
-- inputs workload, strain, and overs  
+The user can:
 
-Each player stored in the roster has:
+- select the **match state** (batting or bowling)
+- choose players from the **team roster**
+- add new players to the roster
+- input workload signals such as overs bowled, strain, and fatigue indicators
 
-- baseline workload profile  
-- recovery averages  
-- fatigue limits  
+When a new player is added, tactIQ automatically creates a **baseline profile stored in Azure Cosmos DB**.
 
-This creates a **historical performance layer** used in future matches.
+Each player baseline contains:
 
----
+- workload patterns
+- recovery averages
+- fatigue thresholds
+- historical performance signals
 
-## 2. State Enforcement (Role Safety)
-
-tactIQ validates match context before running AI:
-
-- Running a **bowler in batting mode** triggers a notification to switch state  
-- Running a **batter in bowling mode** does the same  
-- Tactical recommendations are **role-safe**:
-  - Bowling → suggests the next best bowler to rotate in  
-  - Batting → suggests the next best batter  
-
-This prevents invalid substitutions.
+Over time this creates a **persistent player intelligence layer** used across future matches.
 
 ---
 
-## 3. Backend Context Builder (Azure App Service)
+## 2. Context & Role Validation
 
-The Node/Express API:
+Before any AI analysis runs, tactIQ validates the match context.
 
-- validates match state  
-- builds the session context  
-- fetches player baselines from **Azure Cosmos DB**  
-- computes:
-  - workload accumulation  
-  - strain trend  
-  - recovery gap  
-  - fatigue index  
+Examples:
 
----
+- Running a **bowler in batting mode** triggers a notification to switch state
+- Running a **batter in bowling mode** triggers the same safeguard
 
-## 4. Orchestrator (Agent Framework Pattern)
+Tactical recommendations are always **role-safe**:
 
-The orchestrator prepares a structured AI context containing:
+- Bowling mode → recommends the best bowler to rotate in
+- Batting mode → recommends the most suitable batter
 
-- match situation  
-- player role  
-- overs remaining  
-- workload trend  
-- historical baseline  
-
-This context is passed to the **Model Router**.
+This prevents invalid substitutions and keeps the decision system aligned with match reality.
 
 ---
 
-## 5. Model Router (Azure OpenAI)
+## 3. Backend Context Builder (Azure Functions)
 
-In **Auto Mode**, the router decides which agents to run:
+The Azure Functions backend constructs the AI reasoning context.
 
-- **Fatigue Agent** → when workload or strain is high  
-- **Injury Risk Agent** → when recovery deficit or overload is detected  
-- **Tactical Agent** → always runs  
+The backend:
 
-In **Run Full Analysis**, all agents execute regardless of thresholds.
+- validates the match state
+- loads player baselines from **Azure Cosmos DB**
+- builds a structured session context
+- calculates workload indicators such as:
 
-The router outputs a deterministic execution plan.
+  - workload accumulation
+  - strain trends
+  - recovery gap
+  - fatigue index
+
+This structured context becomes the **input signal set for the AI orchestration layer**.
 
 ---
 
-## 6. Specialist Agents
+## 4. Agent Orchestrator
 
-### 🔵 Fatigue Agent
+The **Orchestrator** prepares a unified decision context containing:
+
+- match situation
+- player role
+- overs remaining
+- workload trends
+- historical baselines
+- fatigue indicators
+- contextual match pressure
+
+The orchestrator coordinates the AI pipeline and passes this structured context to the **Model Router**.
+
+---
+
+## 5. Model Router (Agent Selection Layer)
+
+The **Model Router**, powered by Azure OpenAI, determines which specialist agents should run.
+
+In **Auto Mode**, the router analyzes the context signals and decides which agents are necessary:
+
+- **Fatigue Agent** → triggered when workload or strain signals exceed thresholds
+- **Injury Risk Agent** → triggered when recovery deficits or overload patterns appear
+- **Tactical Agent** → always runs to evaluate match strategy
+
+In **Run Full Analysis**, the system bypasses routing and executes **all agents together in parallel** to produce a full tactical report.
+
+The router outputs a **deterministic execution plan** used by the orchestrator.
+
+---
+
+## 6. Specialist AI Agents
+
+Each agent focuses on a different decision dimension.
+
+### Fatigue Agent
+
 Analyzes:
 
-- workload spikes  
-- strain accumulation  
-- recovery vs baseline  
-- sleep deficit  
+- workload spikes
+- strain accumulation
+- recovery vs baseline
+- workload sustainability
 
 Outputs:
 
-- fatigue level  
-- rest recommendation  
-- substitution urgency  
-- **fatigue forecast graph** for upcoming overs
+- fatigue level
+- rest recommendation
+- substitution urgency
+- projected fatigue curve across upcoming overs
 
 ---
 
-### 🔴 Injury Risk Agent
-Identifies:
+### Injury Risk Agent
 
-- probable injury type (e.g., hamstring overload, shoulder strain)  
-- trigger factors  
-- safe workload limits  
+Evaluates:
+
+- workload overload patterns
+- fatigue overlap
+- biomechanical stress indicators
 
 Outputs:
 
-- risk level  
+- injury risk probability
+- potential injury type
+- safe workload limits
 - recommended action:
-  - continue  
-  - rotate  
-  - **mark unfit**
 
-Also generates an **injury risk forecast curve** if the player continues.
+  - continue
+  - rotate
+  - mark player unfit
+
+The agent also generates a **risk projection curve** if the player continues.
 
 ---
 
-### 🟡 Tactical Agent
-Produces:
+### Tactical Agent
 
-- match situation depiction  
-- next best move  
-- **which player to switch in** (role-safe)  
-- context-aware strategy (rotate bowler, send aggressor, delay acceleration)
+Analyzes the match situation and produces coaching recommendations.
+
+Outputs include:
+
+- match pressure assessment
+- next tactical move
+- suggested player rotation
+- role-safe substitution recommendation
+- contextual strategy guidance
+
+Examples include:
+
+- rotating a fatigued bowler
+- introducing a high-impact batter
+- delaying aggressive play depending on match pressure
 
 ---
 
 ## 7. Player Management Actions
 
-Based on agent output, the coach can:
+Based on AI outputs, the coach can take immediate actions.
 
-- **Switch player** → AI suggests the optimal replacement  
-- **Rest player** → removed from active state but workload preserved  
-- **Mark unfit** → player locked from selection  
+Supported actions include:
 
-These actions update the session context while keeping historical baselines intact.
+- **Switch Player** → tactIQ suggests the optimal replacement
+- **Rest Player** → temporarily removes player while preserving workload history
+- **Mark Unfit** → locks the player from further selection
+
+These actions update the **live session context** while preserving the historical baseline data stored in Cosmos DB.
 
 ---
 
 ## 8. Forecast Visualizations
 
+tactIQ presents AI insights using visual projections.
+
 The UI displays:
 
-- fatigue projection over the next overs  
-- injury risk trend if the player continues  
+- fatigue projection across upcoming overs
+- injury risk trend if the player continues
+- workload sustainability indicators
 
-This enables **proactive decision-making**, not reactive substitutions.
+These visualizations allow coaches to make **proactive decisions instead of reactive substitutions**.
 
+---
+
+## 9. Copilot Context-Aware Chat
+
+After the analysis is generated, coaches can interact with a **Copilot-style AI assistant**.
+
+The Copilot chat can:
+
+- explain why the AI reached a specific recommendation
+- explore alternative tactical scenarios
+- evaluate the risks of ignoring the recommendation
+- analyze match pressure or player workload in more detail
+
+Because the chat has access to the **current analysis context**, responses remain aligned with the tactical situation.
+This conversational layer helps coaches better understand the reasoning behind AI decisions and build confidence in the recommendation.
 ---
 
 ## 9. Data Layer (Azure Cosmos DB)
 
-Stores:
+tactIQ uses **Azure Cosmos DB** as the persistent data layer for user accounts, team rosters, and player intelligence.
 
-- player baselines  
-- historical workload  
-- recovery trends  
+The database stores:
 
-Roster is session-based, but **every new player added persists to Cosmos DB**.
+- registered users and authentication-linked profiles  
+- each user's team roster and player selections  
+- player baseline performance profiles  
+- historical workload and recovery patterns  
+- fatigue thresholds and contextual signals  
+
+When a user logs in, tactIQ retrieves their saved roster and player data from Cosmos DB.  
+Any new players added by the user are automatically persisted to the database and associated with that user’s account.
+
+This creates a **user-scoped player intelligence layer**, allowing tactIQ to build historical workload knowledge across multiple matches and sessions while keeping team data isolated per user.
 
 ---
 
 ## 10. Observability (Azure Application Insights)
 
-Tracks:
+tactIQ includes observability to monitor the AI pipeline and system behavior.
 
-- router decisions  
+Application Insights tracks:
+
+- model router decisions  
 - agent execution paths  
-- latency and errors  
-- analysis mode (auto vs full)
+- analysis mode (auto vs full analysis)  
+- request latency and AI inference timing  
+- backend errors and system diagnostics  
+
+This telemetry helps monitor system performance and ensures the multi-agent pipeline remains reliable and transparent.
 
 ---
 
-## 11. Copilot-Assisted DevOps
+## 11. Copilot-Assisted Development & CI/CD
 
-- **GitHub Copilot (Agent Mode)** → assisted UI, API, and orchestration code  
-- **GitHub Actions** → CI/CD deployment to Azure App Service  
+tactIQ development is accelerated using AI-assisted tooling and automated deployment workflows.
+
+- **GitHub Copilot (Agent Mode)** assisted development of UI components, backend APIs, and agent orchestration logic  
+- **GitHub Actions** powers the CI/CD pipeline for automated builds and deployments  
+- Deployments target **Azure Static Web Apps (frontend)** and **Azure Functions (backend)**  
+
+This workflow enables rapid iteration while maintaining a scalable cloud-native architecture.
 
 ---
 
-#  Execution Modes Summary
+# Execution Modes Summary
+
+tactIQ supports two execution strategies depending on the depth of analysis required.
 
 ### Auto Mode
-- Smart agent selection  
-- Faster response  
-- Runs only required analysis  
+
+- Model Router dynamically selects the required agents  
+- Runs only the necessary analysis modules  
+- Optimized for faster responses during live match situations  
 
 ### Run Full Analysis
-- Fatigue + Injury + Tactical together  
-- Complete coaching briefing  
-- Used for high-stakes decisions  
+
+- Executes **Fatigue, Injury Risk, and Tactical agents together**  
+- Produces a comprehensive coaching briefing  
+- Designed for deeper evaluation during critical match moments  
 
 ---
 
-#  Outcome
+# Outcome
 
-tactIQ delivers:
+tactIQ delivers an intelligent decision-support system for real-time match management.
 
-- role-safe player switching  
-- rest and unfit management  
-- AI-driven substitution decisions  
-- fatigue and injury forecasting  
-- baseline-aware tactical intelligence  
+The platform enables:
 
-All powered by a **multi-agent Azure architecture**.
+- role-safe player rotation and switching  
+- fatigue-aware player workload management  
+- injury risk forecasting and safety alerts  
+- AI-driven substitution and tactical recommendations  
+- baseline-aware player intelligence across matches  
+- explainable decision reasoning through multi-agent analysis  
+
+All capabilities are powered by a **cloud-native, multi-agent architecture built on Microsoft Azure**.
