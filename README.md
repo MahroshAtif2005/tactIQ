@@ -108,6 +108,30 @@ The current tactIQ web application is deployed using:
 
 ---
 
+## Project Structure
+
+tactIQ
+│
+├── src/                         # React + TypeScript frontend application
+│   ├── components/              # Reusable UI components (charts, panels, controls)
+│   ├── pages/                   # Main dashboard views and tactical interfaces
+│   ├── hooks/                   # Custom React hooks for state and match logic
+│   ├── styles/                  # Global styles and UI theme configuration
+│
+├── api/                         # Azure Functions serverless backend
+│   ├── functions/               # HTTP endpoints and AI orchestration logic
+│   ├── shared/                  # Shared utilities, prompts, and context builders
+│
+├── middleware/                  # Request middleware and shared processing helpers
+├── archive/                     # Archived experimental agent framework (not used in production)
+├── public/                      # Static assets served by the frontend
+│
+├── README.md                    # Project documentation
+├── package.json                 # Project dependencies and scripts
+├── vite.config.ts               # Vite build configuration
+
+---
+
 ## Use Cases
 
 - Live tactical coaching support during matches  
