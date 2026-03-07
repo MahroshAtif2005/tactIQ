@@ -60,18 +60,23 @@ The goal is not just to show numbers but to guide decisions.
 ---
 ## Repository Notes
 
-This repository contains the current tactIQ production path as well as some earlier experimental and legacy components created during development.
-
 ### Current primary architecture
+
 - Frontend: React + Vite
 - Hosting: Azure Static Web Apps
 - Main backend API: Azure Functions under `/api`
 - AI reasoning: Azure OpenAI
 - Persistence: Azure Cosmos DB
 
-### Legacy / experimental components
-- `server/agent-framework` contains an earlier experimental Node/Express-based agent runtime and is **not required for the main tactIQ web application flow**
-- older Azure Web App deployment workflow files remain in the repo for reference, but the **current frontend deployment path is Azure Static Web Apps**
+### Archived experimental component
+
+- `archive/agent-framework-experimental` contains an earlier Node/Express-based agent runtime explored during development and is not required for the main tactIQ web application flow.
+
+ ### Current deployment
+The current tactIQ web application is deployed using:
+
+- **Azure Static Web Apps** for the frontend
+- **Azure Functions** for the main API and orchestration layer
 
 ## Tech Stack
 
@@ -85,14 +90,6 @@ This repository contains the current tactIQ production path as well as some earl
 | AI Engine | Azure OpenAI Service | Powers fatigue analysis, risk assessment, and tactical reasoning |
 | CI/CD | GitHub Actions | Automated build and deployment pipeline |
 | Development | GitHub Copilot | AI-assisted development workflow |
-
----
-
-### Current deployment
-The current tactIQ web application is deployed using:
-
-- **Azure Static Web Apps** for the frontend
-- **Azure Functions** for the main API and orchestration layer
 
 ---
 
