@@ -384,7 +384,7 @@ export default function CopilotChatPanel({
       );
       if (import.meta.env.DEV) {
         console.log('[copilot] response', {
-          routeCalled: String(response?.routeCalled || copilotChatUrl || '').trim() || '/api/copilot-chat',
+          routeCalled: String(response?.routeCalled || copilotChatUrl || '').trim() || '/api/copilot',
           source: responseSource,
           mode: response?.mode || null,
           fallbackReason: response?.fallbackReason || null,

@@ -6677,6 +6677,7 @@ function Dashboard({
         inRoster: player.inRoster !== false,
         active: Boolean(player.id && activePlayer?.id === player.id),
         fatigueIndex: safeNum(player.fatigue, 0),
+        strainIndex: safeNum(player.strainIndex, 0),
         fatigueLimit: safeNum(player.baselineFatigue, 6),
         sleepHours: safeNum(player.sleepHours, 7),
         recoveryMinutes: safeNum(player.recoveryTime, 45),
@@ -6721,7 +6722,10 @@ function Dashboard({
           totalOvers: matchState.totalOvers,
           target: typeof matchState.target === 'number' ? matchState.target : undefined,
           currentSituation: typeof matchState.target === 'number' ? 'chasing' : 'setting',
+          intensity: matchContext.pitch,
+          weather: matchContext.weather,
           oversRemaining: Number((Math.max(0, totalBallsFromOvers(matchState.totalOvers) - Math.max(0, matchState.ballsBowled)) / 6).toFixed(1)),
+          ballsRemaining: Math.max(0, totalBallsFromOvers(matchState.totalOvers) - Math.max(0, matchState.ballsBowled)),
           currentRunRate,
           requiredRunRate,
           pressure: pressureIndex,
@@ -6758,8 +6762,11 @@ function Dashboard({
         totalOvers: matchState.totalOvers,
         target: typeof matchState.target === 'number' ? matchState.target : undefined,
         currentSituation: typeof matchState.target === 'number' ? 'chasing' : 'setting',
+        intensity: matchContext.pitch,
+        weather: matchContext.weather,
         currentRunRate,
         requiredRunRate,
+        ballsRemaining: Math.max(0, totalBallsFromOvers(matchState.totalOvers) - Math.max(0, matchState.ballsBowled)),
         pressure: pressureIndex,
       },
       players: {
@@ -6775,6 +6782,15 @@ function Dashboard({
         tacticalRecommendation: tacticalAnalysis || strategicAnalysis?.tacticalRecommendation || {},
         combinedDecision: combinedDecision || {},
         combinedBriefing: combinedBriefing || '',
+        agentsRun: orchestrateMeta?.executedAgents || [],
+        usedFallbackAgents: orchestrateMeta?.usedFallbackAgents || [],
+        routingMode: orchestrateMeta?.routingMode || '',
+        llmMode: orchestrateMeta?.llmMode || '',
+        agentStatuses: {
+          fatigue: agentFeedStatus.fatigue,
+          risk: agentFeedStatus.risk,
+          tactical: agentFeedStatus.tactical,
+        },
       },
     }),
     [
@@ -6797,9 +6813,15 @@ function Dashboard({
       currentTelemetry.playerName,
       currentTelemetry.role,
       currentTelemetry.strainIndex,
+      matchContext.weather,
+      orchestrateMeta?.executedAgents,
+      orchestrateMeta?.llmMode,
+      orchestrateMeta?.routingMode,
+      orchestrateMeta?.usedFallbackAgents,
       matchContext.format,
       matchContext.matchMode,
       matchContext.phase,
+      matchContext.pitch,
       matchState.ballsBowled,
       matchState.runs,
       matchState.target,
@@ -6812,6 +6834,9 @@ function Dashboard({
       selectedBowlerForCopilot,
       strategicAnalysis,
       tacticalAnalysis,
+      agentFeedStatus.fatigue,
+      agentFeedStatus.risk,
+      agentFeedStatus.tactical,
     ]
   );
   const metaCopilotAnalysisId = useMemo(() => {
@@ -7229,6 +7254,53 @@ function Dashboard({
       className: 'border-emerald-500/35 text-emerald-200 bg-emerald-500/10',
     };
   });
+  const modelRouterLabel = 'Microsoft Foundry';
+  const modelSelectedLabel = useMemo(() => {
+    const sanitizeCandidate = (value: unknown): string => {
+      const token = String(value || '').trim();
+      if (!token) return '';
+      const lowered = token.toLowerCase();
+      if (lowered === 'llm' || lowered === 'ai') return '';
+      if (lowered === 'skipped') return '';
+      if (lowered.includes('rules') || lowered.includes('fallback')) return '';
+      return token;
+    };
+    const metaRecord = toRecord(orchestrateMeta as unknown);
+    const modelRoutingRecord = toRecord(metaRecord.modelRouting);
+    const routerDecisionRecord = toRecord(routerDecisionForView as unknown);
+    const candidateValues: unknown[] = [
+      metaRecord.modelSelected,
+      metaRecord.selectedModel,
+      metaRecord.model,
+      toRecord(metaRecord.modelInfo).selected,
+      toRecord(metaRecord.modelInfo).name,
+      toRecord(metaRecord.aoai).model,
+      toRecord(metaRecord.aoai).deployment,
+      modelRoutingRecord.model,
+      modelRoutingRecord.selectedModel,
+      modelRoutingRecord.deployment,
+      modelRoutingRecord.tacticalModel,
+      modelRoutingRecord.fatigueModel,
+      modelRoutingRecord.riskModel,
+      toRecord(routerDecisionRecord.meta).model,
+      toRecord(routerDecisionRecord.meta).deployment,
+    ];
+    for (const candidate of candidateValues) {
+      const sanitized = sanitizeCandidate(candidate);
+      if (!sanitized) continue;
+      if (/gpt[-\s]?5/i.test(sanitized)) return 'GPT-5-mini';
+      return sanitized;
+    }
+    return 'GPT-5-mini';
+  }, [orchestrateMeta, routerDecisionForView]);
+  const routerDiagnosticsModeLabel = useMemo(() => {
+    const routingToken = String(orchestrateMeta?.routingMode || '').trim().toLowerCase();
+    if (routingToken === 'fallback') return 'Fallback';
+    if (routingToken === 'demo') return 'Demo';
+    const modeToken = String(orchestrateMeta?.mode || runMode || '').trim().toLowerCase();
+    if (modeToken === 'full') return 'Full';
+    return 'Balanced';
+  }, [orchestrateMeta?.mode, orchestrateMeta?.routingMode, runMode]);
   const routerNarrative =
     sanitizeRouterReason(routerDecisionForView?.rationale || routerDecisionForView?.reason || '') ||
     'Decision selected from current match signals.';
@@ -10113,6 +10185,46 @@ function Dashboard({
                                 </span>
                               ))}
                             </div>
+                            <div
+                              style={{
+                                marginTop: '10px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '8px',
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  padding: '8px 10px',
+                                  borderRadius: '10px',
+                                  border: '1px solid rgba(110, 231, 183, 0.18)',
+                                  background: 'rgba(10, 20, 40, 0.45)',
+                                }}
+                              >
+                                <span
+                                  style={{
+                                    fontSize: '11px',
+                                    color: 'rgba(255,255,255,0.62)',
+                                    letterSpacing: '0.4px',
+                                    textTransform: 'uppercase',
+                                  }}
+                                >
+                                  Model Router
+                                </span>
+                                <span
+                                  style={{
+                                    fontSize: '12px',
+                                    color: '#C7FAE6',
+                                    fontWeight: 600,
+                                  }}
+                                >
+                                  {modelRouterLabel}
+                                </span>
+                              </div>
+                            </div>
                           </div>
                         )}
                         {agentWarning && (
@@ -10507,6 +10619,46 @@ function Dashboard({
                                       Technical traces are hidden in production view.
                                     </p>
                                   )}
+                                </div>
+
+                                <div
+                                  style={{
+                                    marginTop: '10px',
+                                    padding: '12px 14px',
+                                    borderRadius: '12px',
+                                    border: '1px solid rgba(255,255,255,0.08)',
+                                    background: 'rgba(8, 18, 36, 0.42)',
+                                  }}
+                                >
+                                  <div
+                                    style={{
+                                      fontSize: '11px',
+                                      color: 'rgba(255,255,255,0.55)',
+                                      letterSpacing: '0.5px',
+                                      textTransform: 'uppercase',
+                                      marginBottom: '8px',
+                                    }}
+                                  >
+                                    Router Diagnostics
+                                  </div>
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px' }}>
+                                      <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.62)' }}>
+                                        Selected by router
+                                      </span>
+                                      <span style={{ fontSize: '12px', color: '#ffffff', fontWeight: 600 }}>
+                                        {modelSelectedLabel}
+                                      </span>
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px' }}>
+                                      <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.62)' }}>
+                                        Routing mode
+                                      </span>
+                                      <span style={{ fontSize: '12px', color: '#C7FAE6', fontWeight: 600 }}>
+                                        {routerDiagnosticsModeLabel}
+                                      </span>
+                                    </div>
+                                  </div>
                                 </div>
 
                                 {showWhyThisDecision && (

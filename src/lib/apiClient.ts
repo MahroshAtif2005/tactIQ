@@ -55,7 +55,8 @@ const orchestrateEndpoint = apiOrchestrateUrl;
 const aiStatusEndpoint = resolveApiUrl('/ai/status');
 const baselinesEndpoint = resolveApiUrl('/baselines');
 const usersEnsureEndpoint = resolveApiUrl('/users/ensure');
-const copilotChatEndpoint = resolveApiUrl('/copilot-chat');
+// Canonical Copilot route. Backend also keeps /copilot-chat as a compatibility alias.
+const copilotChatEndpoint = resolveApiUrl('/copilot');
 export const copilotChatUrl = copilotChatEndpoint;
 const analysisExistsEndpoint = (analysisId: string): string =>
   resolveApiUrl(`/analysis/${encodeURIComponent(String(analysisId || '').trim())}/exists`);

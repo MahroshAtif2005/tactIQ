@@ -8,6 +8,7 @@ const {
 const { buildAoaiChatUrl } = require('../shared/aoaiConfig');
 
 const asRecord = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+const asArray = (value) => (Array.isArray(value) ? value : []);
 
 const toText = (...values) => {
   for (const value of values) {
@@ -15,6 +16,60 @@ const toText = (...values) => {
     if (normalized.length > 0) return normalized;
   }
   return '';
+};
+
+const resolveCopilotRoute = (rawUrl) => {
+  const normalized = toText(rawUrl);
+  if (!normalized) return '/api/copilot';
+  try {
+    const parsed = new URL(normalized, 'http://localhost');
+    const path = toText(parsed.pathname);
+    if (path.startsWith('/api/')) return path;
+    if (path.startsWith('/')) return `/api${path}`;
+  } catch {
+    // Ignore malformed URLs and fall back to canonical route.
+  }
+  return '/api/copilot';
+};
+
+const parseRequestJson = async (req) => {
+  if (typeof req?.json !== 'function') return {};
+  try {
+    const parsed = await req.json();
+    return asRecord(parsed);
+  } catch {
+    return {};
+  }
+};
+
+const normalizeCopilotPayload = async (req) => {
+  const normalizedBody = asRecord(normalizeBody(req));
+  const parsedJson = Object.keys(normalizedBody).length > 0 ? {} : await parseRequestJson(req);
+  const payload = { ...(Object.keys(parsedJson).length > 0 ? parsedJson : normalizedBody) };
+
+  const question = toText(payload.question);
+  if (!toText(payload.message) && question) {
+    payload.message = question;
+  }
+
+  const matchState = asRecord(payload.matchState);
+  if (!payload.matchContext && Object.keys(matchState).length > 0) {
+    payload.matchContext = matchState;
+  }
+
+  const roster = payload.roster;
+  if (!payload.players) {
+    if (Array.isArray(roster)) {
+      payload.players = { rosterMetrics: roster };
+    } else {
+      const rosterRecord = asRecord(roster);
+      if (Object.keys(rosterRecord).length > 0) {
+        payload.players = rosterRecord;
+      }
+    }
+  }
+
+  return payload;
 };
 
 const clipText = (value, max = 420) => {
@@ -335,6 +390,9 @@ const DOMAIN_BLOCKED_KEYWORDS = [
   'crypto',
   'stock',
   'investment',
+  'celebrity',
+  'celebrities',
+  'gossip',
   'dating',
   'relationship',
   'joke',
@@ -543,8 +601,8 @@ const classifyCopilotDomain = (message, history, snapshot) => {
   if (hasCricketSignal || (comparisonDetected && cricketEntityHits.length > 0)) {
     return {
       allowed: true,
-      handling: 'cricket_redirect',
-      reason: hasCricketSignal ? 'cricket_general' : 'cricket_entity_comparison',
+      handling: 'full',
+      reason: hasPerformanceIntent ? 'cricket_performance_question' : 'cricket_general',
       allowedHits,
       blockedHits,
       domainIntentHits,
@@ -736,8 +794,11 @@ const buildCopilotContextBlock = (snapshot) => {
     `- Phase: ${toText(matchContext.phase, snapshotContext.phase, 'n/a')}`,
     `- Format: ${toText(matchContext.format, snapshotContext.format, 'n/a')}`,
     `- Mode: ${toText(matchContext.matchMode, snapshotContext.matchMode, 'n/a')}`,
+    `- Intensity: ${toText(matchContext.intensity, snapshotContext.intensity, 'n/a')}`,
+    `- Weather: ${toText(matchContext.weather, snapshotContext.weather, 'n/a')}`,
     `- Current RR: ${toText(matchContext.currentRunRate, snapshotContext.currentRunRate, 'n/a')}`,
     `- Required RR: ${toText(matchContext.requiredRunRate, snapshotContext.requiredRunRate, 'n/a')}`,
+    `- Balls remaining: ${toText(matchContext.ballsRemaining, snapshotContext.ballsRemaining, 'n/a')}`,
     `- Situation: ${toText(matchContext.currentSituation, snapshotContext.currentSituation, 'n/a')}`,
     '',
     'SELECTED PLAYERS',
@@ -750,6 +811,12 @@ const buildCopilotContextBlock = (snapshot) => {
     'COACH CONTEXT',
     `- Latest recommendation: ${latestRecommendation}`,
     `- Latest rationale: ${latestRationale}`,
+    `- Agents run: ${toText(
+      asArray(coachOutput.agentsRun).map((entry) => String(entry || '').trim().toUpperCase()).join(', '),
+      'n/a'
+    )}`,
+    `- Routing mode: ${toText(coachOutput.routingMode, 'n/a')}`,
+    `- LLM mode: ${toText(coachOutput.llmMode, 'n/a')}`,
   ].join('\n');
 };
 
@@ -863,29 +930,13 @@ const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
   return `Copilot is in fallback/local mode for this message. Recommended action: ${nextAction}. ${rationale}`.trim();
 };
 
-const buildCricketRedirectReply = (userMessage, snapshot) => {
-  const normalizedQuestion = String(userMessage || '').trim().toLowerCase();
-  const matchContext = asRecord(snapshot.matchContext);
-  const fallbackMatchContext = asRecord(snapshot.matchContextSnapshot);
-  const phase = toText(matchContext.phase, fallbackMatchContext.phase, 'this phase');
-
-  if (normalizedQuestion.includes('shaheen') && normalizedQuestion.includes('shahid') && normalizedQuestion.includes('afridi')) {
-    return 'That depends on role, era, and tactical need. Shahid Afridi offered explosive all-round impact, while Shaheen Afridi is a specialist new-ball pace threat with high wicket-taking value. In tactIQ terms, I can map that choice to a scenario like powerplay pressure, strike bowling, control, or workload risk.';
-  }
-
-  if (/\b(better|best|compare|comparison|vs|versus)\b/.test(normalizedQuestion)) {
-    return `That depends on role, format, and pressure phase rather than a single "better" label. In tactical terms, compare wicket threat, control under pressure, and workload sustainability for the role you need. If you share the ${phase} situation, I can give a match-specific coaching recommendation.`;
-  }
-
-  return `That is within cricket domain, but the best answer depends on role, format, and phase pressure. In tactIQ context, I can turn this into a practical coaching call for ${phase} with control, risk, and workload trade-offs.`;
-};
-
 module.exports = async function copilotChat(context, req) {
   const startedAt = Date.now();
   const traceId = randomUUID();
   const method = String(req?.method || '').trim().toUpperCase();
-  const routeCalled = '/api/copilot-chat';
-  const url = String(req?.url || routeCalled).trim() || routeCalled;
+  const url = String(req?.url || '').trim();
+  const routeCalled = resolveCopilotRoute(url);
+  const requestUrl = url || routeCalled;
   const respond = (response) => {
     context.res = response;
     return response;
@@ -902,7 +953,7 @@ module.exports = async function copilotChat(context, req) {
         {
           ok: false,
           error: 'method_not_allowed',
-          message: 'Use POST /api/copilot-chat.',
+          message: 'Use POST /api/copilot (or /api/copilot-chat).',
           routeCalled,
         },
         {},
@@ -910,207 +961,19 @@ module.exports = async function copilotChat(context, req) {
       )
     );
   }
-
-  const payload = normalizeBody(req);
-  const message = toText(payload.message);
-  if (!message) {
-    return respond(
-      jsonResponse(
-        400,
-        {
-          ok: false,
-          error: 'invalid_request',
-          message: 'message must be a non-empty string',
-          routeCalled,
-        },
-        {},
-        req
-      )
-    );
-  }
-
-  const analysisIdUsed = toText(payload.analysisId, `local-copilot-${Date.now()}`);
-  const history = sanitizeHistory(payload.history);
-  const contextSnapshot = {
-    matchContextSnapshot: asRecord(payload.matchContextSnapshot),
-    telemetry: asRecord(payload.telemetry),
-    matchContext: asRecord(payload.matchContext),
-    players: asRecord(payload.players),
-    coachOutput: asRecord(payload.coachOutput),
-    matchId: toText(payload.matchId),
-    sessionId: toText(payload.sessionId),
-  };
-  context.log?.('[copilot-chat] submit', {
-    traceId,
-    routeCalled,
-    url,
-    analysisId: analysisIdUsed,
-    prompt: message,
-    historyTurns: history.length,
-  });
-
-  const domain = classifyCopilotDomain(message, history, contextSnapshot);
-  context.log?.('[copilot-chat] domain_guard', {
-    traceId,
-    routeCalled,
-    allowed: domain.allowed,
-    handling: domain.handling,
-    reason: domain.reason,
-    allowedHits: domain.allowedHits,
-    blockedHits: domain.blockedHits,
-    domainIntentHits: domain.domainIntentHits,
-    liveScopeHits: domain.liveScopeHits,
-    cricketEntityHits: domain.cricketEntityHits,
-    performanceIntentHits: domain.performanceIntentHits,
-    comparisonDetected: domain.comparisonDetected,
-    followUpDetected: domain.followUpDetected,
-  });
-
-  if (domain.handling === 'blocked') {
-    return respond(
-      jsonResponse(
-        200,
-        {
-          ok: true,
-          source: 'fallback',
-          mode: 'domain_guard',
-          routeCalled,
-          fallbackReason: `domain_guard:${domain.reason}`,
-          analysisIdUsed,
-          reply: DOMAIN_REFUSAL_REPLY,
-          messagesUsed: Math.min(10, countUserTurns(history) + 1),
-        },
-        {},
-        req
-      )
-    );
-  }
-
-  if (domain.handling === 'cricket_redirect') {
-    const redirectReply = buildCricketRedirectReply(message, contextSnapshot);
-    return respond(
-      jsonResponse(
-        200,
-        {
-          ok: true,
-          source: 'fallback',
-          mode: 'domain_redirect',
-          routeCalled,
-          fallbackReason: `domain_redirect:${domain.reason}`,
-          analysisIdUsed,
-          reply: redirectReply,
-          messagesUsed: Math.min(10, countUserTurns(history) + 1),
-        },
-        {},
-        req
-      )
-    );
-  }
-
-  const aoai = resolveAoaiRuntimeConfig();
-  const requestUrl = buildAoaiChatUrl(aoai);
-  const aiPathSelected = Boolean(aoai.ok && requestUrl);
-  context.log?.('[copilot-chat] routing', {
-    traceId,
-    routeCalled,
-    aiPathSelected,
-    fallbackPath: !aiPathSelected,
-    endpointHost: aoai.endpointHost || '',
-    deployment: aoai.deployment || '',
-    apiVersion: aoai.apiVersion || '',
-    requestUrl,
-    authHeader: 'api-key',
-  });
-
-  if (!aiPathSelected) {
-    const fallbackReason = aoai.missing && aoai.missing.length > 0
-      ? `missing_config:${aoai.missing.join(',')}`
-      : 'aoai_not_available';
-    const reply = buildFallbackReply(message, payload, fallbackReason);
-    context.log?.('[copilot-chat] fallback', {
-      traceId,
-      routeCalled,
-      source: 'fallback',
-      reason: fallbackReason,
-      latencyMs: Date.now() - startedAt,
-    });
-    return respond(
-      jsonResponse(
-        200,
-        {
-          ok: true,
-          source: 'fallback',
-          mode: 'fallback',
-          routeCalled,
-          fallbackReason,
-          analysisIdUsed,
-          reply,
-          messagesUsed: Math.min(10, countUserTurns(history) + 1),
-        },
-        {},
-        req
-      )
-    );
-  }
-
-  const systemPrompt = buildCopilotSystemPrompt();
-  const signalSummary = buildCopilotSignalSummary(contextSnapshot);
-  const structuredContext = buildCopilotContextBlock(contextSnapshot);
-
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    { role: 'system', content: `High-signal coaching context:\n${signalSummary}` },
-    { role: 'system', content: `Structured live context:\n${structuredContext}` },
-    ...history.map((turn) => ({ role: turn.role, content: turn.content })),
-    { role: 'user', content: message },
-  ];
 
   try {
-    const upstreamResponse = await fetch(requestUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': String(aoai.apiKey || ''),
-      },
-      body: JSON.stringify({
-        messages,
-        temperature: 0.25,
-        max_tokens: 420,
-      }),
-    });
-    const rawBody = await upstreamResponse.text();
-
-    if (!upstreamResponse.ok) {
-      const status = parseStatusCode(upstreamResponse.status);
-      const code = parseUpstreamCode(rawBody);
-      const body = summarizeRawBody(rawBody);
-      context.log?.('[copilot-chat] fallback', {
-        traceId,
-        routeCalled,
-        source: 'fallback',
-        reason: 'aoai_http_error',
-        status,
-        code: code || undefined,
-        body,
-      });
-      const fallbackReason = `aoai_http_${String(status || 'error')}`;
+    const payload = await normalizeCopilotPayload(req);
+    const message = toText(payload.message);
+    if (!message) {
       return respond(
         jsonResponse(
-          200,
+          400,
           {
-            ok: true,
-            source: 'fallback',
-            mode: 'fallback',
+            ok: false,
+            error: 'invalid_request',
+            message: 'message/question must be a non-empty string',
             routeCalled,
-            fallbackReason,
-            analysisIdUsed,
-            reply: buildFallbackReply(message, payload, fallbackReason),
-            messagesUsed: Math.min(10, countUserTurns(history) + 1),
-            upstream: {
-              ...(typeof status === 'number' ? { status } : {}),
-              ...(code ? { code } : {}),
-              ...(body ? { body } : {}),
-            },
           },
           {},
           req
@@ -1118,20 +981,90 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
-    let parsed;
-    try {
-      parsed = JSON.parse(rawBody);
-    } catch {
-      parsed = {};
+    const analysisIdUsed = toText(payload.analysisId, `local-copilot-${Date.now()}`);
+    const history = sanitizeHistory(payload.history);
+    const contextSnapshot = {
+      matchContextSnapshot: asRecord(payload.matchContextSnapshot),
+      telemetry: asRecord(payload.telemetry),
+      matchContext: asRecord(payload.matchContext),
+      players: asRecord(payload.players),
+      coachOutput: asRecord(payload.coachOutput),
+      matchId: toText(payload.matchId),
+      sessionId: toText(payload.sessionId),
+    };
+    context.log?.('[copilot-chat] submit', {
+      traceId,
+      routeCalled,
+      url: requestUrl,
+      analysisId: analysisIdUsed,
+      prompt: message,
+      historyTurns: history.length,
+    });
+
+    const domain = classifyCopilotDomain(message, history, contextSnapshot);
+    context.log?.('[copilot-chat] domain_guard', {
+      traceId,
+      routeCalled,
+      allowed: domain.allowed,
+      handling: domain.handling,
+      reason: domain.reason,
+      allowedHits: domain.allowedHits,
+      blockedHits: domain.blockedHits,
+      domainIntentHits: domain.domainIntentHits,
+      liveScopeHits: domain.liveScopeHits,
+      cricketEntityHits: domain.cricketEntityHits,
+      performanceIntentHits: domain.performanceIntentHits,
+      comparisonDetected: domain.comparisonDetected,
+      followUpDetected: domain.followUpDetected,
+    });
+
+    if (domain.handling === 'blocked') {
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'fallback',
+            mode: 'domain_guard',
+            routeCalled,
+            fallbackReason: `domain_guard:${domain.reason}`,
+            analysisIdUsed,
+            reply: DOMAIN_REFUSAL_REPLY,
+            answer: DOMAIN_REFUSAL_REPLY,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+          },
+          {},
+          req
+        )
+      );
     }
-    const reply = extractCompletionText(parsed);
-    if (!reply) {
-      const fallbackReason = 'aoai_empty_response';
+
+    const aoai = resolveAoaiRuntimeConfig();
+    const aoaiRequestUrl = buildAoaiChatUrl(aoai);
+    const aiPathSelected = Boolean(aoai.ok && aoaiRequestUrl);
+    context.log?.('[copilot-chat] routing', {
+      traceId,
+      routeCalled,
+      aiPathSelected,
+      fallbackPath: !aiPathSelected,
+      endpointHost: aoai.endpointHost || '',
+      deployment: aoai.deployment || '',
+      apiVersion: aoai.apiVersion || '',
+      requestUrl: aoaiRequestUrl,
+      authHeader: 'api-key',
+    });
+
+    if (!aiPathSelected) {
+      const fallbackReason = aoai.missing && aoai.missing.length > 0
+        ? `missing_config:${aoai.missing.join(',')}`
+        : 'aoai_not_available';
+      const reply = buildFallbackReply(message, payload, fallbackReason);
       context.log?.('[copilot-chat] fallback', {
         traceId,
         routeCalled,
         source: 'fallback',
         reason: fallbackReason,
+        latencyMs: Date.now() - startedAt,
       });
       return respond(
         jsonResponse(
@@ -1143,7 +1076,8 @@ module.exports = async function copilotChat(context, req) {
             routeCalled,
             fallbackReason,
             analysisIdUsed,
-            reply: buildFallbackReply(message, payload, fallbackReason),
+            reply,
+            answer: reply,
             messagesUsed: Math.min(10, countUserTurns(history) + 1),
           },
           {},
@@ -1152,55 +1086,183 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
-    const messagesUsed = Math.min(10, countUserTurns(history) + 1);
-    context.log?.('[copilot-chat] reply', {
-      traceId,
-      routeCalled,
-      source: 'ai',
-      analysisId: analysisIdUsed,
-      messagesUsed,
-      latencyMs: Date.now() - startedAt,
-    });
-    return respond(
-      jsonResponse(
-        200,
-        {
-          ok: true,
-          source: 'ai',
-          mode: 'ai',
-          routeCalled,
-          analysisIdUsed,
-          reply,
-          messagesUsed,
+    const systemPrompt = buildCopilotSystemPrompt();
+    const signalSummary = buildCopilotSignalSummary(contextSnapshot);
+    const structuredContext = buildCopilotContextBlock(contextSnapshot);
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'system', content: `High-signal coaching context:\n${signalSummary}` },
+      { role: 'system', content: `Structured live context:\n${structuredContext}` },
+      ...history.map((turn) => ({ role: turn.role, content: turn.content })),
+      { role: 'user', content: message },
+    ];
+
+    try {
+      const upstreamResponse = await fetch(aoaiRequestUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': String(aoai.apiKey || ''),
         },
-        {},
-        req
-      )
-    );
-  } catch (error) {
-    const status = parseStatusCode(error && typeof error === 'object' ? error.status : undefined);
-    const messageText = error instanceof Error ? error.message : String(error || 'unknown_error');
-    const fallbackReason = `aoai_error:${clipText(messageText, 120)}`;
-    context.log?.('[copilot-chat] fallback', {
+        body: JSON.stringify({
+          messages,
+          temperature: 0.25,
+          max_tokens: 420,
+        }),
+      });
+      const rawBody = await upstreamResponse.text();
+
+      if (!upstreamResponse.ok) {
+        const status = parseStatusCode(upstreamResponse.status);
+        const code = parseUpstreamCode(rawBody);
+        const body = summarizeRawBody(rawBody);
+        context.log?.('[copilot-chat] fallback', {
+          traceId,
+          routeCalled,
+          source: 'fallback',
+          reason: 'aoai_http_error',
+          status,
+          code: code || undefined,
+          body,
+        });
+        const fallbackReason = `aoai_http_${String(status || 'error')}`;
+        const reply = buildFallbackReply(message, payload, fallbackReason);
+        return respond(
+          jsonResponse(
+            200,
+            {
+              ok: true,
+              source: 'fallback',
+              mode: 'fallback',
+              routeCalled,
+              fallbackReason,
+              analysisIdUsed,
+              reply,
+              answer: reply,
+              messagesUsed: Math.min(10, countUserTurns(history) + 1),
+              upstream: {
+                ...(typeof status === 'number' ? { status } : {}),
+                ...(code ? { code } : {}),
+                ...(body ? { body } : {}),
+              },
+            },
+            {},
+            req
+          )
+        );
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(rawBody);
+      } catch {
+        parsed = {};
+      }
+      const reply = extractCompletionText(parsed);
+      if (!reply) {
+        const fallbackReason = 'aoai_empty_response';
+        context.log?.('[copilot-chat] fallback', {
+          traceId,
+          routeCalled,
+          source: 'fallback',
+          reason: fallbackReason,
+        });
+        const fallbackReply = buildFallbackReply(message, payload, fallbackReason);
+        return respond(
+          jsonResponse(
+            200,
+            {
+              ok: true,
+              source: 'fallback',
+              mode: 'fallback',
+              routeCalled,
+              fallbackReason,
+              analysisIdUsed,
+              reply: fallbackReply,
+              answer: fallbackReply,
+              messagesUsed: Math.min(10, countUserTurns(history) + 1),
+            },
+            {},
+            req
+          )
+        );
+      }
+
+      const messagesUsed = Math.min(10, countUserTurns(history) + 1);
+      context.log?.('[copilot-chat] reply', {
+        traceId,
+        routeCalled,
+        source: 'ai',
+        analysisId: analysisIdUsed,
+        messagesUsed,
+        latencyMs: Date.now() - startedAt,
+      });
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'ai',
+            mode: 'ai',
+            routeCalled,
+            analysisIdUsed,
+            reply,
+            answer: reply,
+            messagesUsed,
+          },
+          {},
+          req
+        )
+      );
+    } catch (error) {
+      const status = parseStatusCode(error && typeof error === 'object' ? error.status : undefined);
+      const messageText = error instanceof Error ? error.message : String(error || 'unknown_error');
+      const fallbackReason = `aoai_error:${clipText(messageText, 120)}`;
+      context.log?.('[copilot-chat] fallback', {
+        traceId,
+        routeCalled,
+        source: 'fallback',
+        reason: fallbackReason,
+        ...(typeof status === 'number' ? { status } : {}),
+      });
+      const reply = buildFallbackReply(message, payload, fallbackReason);
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'fallback',
+            mode: 'fallback',
+            routeCalled,
+            fallbackReason,
+            analysisIdUsed,
+            reply,
+            answer: reply,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+            ...(typeof status === 'number' ? { upstream: { status } } : {}),
+          },
+          {},
+          req
+        )
+      );
+    }
+  } catch (handlerError) {
+    const messageText =
+      handlerError instanceof Error ? handlerError.message : String(handlerError || 'unknown_handler_error');
+    context.log?.('[copilot-chat] handler_error', {
       traceId,
       routeCalled,
-      source: 'fallback',
-      reason: fallbackReason,
-      ...(typeof status === 'number' ? { status } : {}),
+      error: clipText(messageText, 300),
     });
     return respond(
       jsonResponse(
-        200,
+        500,
         {
-          ok: true,
-          source: 'fallback',
-          mode: 'fallback',
+          ok: false,
+          error: 'copilot_backend_failed',
+          details: clipText(messageText, 300),
           routeCalled,
-          fallbackReason,
-          analysisIdUsed,
-          reply: buildFallbackReply(message, payload, fallbackReason),
-          messagesUsed: Math.min(10, countUserTurns(history) + 1),
-          ...(typeof status === 'number' ? { upstream: { status } } : {}),
         },
         {},
         req
