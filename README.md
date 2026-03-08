@@ -59,24 +59,25 @@ The goal is not just to show numbers but to guide decisions.
 
 ---
 ## Repository Notes
-
 ### Current primary architecture
 
 - Frontend: React + Vite
 - Hosting: Azure Static Web Apps
 - Main backend API: Azure Functions under `/api`
-- AI reasoning: Azure OpenAI
+- AI reasoning: Azure OpenAI via Microsoft Foundry Model Router
 - Persistence: Azure Cosmos DB
 
 ### Archived experimental component
 
 - `archive/agent-framework-experimental` contains an earlier Node/Express-based agent runtime explored during development and is not required for the main tactIQ web application flow.
 
- ### Current deployment
+### Current deployment
 The current tactIQ web application is deployed using:
 
 - **Azure Static Web Apps** for the frontend
 - **Azure Functions** for the main API and orchestration layer
+
+---
 
 ## Tech Stack
 
@@ -87,7 +88,9 @@ The current tactIQ web application is deployed using:
 | Backend | Azure Functions | Serverless API layer and multi-agent orchestration |
 | Authentication | Microsoft Identity | Secure user login and session management |
 | Database | Azure Cosmos DB | Stores players, coaches, match sessions, and AI recommendations |
-| AI Engine | Azure OpenAI Service | Powers fatigue analysis, risk assessment, and tactical reasoning |
+| AI Platform | Microsoft Foundry | Unified AI platform used to access models and routing capabilities |
+| AI Engine | Azure OpenAI Service | Provides the language models used for fatigue analysis, risk assessment, and tactical reasoning |
+| Model Routing | Microsoft Foundry Model Router | Dynamically selects the most appropriate model for AI requests to balance reasoning quality, speed, and cost |
 | CI/CD | GitHub Actions | Automated build and deployment pipeline |
 | Development | GitHub Copilot | AI-assisted development workflow |
 
@@ -97,6 +100,7 @@ The current tactIQ web application is deployed using:
 
 | Technology | Role in tactIQ |
 |-------------|----------------|
+| **Microsoft Foundry Model Router** | Dynamically selects the most appropriate language model for each AI request based on reasoning complexity and performance requirements |
 | **Azure OpenAI Service** | Core AI reasoning engine powering the Fatigue, Injury Risk, and Tactical agents that generate explainable coaching recommendations |
 | **Azure Functions** | Serverless orchestration layer that builds match context, coordinates the multi-agent pipeline, and executes AI decision workflows |
 | **Azure Static Web Apps** | Hosts the tactIQ analytics dashboard and securely integrates the frontend with the Azure Functions API layer |
@@ -107,7 +111,6 @@ The current tactIQ web application is deployed using:
 | **GitHub Actions** | CI/CD pipeline that automatically builds and deploys tactIQ to Azure |
 
 ---
-
 ## Project Structure
 
 ```text
@@ -176,15 +179,15 @@ Example configuration:
 {
   "IsEncrypted": false,
   "Values": {
-    "AZURE_OPENAI_ENDPOINT": "https://<resource>.openai.azure.com/",
-    "AZURE_OPENAI_API_KEY": "<key>",
-    "AZURE_OPENAI_DEPLOYMENT": "<deployment-name>",
+    "AZURE_OPENAI_ENDPOINT": "https://tactiq-router-eastus2-resource.services.ai.azure.com",
+    "AZURE_OPENAI_API_KEY": "YOUR_KEY",
+    "AZURE_OPENAI_DEPLOYMENT": "model-router",
     "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
     "CORS_ALLOWED_ORIGINS": "http://localhost:5173",
-    "COSMOS_ENDPOINT": "<cosmos-endpoint>",
-    "COSMOS_KEY": "<cosmos-key>",
-    "COSMOS_DB": "<database-name>",
-    "COSMOS_CONTAINER_PLAYERS": "<container-name>"
+    "COSMOS_ENDPOINT": "https://tactiq-cosmos.documents.azure.com:443/",
+    "COSMOS_KEY": "YOUR_COSMOS_KEY",
+    "COSMOS_DB": "tactiq-db",
+    "COSMOS_CONTAINER_PLAYERS": "playersByUser"
   }
 }
 
@@ -336,37 +339,59 @@ flowchart TD
 ```mermaid
 flowchart LR
     DEV[Developer] --> GH[GitHub Repository]
-    DEV --> COP[GitHub Copilot / Agent-assisted Development]
+    DEV --> COP[GitHub Copilot / AI-assisted Development]
 
     GH --> CI[GitHub Actions CI/CD]
     CI --> SWA[Azure Static Web Apps]
-    CI --> FUNC[Azure Functions Deployment]
+    CI --> FUNC[Azure Functions]
 
     USER[Coach / Analyst / Judge Browser] --> SWA
+
+    SWA --> UI[React + TypeScript + Vite UI]
     SWA --> AUTH[Microsoft Identity / Login Layer]
-    SWA --> FUNC
+    SWA --> API[Azure Functions API Layer]
 
-    FUNC --> AOAI[Azure OpenAI Service]
-    FUNC --> COSMOS[Azure Cosmos DB]
+    AUTH --> API
 
-    COSMOS --> STORE[Players • Coaches • Match Sessions<br/>Recommendations • Copilot Context]
+    API --> CTX[Match Context Builder]
+    API --> COPILOTCTX[Context-aware Copilot Request Builder]
+    API --> ORCH[Serverless Agent Orchestrator]
 
-    FUNC --> ORCH[Agent Orchestration Layer]
-    ORCH --> AG1[Fatigue Agent]
-    ORCH --> AG2[Risk Agent]
-    ORCH --> AG3[Tactical Agent]
+    API --> COSMOS[Azure Cosmos DB]
+    COSMOS --> DATA[Players • Coaches • Rosters<br/>Player Baselines • Match Sessions<br/>Recommendations • Copilot Context]
 
-    AG1 --> AOAI
-    AG2 --> AOAI
-    AG3 --> AOAI
+    COSMOS --> CTX
+    COSMOS --> COPILOTCTX
+    COSMOS --> ORCH
 
-    SWA --> UX[Premium Cricket Analytics UI]
-    FUNC --> TELE[Telemetry / Debug Output / Advanced View]
+    ORCH --> FATIGUE[Fatigue Agent]
+    ORCH --> RISK[Risk Agent]
+    ORCH --> TACTICAL[Tactical Agent]
+
+    FATIGUE --> FOUNDRY[Microsoft Foundry]
+    RISK --> FOUNDRY
+    TACTICAL --> FOUNDRY
+    COPILOTCTX --> FOUNDRY
+
+    FOUNDRY --> ROUTER[Microsoft Foundry Model Router]
+    ROUTER --> AOAI[Azure OpenAI Service]
+
+    AOAI --> AGENTRESP[AI Agent Responses]
+    AGENTRESP --> ORCH
+
+    ORCH --> MERGE[Explainable Recommendation Composer]
+    MERGE --> API
+
+    API --> COSMOS
+    API --> COACHOUT[Coach Recommendation Output]
+    API --> CHATOUT[Copilot Chat Response]
+    API --> DEBUG[Advanced View / Debug Output]
+
+    COACHOUT --> SWA
+    CHATOUT --> SWA
+    DEBUG --> SWA
 
     COP -. accelerates .-> GH
-    AOAI --> RESP[AI-Generated Recommendations]
-    RESP --> FUNC
-    FUNC --> SWA
 ```
 tactIQ follows an agentic AI architecture pattern, where specialized AI agents collaborate through an orchestration layer to produce explainable decisions
 
@@ -425,10 +450,9 @@ Tactical recommendations are always **role-safe**:
 This prevents invalid substitutions and keeps the decision system aligned with match reality.
 
 ---
-
 ## 3. Backend Context Builder (Azure Functions)
 
-The Azure Functions backend constructs the AI reasoning context.
+The **Azure Functions** backend constructs the AI reasoning context.
 
 The backend:
 
@@ -442,13 +466,13 @@ The backend:
   - recovery gap
   - fatigue index
 
-This structured context becomes the **input signal set for the AI orchestration layer**.
+This structured context becomes the **input signal set for the AI orchestration layer**, ensuring that all agents operate on the same deterministic match context.
 
 ---
 
 ## 4. Agent Orchestrator
 
-The **Orchestrator** prepares a unified decision context containing:
+The **Agent Orchestrator**, implemented within **Azure Functions**, prepares a unified decision context containing:
 
 - match situation
 - player role
@@ -458,24 +482,47 @@ The **Orchestrator** prepares a unified decision context containing:
 - fatigue indicators
 - contextual match pressure
 
-The orchestrator coordinates the AI pipeline and passes this structured context to the **Model Router**.
+The orchestrator coordinates the multi-agent reasoning pipeline and determines which specialist agents should execute for the current match state.
+
+It then forwards the structured context to the **Microsoft Foundry Model Router**, which handles model selection for the AI reasoning requests.
 
 ---
 
-## 5. Model Router (Agent Selection Layer)
+## 5. Model Router (AI Model Selection Layer)
 
-The **Model Router**, powered by Azure OpenAI, determines which specialist agents should run.
+tactIQ uses the **Microsoft Foundry Model Router** to dynamically select the most appropriate language model for each reasoning request.
 
-In **Auto Mode**, the router analyzes the context signals and decides which agents are necessary:
+Instead of binding the system to a single model, the router evaluates the request characteristics and forwards the call to the most suitable model deployment hosted on **Azure OpenAI Service**.
 
-- **Fatigue Agent** → triggered when workload or strain signals exceed thresholds
-- **Injury Risk Agent** → triggered when recovery deficits or overload patterns appear
-- **Tactical Agent** → always runs to evaluate match strategy
+This enables tactIQ to balance:
 
-In **Run Full Analysis**, the system bypasses routing and executes **all agents together in parallel** to produce a full tactical report.
+- reasoning quality
+- response latency
+- cost efficiency
 
-The router outputs a **deterministic execution plan** used by the orchestrator.
+Each specialist agent (Fatigue, Risk, Tactical) sends its reasoning request through the **Model Router**, which then routes the request to the appropriate Azure OpenAI model.
 
+---
+
+### Agent Execution Modes
+
+The system supports two orchestration modes:
+
+**Auto Mode**
+
+The orchestrator evaluates the match context and selectively executes agents:
+
+- **Fatigue Agent** → triggered when workload or strain signals exceed thresholds  
+- **Injury Risk Agent** → triggered when recovery deficits or overload patterns appear  
+- **Tactical Agent** → always runs to evaluate match strategy  
+
+**Run Full Analysis**
+
+In this mode, the orchestrator executes **all agents in parallel**, generating a comprehensive tactical and workload report.
+
+---
+
+The combined agent outputs are then merged into a **final explainable recommendation**, which is returned to the coaching interface and the **Copilot conversational layer**.
 ---
 
 ## 6. Specialist AI Agents
@@ -609,13 +656,14 @@ This creates a **user-scoped player intelligence layer**, allowing tactIQ to bui
 
 ---
 
-## 11. Observability (Azure Application Insights)
+## 11. ## Observability & Debug Telemetry
 
 tactIQ includes observability to monitor the AI pipeline and system behavior.
 
 Application Insights tracks:
 
-- model router decisions  
+
+- Microsoft Foundry Model Router decisions 
 - agent execution paths  
 - analysis mode (auto vs full analysis)  
 - request latency and AI inference timing  
