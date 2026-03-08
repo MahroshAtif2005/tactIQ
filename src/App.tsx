@@ -624,6 +624,27 @@ function SplashScreen({ onComplete }: { onComplete: () => void }) {
   );
 }
 
+function AuthResolvingSplash() {
+  return (
+    <div
+      style={{
+        minHeight: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'linear-gradient(180deg, #061226 0%, #071a33 100%)',
+        color: '#ffffff',
+        fontFamily: 'inherit',
+      }}
+    >
+      <div style={{ textAlign: 'center' }}>
+        <div style={{ fontSize: '28px', fontWeight: 700, marginBottom: '8px' }}>tactIQ</div>
+        <div style={{ fontSize: '14px', opacity: 0.72 }}>Loading your workspace...</div>
+      </div>
+    </div>
+  );
+}
+
 // --- Telemetry Logic ---
 
 const normalizePhase = (phase: string): Phase => {
@@ -1709,6 +1730,7 @@ export default function App() {
     if (authStatus === 'authenticated' && Boolean(authUser?.userId)) return 'authenticated';
     return 'guest';
   }, [authStatus, authUser?.userId, demoMode]);
+  const authResolving = !demoMode && authStatus === 'checking';
   const isAppUnlocked = sessionMode !== 'guest';
   const isDemoSession = sessionMode === 'demo';
   const demoStep: DemoStep = useMemo(() => {
@@ -1847,6 +1869,7 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || showSplash) return;
+    if (authResolving) return;
     const path = String(window.location.pathname || '');
     const onAuthPath = isAuthPath(path);
     const onDemoPath = isDemoPath(path);
@@ -1887,7 +1910,7 @@ export default function App() {
       window.history.replaceState(null, '', '/auth');
       logSessionDebug('route_redirect:guest_to_auth', { path });
     }
-  }, [logSessionDebug, page, sessionMode, setDemoSessionActive, showSplash]);
+  }, [authResolving, logSessionDebug, page, sessionMode, setDemoSessionActive, showSplash]);
 
   useEffect(() => {
     if (isAppUnlocked) {
@@ -4559,6 +4582,33 @@ export default function App() {
                         </p>
                       </div>
 
+                      <div style={{ marginTop: '10px', marginBottom: '12px' }}>
+                        <div
+                          style={{
+                            fontSize: '11px',
+                            color: 'rgba(255,255,255,0.55)',
+                            letterSpacing: '0.5px',
+                          }}
+                        >
+                          Signed in as
+                        </div>
+
+                        <div
+                          style={{
+                            fontSize: '13px',
+                            color: '#ffffff',
+                            fontWeight: '500',
+                            marginTop: '2px',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                            maxWidth: '220px',
+                          }}
+                        >
+                          {authUser?.email || 'Signed in user'}
+                        </div>
+                      </div>
+
                       <div
                         style={{
                           marginTop: '12px',
@@ -4733,15 +4783,19 @@ export default function App() {
 
       <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col dashboard-main-offset">
         {!showSplash && !isAppUnlocked ? (
-          <AuthPage
-            isChecking={authStatus === 'checking'}
-            onContinueWithMicrosoft={handleContinueWithMicrosoft}
-            onTryDemo={handleTryDemoMode}
-            isLocalDev={isLocalAuthHost}
-            localHint={authLocalHint}
-            onCopySwaCommand={handleCopySwaCommand}
-            copiedSwaCommand={copiedSwaCommand}
-          />
+          authResolving ? (
+            <AuthResolvingSplash />
+          ) : (
+            <AuthPage
+              isChecking={authStatus === 'checking'}
+              onContinueWithMicrosoft={handleContinueWithMicrosoft}
+              onTryDemo={handleTryDemoMode}
+              isLocalDev={isLocalAuthHost}
+              localHint={authLocalHint}
+              onCopySwaCommand={handleCopySwaCommand}
+              copiedSwaCommand={copiedSwaCommand}
+            />
+          )
         ) : (
           <AnimatePresence mode="wait">
             {page === 'landing' && (
@@ -5995,6 +6049,7 @@ function Dashboard({
   const [substitutionRecommendation, setSubstitutionRecommendation] = useState<string | null>(null);
   const [isRunCoachHovered, setIsRunCoachHovered] = useState(false);
   const [showCoachInsights, setShowCoachInsights] = useState(false);
+  const [isCoachPanelSuppressedForSelection, setIsCoachPanelSuppressedForSelection] = useState(false);
   const [showCopilotChat, setShowCopilotChat] = useState(() => {
     if (typeof window === 'undefined') return false;
     try {
@@ -6077,6 +6132,7 @@ function Dashboard({
   } | null>(null);
   const lastValidPressureRef = useRef<{ playerId: string; value: number } | null>(null);
   const lastCapturedAnalysisBundleIdRef = useRef<string>('');
+  const previousSelectedPlayerIdRef = useRef<string>(String(activePlayer?.id || ''));
 
   useEffect(() => {
     setSubstitutionRecommendation(null);
@@ -6098,6 +6154,17 @@ function Dashboard({
   }, [activePlayer?.id, activePlayer?.strainIndex]);
 
   useEffect(() => {
+    const nextSelectedId = String(activePlayer?.id || '');
+    const previousSelectedId = previousSelectedPlayerIdRef.current;
+    const didSwitchPlayer =
+      previousSelectedId.length > 0 &&
+      nextSelectedId.length > 0 &&
+      previousSelectedId !== nextSelectedId;
+    if (didSwitchPlayer) {
+      setIsCoachPanelSuppressedForSelection(true);
+    }
+    previousSelectedPlayerIdRef.current = nextSelectedId;
+
     // Keep coach expansion local to the currently selected player.
     setShowCoachInsights(false);
     setShowCopilotChat(false);
@@ -6119,6 +6186,12 @@ function Dashboard({
     setShowDismissAnalysisInfo(false);
     lastCapturedAnalysisBundleIdRef.current = '';
   }, [activePlayer?.id]);
+
+  useEffect(() => {
+    if (!showCoachInsights) return;
+    if (!isCoachPanelSuppressedForSelection) return;
+    setIsCoachPanelSuppressedForSelection(false);
+  }, [isCoachPanelSuppressedForSelection, showCoachInsights]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -6572,6 +6645,55 @@ function Dashboard({
     ],
     []
   );
+  const selectedBatterForCopilot = useMemo(() => {
+    if (activePlayer && (telemetryView === 'batting' || isBattingRole(activePlayer.role))) {
+      return activePlayer.name;
+    }
+    const candidate = rosterPlayers.find((player) =>
+      isBattingRole(player.role)
+      && resolveDismissalStatus(player) !== 'OUT'
+      && !player.isSub
+      && !player.isUnfit
+    );
+    return candidate?.name || '';
+  }, [activePlayer, rosterPlayers, telemetryView]);
+  const selectedBowlerForCopilot = useMemo(() => {
+    if (activePlayer && (telemetryView === 'bowling' || isBowlingRole(activePlayer.role))) {
+      return activePlayer.name;
+    }
+    const candidate = rosterPlayers.find((player) =>
+      isBowlingRole(player.role)
+      && !player.isSub
+      && !player.isUnfit
+    );
+    return candidate?.name || '';
+  }, [activePlayer, rosterPlayers, telemetryView]);
+  const copilotRosterMetrics = useMemo(
+    () =>
+      rosterPlayers.map((player) => ({
+        id: String(player.id || ''),
+        name: String(player.name || ''),
+        role: String(player.role || ''),
+        inRoster: player.inRoster !== false,
+        active: Boolean(player.id && activePlayer?.id === player.id),
+        fatigueIndex: safeNum(player.fatigue, 0),
+        fatigueLimit: safeNum(player.baselineFatigue, 6),
+        sleepHours: safeNum(player.sleepHours, 7),
+        recoveryMinutes: safeNum(player.recoveryTime, 45),
+        heartRateRecovery: String(player.hrRecovery || 'Moderate'),
+        injuryRisk: String(player.injuryRisk || 'Low').toUpperCase(),
+        noBallRisk: String(player.noBallRisk || 'Low').toUpperCase(),
+        control: safeNum(player.controlBaseline, 75),
+        speed: safeNum(player.speed, 7),
+        power: safeNum(player.power, 6),
+        oversBowled: safeNum(player.overs, 0),
+        maxOvers: safeNum((player as Player & { maxOvers?: number }).maxOvers, getMaxOvers(matchContext.format)),
+        isSub: Boolean(player.isSub),
+        isUnfit: Boolean(player.isUnfit || player.isManuallyUnfit || player.isInjured),
+        isInjured: Boolean(player.isInjured),
+      })),
+    [activePlayer?.id, matchContext.format, rosterPlayers]
+  );
   const copilotFallbackContext = useMemo(
     () => ({
       matchContextSnapshot: {
@@ -6591,15 +6713,26 @@ function Dashboard({
           format: matchContext.format,
           phase: matchContext.phase,
           score: matchState.runs,
+          scoreRuns: matchState.runs,
           wickets: matchState.wickets,
+          wicketsInHand: Math.max(0, 10 - safeNum(matchState.wickets, 0)),
+          overs: formatOverStr(matchState.ballsBowled),
+          ballsBowled: matchState.ballsBowled,
+          totalOvers: matchState.totalOvers,
           target: typeof matchState.target === 'number' ? matchState.target : undefined,
+          currentSituation: typeof matchState.target === 'number' ? 'chasing' : 'setting',
           oversRemaining: Number((Math.max(0, totalBallsFromOvers(matchState.totalOvers) - Math.max(0, matchState.ballsBowled)) / 6).toFixed(1)),
           currentRunRate,
           requiredRunRate,
+          pressure: pressureIndex,
         },
         players: {
-          bowler: String(activePlayer?.name || currentTelemetry.playerName || ''),
-          bench: players.filter((player) => player.inRoster !== false).map((player) => player.name).slice(0, 8),
+          selectedBatter: selectedBatterForCopilot || undefined,
+          selectedBowler: selectedBowlerForCopilot || undefined,
+          striker: selectedBatterForCopilot || undefined,
+          bowler: selectedBowlerForCopilot || String(activePlayer?.name || currentTelemetry.playerName || ''),
+          bench: rosterPlayers.map((player) => player.name).slice(0, 8),
+          rosterMetrics: copilotRosterMetrics,
         },
       },
       telemetry: {
@@ -6617,12 +6750,25 @@ function Dashboard({
         format: matchContext.format,
         phase: matchContext.phase,
         score: matchState.runs,
+        scoreRuns: matchState.runs,
         wickets: matchState.wickets,
+        wicketsInHand: Math.max(0, 10 - safeNum(matchState.wickets, 0)),
+        overs: formatOverStr(matchState.ballsBowled),
+        ballsBowled: matchState.ballsBowled,
+        totalOvers: matchState.totalOvers,
         target: typeof matchState.target === 'number' ? matchState.target : undefined,
+        currentSituation: typeof matchState.target === 'number' ? 'chasing' : 'setting',
+        currentRunRate,
+        requiredRunRate,
+        pressure: pressureIndex,
       },
       players: {
-        bowler: String(activePlayer?.name || currentTelemetry.playerName || ''),
-        bench: players.filter((player) => player.inRoster !== false).map((player) => player.name).slice(0, 8),
+        selectedBatter: selectedBatterForCopilot || undefined,
+        selectedBowler: selectedBowlerForCopilot || undefined,
+        striker: selectedBatterForCopilot || undefined,
+        bowler: selectedBowlerForCopilot || String(activePlayer?.name || currentTelemetry.playerName || ''),
+        bench: rosterPlayers.map((player) => player.name).slice(0, 8),
+        rosterMetrics: copilotRosterMetrics,
       },
       coachOutput: {
         strategicAnalysis: strategicAnalysis || combinedAnalysis || {},
@@ -6641,6 +6787,7 @@ function Dashboard({
       activePlayer?.overs,
       activePlayer?.role,
       activePlayer?.strainIndex,
+      copilotRosterMetrics,
       combinedAnalysis,
       combinedBriefing,
       combinedDecision,
@@ -6658,8 +6805,11 @@ function Dashboard({
       matchState.target,
       matchState.totalOvers,
       matchState.wickets,
-      players,
+      pressureIndex,
       requiredRunRate,
+      rosterPlayers,
+      selectedBatterForCopilot,
+      selectedBowlerForCopilot,
       strategicAnalysis,
       tacticalAnalysis,
     ]
@@ -7082,7 +7232,7 @@ function Dashboard({
   const routerNarrative =
     sanitizeRouterReason(routerDecisionForView?.rationale || routerDecisionForView?.reason || '') ||
     'Decision selected from current match signals.';
-  const isCoachOutputState = analysisActive || showCoachInsights;
+  const isCoachOutputState = !isCoachPanelSuppressedForSelection && (analysisActive || showCoachInsights);
   const shouldShowTelemetryGraph = showCoachInsights && (analysisActive || agentState !== 'idle');
   const isFullAnalysis = runMode === 'full';
   const analysisRunModeLine = (() => {

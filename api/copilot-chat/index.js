@@ -111,6 +111,66 @@ const parseUpstreamCode = (rawBody) => {
 const DOMAIN_REFUSAL_REPLY =
   "I'm designed to help with cricket tactics, player performance, match analysis, workload, fatigue, recovery, and injury-risk decisions. Ask me anything in the cricket and coaching domain.";
 
+const PERFORMANCE_INTENT_KEYWORDS = [
+  'reliable',
+  'reliability',
+  'lowest fatigue',
+  'low fatigue',
+  'fatigue risk',
+  'safest bowler',
+  'safest batter',
+  'safest player',
+  'best condition',
+  'best prepared',
+  'ready to bowl',
+  'ready to bat',
+  'in best condition',
+  'lowest injury risk',
+  'workload risk',
+  'readiness',
+  'workload',
+  'recovery',
+  'sleep',
+  'performance',
+  'consistency',
+  'most reliable player',
+  'who should bowl',
+  'who should bat',
+];
+
+const LIVE_SCOPE_KEYWORDS = [
+  'this match',
+  'current match',
+  'match state',
+  'current state',
+  'next over',
+  'this over',
+  'over plan',
+  'over planning',
+  'pressure phase',
+  'required run rate',
+  'current run rate',
+  'target',
+  'wickets in hand',
+  'score',
+  'rotation',
+  'rotate',
+  'switch',
+  'spell',
+  'quota',
+  'overs remaining',
+  'no-ball risk',
+  'noball risk',
+  'injury risk',
+  'fatigue',
+  'strain',
+  'workload',
+  'recovery',
+  'readiness',
+  'coach recommendation',
+  'coaching recommendation',
+];
+
 const DOMAIN_ALLOWED_KEYWORDS = [
   'cricket',
   'cricketer',
@@ -210,6 +270,46 @@ const DOMAIN_ALLOWED_KEYWORDS = [
   'risk',
   'spell',
   'coach',
+];
+
+const CRICKET_ENTITY_KEYWORDS = [
+  'afridi',
+  'shaheen',
+  'shahid',
+  'kohli',
+  'virat',
+  'babar',
+  'azam',
+  'dhoni',
+  'rohit',
+  'bumrah',
+  'stokes',
+  'ben stokes',
+  'root',
+  'joe root',
+  'smith',
+  'steve smith',
+  'williamson',
+  'kane williamson',
+  'jadeja',
+  'rashid',
+  'malinga',
+  'sachin',
+  'tendulkar',
+  'dravid',
+  'sehwag',
+  'gavaskar',
+  'lara',
+  'ponting',
+  'warne',
+  'muralitharan',
+  'akram',
+  'waqar',
+  'imran khan',
+  'buttler',
+  'livingstone',
+  'maxwell',
+  'gayle',
 ];
 
 const DOMAIN_BLOCKED_KEYWORDS = [
@@ -336,6 +436,15 @@ const collectBlockedKeywordHits = (normalizedMessage) =>
 const collectDomainIntentHits = (normalizedMessage) =>
   DOMAIN_INTENT_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
 
+const collectLiveScopeHits = (normalizedMessage) =>
+  LIVE_SCOPE_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
+
+const collectCricketEntityHits = (normalizedMessage) =>
+  CRICKET_ENTITY_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
+
+const collectPerformanceIntentHits = (normalizedMessage) =>
+  PERFORMANCE_INTENT_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
+
 const hasCopilotContextSignals = (snapshot) => {
   const matchContext = asRecord(snapshot.matchContext);
   const telemetry = asRecord(snapshot.telemetry);
@@ -354,40 +463,63 @@ const classifyCopilotDomain = (message, history, snapshot) => {
   const allowedHits = collectAllowedKeywordHits(normalizedMessage);
   const blockedHits = collectBlockedKeywordHits(normalizedMessage);
   const domainIntentHits = collectDomainIntentHits(normalizedMessage);
+  const liveScopeHits = collectLiveScopeHits(normalizedMessage);
+  const cricketEntityHits = collectCricketEntityHits(normalizedMessage);
+  const performanceIntentHits = collectPerformanceIntentHits(normalizedMessage);
+  const comparisonDetected =
+    /\b(better|best|compare|comparison|vs|versus)\b/.test(normalizedMessage) && /\bor\b/.test(normalizedMessage);
   const followUpDetected = FOLLOW_UP_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
   const hasRecentTurns = Array.isArray(history) && history.length > 0;
   const hasContextSignals = hasCopilotContextSignals(snapshot);
   const hasDomainIntent = domainIntentHits.length > 0;
+  const hasCricketSignal = hasDomainIntent || allowedHits.length > 0 || cricketEntityHits.length > 0;
+  const hasLiveScopeSignal = liveScopeHits.length > 0;
+  const hasPerformanceIntent = performanceIntentHits.length > 0;
 
-  if (blockedHits.length > 0 && !hasDomainIntent) {
+  if (blockedHits.length > 0 && !hasCricketSignal) {
     return {
       allowed: false,
+      handling: 'blocked',
       reason: 'blocked_keyword',
       allowedHits,
       blockedHits,
       domainIntentHits,
+      liveScopeHits,
+      cricketEntityHits,
+      performanceIntentHits,
+      comparisonDetected,
       followUpDetected,
     };
   }
 
-  if (hasDomainIntent) {
+  if (hasPerformanceIntent && (hasContextSignals || hasCricketSignal)) {
     return {
       allowed: true,
-      reason: 'allowed_domain_intent',
+      handling: 'full',
+      reason: 'player_performance_intent',
       allowedHits,
       blockedHits,
       domainIntentHits,
+      liveScopeHits,
+      cricketEntityHits,
+      performanceIntentHits,
+      comparisonDetected,
       followUpDetected,
     };
   }
 
-  if (allowedHits.length > 0) {
+  if (hasLiveScopeSignal) {
     return {
       allowed: true,
-      reason: 'allowed_keyword',
+      handling: 'full',
+      reason: 'live_scope_keyword',
       allowedHits,
       blockedHits,
       domainIntentHits,
+      liveScopeHits,
+      cricketEntityHits,
+      performanceIntentHits,
+      comparisonDetected,
       followUpDetected,
     };
   }
@@ -395,20 +527,46 @@ const classifyCopilotDomain = (message, history, snapshot) => {
   if (followUpDetected && (hasRecentTurns || hasContextSignals)) {
     return {
       allowed: true,
+      handling: 'full',
       reason: 'contextual_follow_up',
       allowedHits,
       blockedHits,
       domainIntentHits,
+      liveScopeHits,
+      cricketEntityHits,
+      performanceIntentHits,
+      comparisonDetected,
+      followUpDetected,
+    };
+  }
+
+  if (hasCricketSignal || (comparisonDetected && cricketEntityHits.length > 0)) {
+    return {
+      allowed: true,
+      handling: 'cricket_redirect',
+      reason: hasCricketSignal ? 'cricket_general' : 'cricket_entity_comparison',
+      allowedHits,
+      blockedHits,
+      domainIntentHits,
+      liveScopeHits,
+      cricketEntityHits,
+      performanceIntentHits,
+      comparisonDetected,
       followUpDetected,
     };
   }
 
   return {
     allowed: false,
+    handling: 'blocked',
     reason: 'out_of_domain',
     allowedHits,
     blockedHits,
     domainIntentHits,
+    liveScopeHits,
+    cricketEntityHits,
+    performanceIntentHits,
+    comparisonDetected,
     followUpDetected,
   };
 };
@@ -419,7 +577,11 @@ const buildCopilotSystemPrompt = () =>
     'You are not a general chatbot.',
     'You can answer questions about live match state, cricket tactics, format strategy (T20/ODI/Test), player comparisons, and cricket performance science.',
     'Also answer questions about fatigue, workload, recovery, readiness, biomechanics, and injury-risk in cricket.',
+    'Treat player-reliability/readiness questions as in-domain and use provided roster metrics directly.',
+    'For player comparisons or reliability ranking, prioritize fatigue, fatigue limit, recovery, sleep, control, speed, power, injury risk, and no-ball risk.',
     'Ground responses in provided context when relevant, but do not force match-state references when the user asks broader cricket knowledge questions.',
+    'Always use the structured live context block (match state, selected players, roster metrics, coach context) before giving advice.',
+    'When context is missing, state exactly which metric is missing in one short sentence.',
     'Do not invent unavailable metrics; if a key value is missing, state that briefly.',
     'Your response style must be coach-facing: clear answer, cricket-specific reasoning, subtle signal, and practical implication.',
     'Be concise but insightful (typically 3-6 sentences).',
@@ -466,6 +628,131 @@ const buildCopilotSignalSummary = (snapshot) => {
   return lines.join('\n');
 };
 
+const readOptionalNumber = (value, digits = 1) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return '';
+  return Number(parsed.toFixed(digits)).toString();
+};
+
+const collectRosterMetrics = (snapshot) => {
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const sources = [players.rosterMetrics, snapshotPlayers.rosterMetrics];
+  const seen = new Set();
+  const rows = [];
+  for (const source of sources) {
+    if (!Array.isArray(source)) continue;
+    for (const entry of source) {
+      const record = asRecord(entry);
+      const id = toText(record.id);
+      const name = toText(record.name, record.playerName);
+      const dedupeKey = toText(id, name).toLowerCase();
+      if (!dedupeKey || seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      rows.push(record);
+    }
+  }
+  return rows;
+};
+
+const buildCopilotContextBlock = (snapshot) => {
+  const matchContext = asRecord(snapshot.matchContext);
+  const snapshotContext = asRecord(asRecord(snapshot.matchContextSnapshot).matchContext);
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const telemetry = asRecord(snapshot.telemetry);
+  const coachOutput = asRecord(snapshot.coachOutput);
+  const tacticalRecommendation = asRecord(coachOutput.tacticalRecommendation);
+  const combinedDecision = asRecord(coachOutput.combinedDecision);
+
+  const scoreRuns = toText(matchContext.scoreRuns, matchContext.score, snapshotContext.scoreRuns, snapshotContext.score, 'n/a');
+  const wickets = toText(matchContext.wickets, matchContext.wicketsInHand, snapshotContext.wickets, snapshotContext.wicketsInHand, 'n/a');
+  const overs = toText(matchContext.overs, snapshotContext.overs);
+  const ballsBowled = readOptionalNumber(matchContext.ballsBowled, 0) || readOptionalNumber(snapshotContext.ballsBowled, 0);
+  const overDisplay = overs || (ballsBowled ? `${Math.floor(Number(ballsBowled) / 6)}.${Number(ballsBowled) % 6}` : 'n/a');
+  const selectedBatter = toText(players.selectedBatter, snapshotPlayers.selectedBatter, players.striker, snapshotPlayers.striker, 'unknown');
+  const selectedBowler = toText(
+    players.selectedBowler,
+    snapshotPlayers.selectedBowler,
+    players.bowler,
+    snapshotPlayers.bowler,
+    telemetry.playerName,
+    'unknown'
+  );
+
+  const rosterRows = collectRosterMetrics(snapshot);
+  const playerLines = rosterRows.length > 0
+    ? rosterRows.map((row) => {
+        const name = toText(row.name, row.playerName, 'Player');
+        const segments = [];
+        const role = toText(row.role);
+        if (role) segments.push(`role=${role}`);
+        const fatigue = readOptionalNumber(row.fatigueIndex, 1);
+        const fatigueLimit = readOptionalNumber(row.fatigueLimit, 1);
+        if (fatigue || fatigueLimit) {
+          segments.push(`fatigue=${fatigue || 'n/a'}/${fatigueLimit || 'n/a'}`);
+        }
+        const sleepHours = readOptionalNumber(row.sleepHours, 1);
+        if (sleepHours) segments.push(`sleep=${sleepHours}h`);
+        const recoveryMinutes = readOptionalNumber(row.recoveryMinutes, 0);
+        if (recoveryMinutes) segments.push(`recovery=${recoveryMinutes}m`);
+        const hr = toText(row.heartRateRecovery);
+        if (hr) segments.push(`hr=${hr}`);
+        const control = readOptionalNumber(row.control, 1);
+        if (control) segments.push(`control=${control}`);
+        const speed = readOptionalNumber(row.speed, 1);
+        if (speed) segments.push(`speed=${speed}`);
+        const power = readOptionalNumber(row.power, 1);
+        if (power) segments.push(`power=${power}`);
+        const injury = toText(row.injuryRisk);
+        if (injury) segments.push(`injuryRisk=${injury}`);
+        const noBall = toText(row.noBallRisk);
+        if (noBall) segments.push(`noBallRisk=${noBall}`);
+        const unavailable = Boolean(row.isUnfit) || Boolean(row.isInjured) || Boolean(row.isSub);
+        if (unavailable) segments.push('available=false');
+        return `- ${name}: ${segments.join(', ') || 'metrics unavailable'}`;
+      })
+      : ['- None'];
+
+  const latestRecommendation = toText(
+    tacticalRecommendation.nextAction,
+    tacticalRecommendation.primary,
+    combinedDecision.immediateAction,
+    coachOutput.combinedBriefing,
+    'None'
+  );
+  const latestRationale = toText(
+    tacticalRecommendation.why,
+    combinedDecision.rationale,
+    coachOutput.summary,
+    'None'
+  );
+
+  return [
+    'MATCH STATE',
+    `- Score: ${scoreRuns}/${wickets}`,
+    `- Overs: ${overDisplay}`,
+    `- Target: ${toText(matchContext.target, snapshotContext.target, 'n/a')}`,
+    `- Phase: ${toText(matchContext.phase, snapshotContext.phase, 'n/a')}`,
+    `- Format: ${toText(matchContext.format, snapshotContext.format, 'n/a')}`,
+    `- Mode: ${toText(matchContext.matchMode, snapshotContext.matchMode, 'n/a')}`,
+    `- Current RR: ${toText(matchContext.currentRunRate, snapshotContext.currentRunRate, 'n/a')}`,
+    `- Required RR: ${toText(matchContext.requiredRunRate, snapshotContext.requiredRunRate, 'n/a')}`,
+    `- Situation: ${toText(matchContext.currentSituation, snapshotContext.currentSituation, 'n/a')}`,
+    '',
+    'SELECTED PLAYERS',
+    `- Batter: ${selectedBatter}`,
+    `- Bowler: ${selectedBowler}`,
+    '',
+    'PLAYER BASELINES',
+    ...playerLines,
+    '',
+    'COACH CONTEXT',
+    `- Latest recommendation: ${latestRecommendation}`,
+    `- Latest rationale: ${latestRationale}`,
+  ].join('\n');
+};
+
 const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
   const coachOutput = asRecord(payload.coachOutput);
   const tacticalRecommendation = asRecord(coachOutput.tacticalRecommendation);
@@ -487,6 +774,84 @@ const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
   );
   const normalizedQuestion = String(userMessage || '').trim().toLowerCase();
 
+  const readRiskBand = (value) => {
+    const token = String(value || '').trim().toUpperCase();
+    if (token === 'HIGH' || token === 'CRITICAL') return 'HIGH';
+    if (token === 'MED' || token === 'MEDIUM') return 'MED';
+    return 'LOW';
+  };
+
+  const normalizeRosterMetrics = (value) => {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((entry) => {
+        const row = asRecord(entry);
+        const name = toText(row.name, row.playerName);
+        if (!name) return null;
+        const fatigue = Number(row.fatigueIndex);
+        const fatigueLimit = Number(row.fatigueLimit);
+        const sleepHours = Number(row.sleepHours);
+        const recoveryMinutes = Number(row.recoveryMinutes);
+        const control = Number(row.control);
+        const injuryRisk = readRiskBand(row.injuryRisk);
+        const noBallRisk = readRiskBand(row.noBallRisk);
+        const recoveryBand = toText(row.heartRateRecovery, row.recoveryBand, 'Moderate');
+        const isUnavailable = Boolean(row.isUnfit) || Boolean(row.isInjured) || Boolean(row.isSub);
+        return {
+          name,
+          role: toText(row.role, 'Player'),
+          fatigue: Number.isFinite(fatigue) ? Math.max(0, fatigue) : 0,
+          fatigueLimit: Number.isFinite(fatigueLimit) ? Math.max(1, fatigueLimit) : 6,
+          sleepHours: Number.isFinite(sleepHours) ? Math.max(0, sleepHours) : 7,
+          recoveryMinutes: Number.isFinite(recoveryMinutes) ? Math.max(0, recoveryMinutes) : 45,
+          control: Number.isFinite(control) ? Math.max(0, control) : 75,
+          injuryRisk,
+          noBallRisk,
+          recoveryBand,
+          isUnavailable,
+        };
+      })
+      .filter(Boolean);
+  };
+
+  const isReliabilityPrompt = /(reliable|reliability|lowest fatigue|fatigue risk|safest (bowler|batter|player)|best condition|ready to bowl|ready to bat|in best condition|lowest injury risk|workload risk|who should bowl|who should bat)/.test(
+    normalizedQuestion
+  );
+
+  if (isReliabilityPrompt) {
+    const snapshotPlayers = asRecord(payload.matchContextSnapshot).players;
+    const directPlayers = players;
+    const rosterMetrics = normalizeRosterMetrics(
+      asRecord(directPlayers).rosterMetrics || asRecord(snapshotPlayers).rosterMetrics
+    ).filter((row) => !row.isUnavailable);
+    if (rosterMetrics.length > 0) {
+      const scorePlayer = (row) => {
+        const fatigueHeadroom = Math.max(-1, Math.min(1, (row.fatigueLimit - row.fatigue) / Math.max(1, row.fatigueLimit)));
+        const sleepScore = Math.max(0, Math.min(1, row.sleepHours / 8));
+        const recoveryScore = row.recoveryBand.toLowerCase() === 'good' ? 1 : row.recoveryBand.toLowerCase() === 'moderate' ? 0.65 : 0.35;
+        const recoveryMinutesScore = Math.max(0, Math.min(1, row.recoveryMinutes / 60));
+        const controlScore = Math.max(0, Math.min(1, row.control > 10 ? row.control / 100 : row.control / 10));
+        const injuryPenalty = row.injuryRisk === 'HIGH' ? 0.45 : row.injuryRisk === 'MED' ? 0.2 : 0;
+        const noBallPenalty = row.noBallRisk === 'HIGH' ? 0.2 : row.noBallRisk === 'MED' ? 0.1 : 0;
+        return (fatigueHeadroom * 0.36) + (sleepScore * 0.15) + (recoveryScore * 0.16) + (recoveryMinutesScore * 0.1) + (controlScore * 0.23) - injuryPenalty - noBallPenalty;
+      };
+      const ranked = [...rosterMetrics]
+        .map((row) => ({ row, score: scorePlayer(row) }))
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return a.row.name.localeCompare(b.row.name);
+        });
+      const best = ranked[0]?.row;
+      const runnerUp = ranked[1]?.row;
+      if (best) {
+        const comparisonLine = runnerUp
+          ? `Compared with ${runnerUp.name}, ${best.name} has a stronger control-risk balance right now.`
+          : `${best.name} currently shows the strongest readiness profile in the available squad metrics.`;
+        return `Based on current recovery and fatigue metrics, ${best.name} appears the most reliable option today. ${best.name}'s fatigue is ${best.fatigue.toFixed(1)}/${best.fatigueLimit.toFixed(1)}, recovery is ${best.recoveryBand}, and injury/no-ball risk remains ${best.injuryRisk}/${best.noBallRisk}. ${comparisonLine}`;
+      }
+    }
+  }
+
   if (/are you sure|are u sure|are you even ai|are u even ai|are you ai/.test(normalizedQuestion)) {
     return `Copilot is currently in fallback/local mode, so this reply is not from Azure OpenAI. Based on the latest match state, ${nextAction}. ${rationale}`.trim();
   }
@@ -496,6 +861,23 @@ const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
   }
 
   return `Copilot is in fallback/local mode for this message. Recommended action: ${nextAction}. ${rationale}`.trim();
+};
+
+const buildCricketRedirectReply = (userMessage, snapshot) => {
+  const normalizedQuestion = String(userMessage || '').trim().toLowerCase();
+  const matchContext = asRecord(snapshot.matchContext);
+  const fallbackMatchContext = asRecord(snapshot.matchContextSnapshot);
+  const phase = toText(matchContext.phase, fallbackMatchContext.phase, 'this phase');
+
+  if (normalizedQuestion.includes('shaheen') && normalizedQuestion.includes('shahid') && normalizedQuestion.includes('afridi')) {
+    return 'That depends on role, era, and tactical need. Shahid Afridi offered explosive all-round impact, while Shaheen Afridi is a specialist new-ball pace threat with high wicket-taking value. In tactIQ terms, I can map that choice to a scenario like powerplay pressure, strike bowling, control, or workload risk.';
+  }
+
+  if (/\b(better|best|compare|comparison|vs|versus)\b/.test(normalizedQuestion)) {
+    return `That depends on role, format, and pressure phase rather than a single "better" label. In tactical terms, compare wicket threat, control under pressure, and workload sustainability for the role you need. If you share the ${phase} situation, I can give a match-specific coaching recommendation.`;
+  }
+
+  return `That is within cricket domain, but the best answer depends on role, format, and phase pressure. In tactIQ context, I can turn this into a practical coaching call for ${phase} with control, risk, and workload trade-offs.`;
 };
 
 module.exports = async function copilotChat(context, req) {
@@ -558,8 +940,6 @@ module.exports = async function copilotChat(context, req) {
     matchId: toText(payload.matchId),
     sessionId: toText(payload.sessionId),
   };
-  const contextJson = compactJson(contextSnapshot, 2800);
-
   context.log?.('[copilot-chat] submit', {
     traceId,
     routeCalled,
@@ -574,14 +954,19 @@ module.exports = async function copilotChat(context, req) {
     traceId,
     routeCalled,
     allowed: domain.allowed,
+    handling: domain.handling,
     reason: domain.reason,
     allowedHits: domain.allowedHits,
     blockedHits: domain.blockedHits,
     domainIntentHits: domain.domainIntentHits,
+    liveScopeHits: domain.liveScopeHits,
+    cricketEntityHits: domain.cricketEntityHits,
+    performanceIntentHits: domain.performanceIntentHits,
+    comparisonDetected: domain.comparisonDetected,
     followUpDetected: domain.followUpDetected,
   });
 
-  if (!domain.allowed) {
+  if (domain.handling === 'blocked') {
     return respond(
       jsonResponse(
         200,
@@ -593,6 +978,27 @@ module.exports = async function copilotChat(context, req) {
           fallbackReason: `domain_guard:${domain.reason}`,
           analysisIdUsed,
           reply: DOMAIN_REFUSAL_REPLY,
+          messagesUsed: Math.min(10, countUserTurns(history) + 1),
+        },
+        {},
+        req
+      )
+    );
+  }
+
+  if (domain.handling === 'cricket_redirect') {
+    const redirectReply = buildCricketRedirectReply(message, contextSnapshot);
+    return respond(
+      jsonResponse(
+        200,
+        {
+          ok: true,
+          source: 'fallback',
+          mode: 'domain_redirect',
+          routeCalled,
+          fallbackReason: `domain_redirect:${domain.reason}`,
+          analysisIdUsed,
+          reply: redirectReply,
           messagesUsed: Math.min(10, countUserTurns(history) + 1),
         },
         {},
@@ -649,11 +1055,12 @@ module.exports = async function copilotChat(context, req) {
 
   const systemPrompt = buildCopilotSystemPrompt();
   const signalSummary = buildCopilotSignalSummary(contextSnapshot);
+  const structuredContext = buildCopilotContextBlock(contextSnapshot);
 
   const messages = [
     { role: 'system', content: systemPrompt },
     { role: 'system', content: `High-signal coaching context:\n${signalSummary}` },
-    { role: 'system', content: `Current tactIQ context snapshot JSON:\n${contextJson}` },
+    { role: 'system', content: `Structured live context:\n${structuredContext}` },
     ...history.map((turn) => ({ role: turn.role, content: turn.content })),
     { role: 'user', content: message },
   ];

@@ -89,8 +89,78 @@ const buildDemoCopilotReply = (
   const benchHint = benchList.length > 0 ? ` Keep ${benchList.join(', ')} ready as rotation options.` : '';
 
   const promptLower = prompt.toLowerCase();
+  const isReliabilityPrompt = /(reliable|reliability|lowest fatigue|fatigue risk|safest (bowler|batter|player)|best condition|ready to bowl|ready to bat|in best condition|lowest injury risk|workload risk|who should bowl|who should bat)/.test(
+    promptLower
+  );
   const safeToContinue = oversBowled === 0 || (fatigueIndex <= 4 && injuryRisk === 'LOW');
   const elevatedRisk = injuryRisk !== 'LOW' || noBallRisk === 'HIGH' || fatigueIndex >= 6 || strainIndex >= 4;
+
+  const rosterMetrics = Array.isArray(players.rosterMetrics)
+    ? players.rosterMetrics
+        .map((entry) => (entry && typeof entry === 'object' ? entry as Record<string, unknown> : null))
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+    : [];
+  if (isReliabilityPrompt && rosterMetrics.length > 0) {
+    const normalizeRiskBand = (value: unknown): 'LOW' | 'MED' | 'HIGH' => {
+      const token = String(value || '').trim().toUpperCase();
+      if (token === 'HIGH' || token === 'CRITICAL') return 'HIGH';
+      if (token === 'MED' || token === 'MEDIUM') return 'MED';
+      return 'LOW';
+    };
+    const scored = rosterMetrics
+      .map((row) => {
+        const name = readText(row.name);
+        if (!name) return null;
+        const isUnavailable = Boolean(row.isUnfit) || Boolean(row.isInjured) || Boolean(row.isSub);
+        if (isUnavailable) return null;
+        const fatigueNow = readNumber(row.fatigueIndex, 0);
+        const fatigueLimitNow = Math.max(1, readNumber(row.fatigueLimit, 6));
+        const sleepNow = readNumber(row.sleepHours, 7);
+        const recoveryMinutesNow = readNumber(row.recoveryMinutes, 45);
+        const recoveryBandNow = readText(row.heartRateRecovery, 'Moderate');
+        const injuryRiskNow = normalizeRiskBand(row.injuryRisk);
+        const noBallRiskNow = normalizeRiskBand(row.noBallRisk);
+        const controlNow = readNumber(row.control, 75);
+        const fatigueHeadroom = Math.max(-1, Math.min(1, (fatigueLimitNow - fatigueNow) / fatigueLimitNow));
+        const sleepScore = Math.max(0, Math.min(1, sleepNow / 8));
+        const recoveryBandScore = recoveryBandNow.toLowerCase() === 'good' ? 1 : recoveryBandNow.toLowerCase() === 'moderate' ? 0.65 : 0.35;
+        const recoveryMinutesScore = Math.max(0, Math.min(1, recoveryMinutesNow / 60));
+        const controlScore = Math.max(0, Math.min(1, controlNow > 10 ? controlNow / 100 : controlNow / 10));
+        const injuryPenalty = injuryRiskNow === 'HIGH' ? 0.45 : injuryRiskNow === 'MED' ? 0.2 : 0;
+        const noBallPenalty = noBallRiskNow === 'HIGH' ? 0.2 : noBallRiskNow === 'MED' ? 0.1 : 0;
+        const score = (fatigueHeadroom * 0.36) + (sleepScore * 0.15) + (recoveryBandScore * 0.16) + (recoveryMinutesScore * 0.1) + (controlScore * 0.23) - injuryPenalty - noBallPenalty;
+        return {
+          name,
+          fatigueNow,
+          fatigueLimitNow,
+          recoveryBandNow,
+          injuryRiskNow,
+          noBallRiskNow,
+          score,
+        };
+      })
+      .filter((entry): entry is {
+        name: string;
+        fatigueNow: number;
+        fatigueLimitNow: number;
+        recoveryBandNow: string;
+        injuryRiskNow: 'LOW' | 'MED' | 'HIGH';
+        noBallRiskNow: 'LOW' | 'MED' | 'HIGH';
+        score: number;
+      } => Boolean(entry))
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.name.localeCompare(b.name);
+      });
+    const best = scored[0];
+    const runnerUp = scored[1];
+    if (best) {
+      const comparison = runnerUp
+        ? `Compared with ${runnerUp.name}, ${best.name} currently has the stronger readiness profile.`
+        : `${best.name} currently profiles as the safest high-readiness option.`;
+      return `Based on current recovery and fatigue metrics, ${best.name} appears the most reliable option today. ${best.name}'s fatigue is ${best.fatigueNow.toFixed(1)}/${best.fatigueLimitNow.toFixed(1)}, recovery is ${best.recoveryBandNow}, and injury/no-ball risk is ${best.injuryRiskNow}/${best.noBallRiskNow}. ${comparison}`;
+    }
+  }
 
   let action = safeToContinue
     ? `Continue with ${playerName} for the next over and focus on repeatable release points.`
@@ -306,6 +376,8 @@ export default function CopilotChatPanel({
       setRuntimeNote(
         responseMode === 'domain_guard'
           ? 'Copilot is domain-restricted to match tactics, fatigue, workload, and injury-risk guidance.'
+          : responseMode === 'domain_redirect'
+          ? 'Copilot handled this as a broader cricket question and redirected to tactical context.'
           : responseSource === 'fallback'
           ? 'Copilot response came from fallback/local mode.'
           : null
