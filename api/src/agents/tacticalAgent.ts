@@ -12,6 +12,37 @@ const truncateChars = (value: unknown, maxChars: number): string => {
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, Math.max(0, maxChars - 1)).trim()}…`;
 };
+const trimToSentenceBoundary = (value: unknown, maxChars: number): string => {
+  const normalized = normalizeText(value);
+  if (!normalized || normalized.length <= maxChars) return normalized;
+  const clipped = normalized.slice(0, Math.max(0, maxChars)).trim();
+  const punctuationIndex = Math.max(clipped.lastIndexOf('.'), clipped.lastIndexOf('!'), clipped.lastIndexOf('?'));
+  if (punctuationIndex >= Math.floor(maxChars * 0.45)) {
+    return clipped.slice(0, punctuationIndex + 1).trim();
+  }
+  const lastSpace = clipped.lastIndexOf(' ');
+  if (lastSpace >= Math.floor(maxChars * 0.55)) {
+    return clipped.slice(0, lastSpace).trim();
+  }
+  return clipped;
+};
+const sanitizeSentenceTail = (value: unknown): string =>
+  String(value || '')
+    .replace(/(?:\.\.\.|…)+\s*$/g, '')
+    .replace(/[,:;/-]\s*$/g, '')
+    .replace(/\b(?:based on|instead of|if|because|while|with)\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+const isIncompleteSentence = (value: string): boolean => {
+  const normalized = normalizeText(value);
+  if (!normalized) return true;
+  if (/(?:\.\.\.|…)\s*$/.test(normalized)) return true;
+  if (/\b(?:based on|instead of|if|because|while|with)\.?\s*$/i.test(normalized)) return true;
+  if (/\b(?:based|instead|after|before|during|for|to|with|if|because|while|the|a|an)\.?\s*$/i.test(normalized)) return true;
+  if (/[,:;/-]\.?\s*$/.test(normalized)) return true;
+  if (/\b(?:to|and|or)\.?\s*$/i.test(normalized)) return true;
+  return false;
+};
 const toSingleSentence = (value: unknown): string => truncateChars(value, 120);
 const dedupeTextList = (values: string[]): string[] => {
   const seen = new Set<string>();
@@ -77,8 +108,25 @@ const sanitizeLine = (value: unknown, fallback: string, maxChars = 120): string 
     !normalized ||
     /(?:\bof\.?$|\bof$| of and )/i.test(normalized) ||
     /\bis\s*,\s*is\b/i.test(normalized);
-  if (broken) return truncateChars(fallback, maxChars) || fallback;
-  return truncateChars(normalized, maxChars) || truncateChars(fallback, maxChars) || fallback;
+  const finalize = (candidate: unknown): string => {
+    const bounded = trimToSentenceBoundary(candidate, maxChars);
+    const cleaned = sanitizeSentenceTail(
+      String(bounded || '')
+        .replace(/\s+([,.;:!?])/g, '$1')
+        .trim()
+    );
+    if (!cleaned) return '';
+    return /[.!?]$/.test(cleaned) ? cleaned : `${cleaned}.`;
+  };
+  if (broken) {
+    const safeFallback = finalize(fallback);
+    return safeFallback && !isIncompleteSentence(safeFallback) ? safeFallback : '';
+  }
+  const primary = finalize(normalized);
+  if (primary && !isIncompleteSentence(primary)) return primary;
+  const safeFallback = finalize(fallback);
+  if (safeFallback && !isIncompleteSentence(safeFallback)) return safeFallback;
+  return '';
 };
 const sanitizeBullets = (items: Array<unknown>, max = 3): string[] =>
   dedupeTextList(
@@ -897,10 +945,15 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         'Required keys: nextAction (<=70 chars), why (array with exactly 2 bullets, each <=90 chars), ifIgnored (<=90 chars), coachNote (<=110 chars). ' +
         'Optional key: swap object {out: playerId, in: playerId, reason <=90 chars}. ' +
         'Also include compatibility keys: immediateAction, rationale, suggestedAdjustments when possible. ' +
-        `${teamModeInstruction} Always justify recommendations with telemetry values oversBowled, fatigueIndex, strainIndex. ` +
+        `${teamModeInstruction} Use telemetry and baseline as evidence, but do not just restate raw stats. ` +
+        'Focus on tactical implications: control stability, momentum, workload compounding, and next-over consequence. ' +
+        'Prefer coach-briefing language and include a short tactical sequence when useful (next over, then following over/backup). ' +
+        'Every field must be a complete sentence or complete tactical clause. ' +
+        'Do not output unfinished endings like "based on...", "instead of...", "if...", "because...", "while...", or "with...". ' +
+        'If uncertain, write a shorter complete sentence. Never leave trailing ellipses. ' +
+        'Do not mention internal ranking scores in coach-facing text. ' +
         'If oversBowled is 0 and fatigueIndex/strainIndex are safe with no HIGH risk flag, do not call immediate rotation. ' +
-        'You MUST explicitly reference baseline sleepHours, recoveryMinutes, and fatigueLimit when provided. ' +
-        'Your answer will be rejected if you do not mention baseline sleep and recovery when provided. ' +
+        'When baseline exists, incorporate sleep/recovery/fatigueLimit meaningfully, but mention numbers only when critical to justify the move. ' +
         'If baseline is missing, say: "Baseline not available — using live telemetry only."',
     },
     {
@@ -912,8 +965,8 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         constraints: {
           modeStrictness: teamModeInstruction,
           telemetryRequired: ['oversBowled', 'fatigueIndex', 'strainIndex'],
-        baselineRequired:
-          'When baseline exists, mention sleepHours + recoveryMinutes + fatigueLimit and explain how they change the action.',
+          baselineRequired:
+            'When baseline exists, use sleepHours + recoveryMinutes + fatigueLimit to shape tactical reasoning without repeating every metric.',
           noImmediateRotationRule:
             'If oversBowled=0 and fatigueIndex<=4 and strainIndex<=2 and injury/no-ball risk are not HIGH, avoid immediate bowler rotation.',
         },
@@ -966,11 +1019,17 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
       fallbacksUsed = [...new Set([...fallbacksUsed, 'mode-sanitized'])];
     }
 
-    if (!/oversbowled|fatigueindex|strainindex/i.test(parsed.rationale)) {
-      parsed.rationale = truncateChars(`${parsed.rationale} ${telemetryBasis}`.trim(), 90);
+    if (!parsed.rationale || parsed.rationale.trim().length < 20) {
+      parsed.rationale = truncateChars(
+        `${parsed.rationale || ''} Tactical call grounded in workload trend and match-phase pressure.`.trim(),
+        90
+      );
     }
     if (!parsed.coachNote || !/baseline|sleep|recovery|fatigue ceiling|fatigue limit/i.test(parsed.coachNote)) {
-      parsed.coachNote = truncateChars(`${baselineDirective.text} ${telemetryBasis}`.trim(), 110);
+      parsed.coachNote = truncateChars(
+        `${baselineDirective.text} Use a one-over checkpoint, then reassess control quality before committing the following spell.`.trim(),
+        110
+      );
     }
     if (baselineDirective.constrained && teamMode === 'BOWLING' && !/rotate|substitut|switch/i.test(parsed.immediateAction.toLowerCase())) {
       parsed.immediateAction = `Rotate ${safeInput.telemetry.playerName || 'current bowler'} now and shorten the next spell`;

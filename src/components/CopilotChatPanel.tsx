@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { copilotChatUrl, postCopilotChat } from '../lib/apiClient';
 
 type CopilotRole = 'user' | 'assistant';
@@ -548,9 +549,15 @@ export default function CopilotChatPanel({
                 {turn.role === 'assistant' && (
                   <div style={{ fontSize: 11, letterSpacing: 2, fontWeight: 700, color: 'rgba(167,243,208,0.95)', marginBottom: 4 }}>COPILOT</div>
                 )}
-                <div style={{ color: 'rgba(255,255,255,0.92)', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                  {turn.content}
-                </div>
+                {turn.role === 'assistant' ? (
+                  <div className="prose prose-invert max-w-none" style={{ color: 'rgba(255,255,255,0.92)', lineHeight: 1.65, wordBreak: 'break-word' }}>
+                    <ReactMarkdown>{turn.content}</ReactMarkdown>
+                  </div>
+                ) : (
+                  <div style={{ color: 'rgba(255,255,255,0.92)', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    <span>{turn.content}</span>
+                  </div>
+                )}
               </div>
             ))}
             {isSending && (

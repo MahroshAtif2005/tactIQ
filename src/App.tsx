@@ -7579,6 +7579,53 @@ function Dashboard({
     if (normalized.length <= maxChars) return normalized;
     return `${normalized.slice(0, Math.max(0, maxChars - 1)).trim()}…`;
   };
+  const trimToSentenceBoundary = (value: string, maxChars: number): string => {
+    const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!normalized || normalized.length <= maxChars) return normalized;
+    const clipped = normalized.slice(0, Math.max(0, maxChars)).trim();
+    const punctuationIndex = Math.max(clipped.lastIndexOf('.'), clipped.lastIndexOf('!'), clipped.lastIndexOf('?'));
+    if (punctuationIndex >= Math.floor(maxChars * 0.45)) {
+      return clipped.slice(0, punctuationIndex + 1).trim();
+    }
+    const lastSpace = clipped.lastIndexOf(' ');
+    if (lastSpace >= Math.floor(maxChars * 0.55)) {
+      return clipped.slice(0, lastSpace).trim();
+    }
+    return clipped;
+  };
+  const sanitizeSentenceTail = (value: string): string =>
+    String(value || '')
+      .replace(/(?:\.\.\.|…)+\s*$/g, '')
+      .replace(/[,:;/-]\s*$/g, '')
+      .replace(/\b(?:based on|instead of|if|because|while|with)\s*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  const isIncompleteCoachSentence = (value: string): boolean => {
+    const normalized = String(value || '').trim();
+    if (!normalized) return true;
+    if (/(?:\.\.\.|…)\s*$/.test(normalized)) return true;
+    if (/\b(?:based on|instead of|if|because|while|with)\.?\s*$/i.test(normalized)) return true;
+    if (/\b(?:based|instead|after|before|during|for|to|with|if|because|while|the|a|an)\.?\s*$/i.test(normalized)) return true;
+    if (/[,:;/-]\.?\s*$/.test(normalized)) return true;
+    if (/\b(?:to|and|or)\.?\s*$/i.test(normalized)) return true;
+    return false;
+  };
+  const finalizeCoachSentence = (value: unknown, fallback: string, maxChars = 140): string => {
+    const normalizeCandidate = (candidate: unknown): string => {
+      const bounded = trimToSentenceBoundary(String(candidate || ''), maxChars);
+      const cleaned = sanitizeSentenceTail(
+        String(bounded || '')
+          .replace(/\s+([,.;:!?])/g, '$1')
+      );
+      if (!cleaned) return '';
+      return /[.!?]$/.test(cleaned) ? cleaned : `${cleaned}.`;
+    };
+    const primary = normalizeCandidate(value);
+    if (primary && !isIncompleteCoachSentence(primary)) return primary;
+    const fallbackText = normalizeCandidate(fallback);
+    if (fallbackText && !isIncompleteCoachSentence(fallbackText)) return fallbackText;
+    return 'Tactical recommendation updated.';
+  };
   const dedupeBullets = (items: Array<unknown>, max = 3): string[] => {
     const seen = new Set<string>();
     const output: string[] = [];
@@ -7856,16 +7903,17 @@ function Dashboard({
       const token = roleToken(role);
       return token.includes('bowler') || token.includes('spinner') || token.includes('fast') || token.includes('all-rounder');
     };
-    const sanitizeCoachLine = (value: unknown, fallback: string, maxChars = 110): string => {
-      const cleaned = normalizeRecommendationText(value)
-        .replace(/\b([a-z]+)(?:\s*,\s*\1\b)+/gi, '$1')
-        .replace(/\b([a-z]+)(?:\s+\1\b){1,}/gi, '$1')
-        .replace(/\s+/g, ' ')
-        .replace(/\s+([,.;:!?])/g, '$1')
-        .trim();
-      const bounded = shortText(cleaned, '', maxChars);
-      return bounded.length >= 8 ? bounded : shortText(fallback, fallback, maxChars);
-    };
+    const sanitizeCoachLine = (value: unknown, fallback: string, maxChars = 110): string =>
+      finalizeCoachSentence(
+        normalizeRecommendationText(value)
+          .replace(/\b([a-z]+)(?:\s*,\s*\1\b)+/gi, '$1')
+          .replace(/\b([a-z]+)(?:\s+\1\b){1,}/gi, '$1')
+          .replace(/\s+/g, ' ')
+          .replace(/\s+([,.;:!?])/g, '$1')
+          .trim(),
+        fallback,
+        maxChars
+      );
     const toConfidenceLabel = (score: number): 'Low' | 'Moderate' | 'High' =>
       score >= 0.75 ? 'High' : score >= 0.5 ? 'Moderate' : 'Low';
     const modeLabel = String(inputMatchContext.matchMode || teamMode || 'BOWLING').toUpperCase();
@@ -7899,27 +7947,94 @@ function Dashboard({
         player.inRoster !== false &&
         !player.isSub &&
         !player.isUnfit &&
+        !player.isInjured &&
         baselineKey(player.id) !== baselineKey(telemetry.playerId) &&
         baselineKey(player.name) !== baselineKey(activeName)
     );
     const compatibleBowlers = replacementPool.filter((player) => isBowlingCompatible(player.role));
-    const byLowestFatigue = (a: Player, b: Player) => {
-      const delta = safeNum(a.fatigue, 10) - safeNum(b.fatigue, 10);
-      if (Math.abs(delta) > 0.001) return delta;
-      return String(a.name || '').localeCompare(String(b.name || ''));
+    const phaseToken = String(inputMatchContext.phase || '').trim().toLowerCase();
+    const normalizeRiskToken = (value: unknown): 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' | 'UNKNOWN' => {
+      const token = String(value || '').trim().toUpperCase();
+      if (token === 'LOW') return 'LOW';
+      if (token === 'MED' || token === 'MEDIUM') return 'MEDIUM';
+      if (token === 'HIGH') return 'HIGH';
+      if (token === 'CRITICAL') return 'CRITICAL';
+      return 'UNKNOWN';
     };
+    const scoreBowlingCandidate = (player: Player) => {
+      const fatigueValue = clamp(safeNum(player.fatigue, 5), 0, 10);
+      const strainValue = clamp(safeNum(player.strainIndex, 3), 0, 10);
+      const oversValue = Math.max(0, safeNum(player.overs, 0));
+      const fatigueLimitValue = Math.max(1, safeNum(player.baselineFatigue, 6));
+      const fatigueHeadroom = clamp((fatigueLimitValue - fatigueValue) / fatigueLimitValue, -1, 1);
+      const recoveryValue = clamp(safeNum(player.recoveryTime, 45), 0, 120);
+      const sleepValue = clamp(safeNum(player.sleepHours, 7), 0, 12);
+      const controlValue = clamp(safeNum(player.controlBaseline, 75), 0, 100);
+      const speedValue = clamp(safeNum(player.speed, 7), 0, 15);
+      const powerValue = clamp(safeNum(player.power, 6), 0, 10);
+      const injuryToken = normalizeRiskToken(player.injuryRisk);
+      const noBallToken = normalizeRiskToken(player.noBallRisk);
+      const role = roleToken(player.role);
+
+      let score = 0;
+      score += Math.max(0, 10 - fatigueValue) * 3;
+      score += Math.max(0, 10 - strainValue) * 2;
+      score += Math.max(0, 4 - oversValue) * 2;
+      score += fatigueHeadroom * 5;
+      score += controlValue * 0.08;
+      score += recoveryValue * 0.05;
+      score += sleepValue * 0.5;
+      score += speedValue * 0.25;
+      score += powerValue * 0.15;
+
+      if (injuryToken === 'LOW') score += 4;
+      else if (injuryToken === 'MEDIUM') score += 1;
+      else if (injuryToken === 'HIGH') score -= 2.5;
+      else if (injuryToken === 'CRITICAL') score -= 5;
+
+      if (noBallToken === 'LOW') score += 3;
+      else if (noBallToken === 'MEDIUM') score += 1;
+      else if (noBallToken === 'HIGH') score -= 2;
+
+      if (modeLabel === 'BOWLING') score += 2;
+      if (phaseToken.includes('death')) score += controlValue >= 80 ? 2 : 0;
+      if (phaseToken.includes('powerplay')) score += speedValue >= 11 ? 1.5 : 0;
+      if (phaseToken.includes('middle') && role.includes('spinner')) score += 1.5;
+
+      return {
+        player,
+        score: Number(score.toFixed(2)),
+        fatigueValue,
+        fatigueLimitValue,
+        strainValue,
+        oversValue,
+        recoveryValue,
+        sleepValue,
+        controlValue,
+        injuryToken,
+        noBallToken,
+      };
+    };
+    const rankedBowlingCandidates = [...compatibleBowlers]
+      .filter((player) => !isInitialOnlyName(player.name))
+      .map(scoreBowlingCandidate)
+      .sort((a, b) => (b.score !== a.score ? b.score - a.score : a.player.name.localeCompare(b.player.name)));
+    const selectedCandidateSummary = rankedBowlingCandidates[0] || null;
+    const backupCandidateSummary = rankedBowlingCandidates[1] || null;
     const selectedReplacementPlayer =
-      [...compatibleBowlers].filter((player) => !isInitialOnlyName(player.name)).sort(byLowestFatigue)[0] ||
-      [...compatibleBowlers].sort(byLowestFatigue)[0] ||
-      [...replacementPool].filter((player) => !isInitialOnlyName(player.name)).sort(byLowestFatigue)[0] ||
-      [...replacementPool].sort(byLowestFatigue)[0] ||
+      selectedCandidateSummary?.player ||
+      [...compatibleBowlers].map(scoreBowlingCandidate).sort((a, b) => b.score - a.score)[0]?.player ||
       null;
     const replacementName = resolveRosterName(
       selectedReplacementPlayer?.id || selectedReplacementPlayer?.name,
       activeName
     ) || activeName;
+    const hasReplacementOption =
+      Boolean(selectedCandidateSummary) && baselineKey(replacementName) !== baselineKey(activeName);
     const alternatives = dedupeBullets(
-      [...compatibleBowlers].sort(byLowestFatigue).map((player) => resolveRosterName(player.id || player.name, player.name)),
+      rankedBowlingCandidates
+        .slice(1, 4)
+        .map((entry) => resolveRosterName(entry.player.id || entry.player.name, entry.player.name)),
       3
     );
     const fatigue = Math.max(0, safeNum(telemetry.fatigueIndex, 0));
@@ -7931,89 +8046,106 @@ function Dashboard({
     const elevatedControlRisk = noBallRiskToken === 'HIGH' || noBallRiskToken === 'MED' || noBallRiskToken === 'MEDIUM';
     const elevatedInjuryRisk = injuryRiskToken === 'HIGH' || injuryRiskToken === 'CRITICAL' || injuryRiskToken === 'MED' || injuryRiskToken === 'MEDIUM';
     const safeContinue = oversBowled === 0 || (fatigue <= 4 && injuryRiskToken === 'LOW');
-    const recoveryLabel =
-      Number.isFinite(Number(baseline.recoveryMinutes))
-        ? Number(baseline.recoveryMinutes) < 35
-          ? 'Poor'
-          : Number(baseline.recoveryMinutes) < 55
-            ? 'Moderate'
-            : 'Good'
-        : 'Good';
     const constrainedRecoveryProfile =
       (Number.isFinite(Number(baseline.sleepHours)) && Number(baseline.sleepHours) < 7) ||
       (Number.isFinite(Number(baseline.recoveryMinutes)) && Number(baseline.recoveryMinutes) < 50);
+    const phaseLeverageLine = phaseToken.includes('death')
+      ? 'This is a leverage phase, so one loose over can swing momentum quickly.'
+      : phaseToken.includes('powerplay')
+        ? 'Fielding restrictions make control and intent shifts more visible in this phase.'
+        : 'Middle-overs tempo control now determines how much pressure carries forward.';
     const assessmentLine1 = safeContinue
-      ? `${activeName} is in a safe state to continue this spell.`
+      ? `${activeName} can continue, but this over should be used as a control checkpoint.`
       : elevatedControlRisk && elevatedInjuryRisk
-        ? `${activeName} is losing rhythm and the risk trend is rising in this spell.`
+        ? `${activeName}'s spell is approaching a rhythm-drop window where pressure can release quickly.`
         : elevatedInjuryRisk
-          ? `${activeName} is carrying workload stress that can escalate if this spell continues.`
+          ? `${activeName} is carrying workload stress that can reduce execution quality in the next spell.`
           : elevatedControlRisk
-            ? `${activeName} is drifting off control under phase pressure.`
-            : `${activeName} is still competing well, but this is the right tactical timing to rotate.`;
+            ? `${activeName} is showing early control drift; proactive rotation is tactically cleaner than reactive change.`
+            : `${activeName} is competing well, but the phase timing favors a proactive reset now.`;
     const assessmentLine2 = safeContinue
-      ? 'Current workload is controlled, so keep rhythm and reassess after the over.'
+      ? `${phaseLeverageLine} Keep a prepared change option for the following over.`
       : constrainedRecoveryProfile
-        ? 'Recovery signals suggest caution, so proactive rotation is the safer call.'
-        : 'A proactive switch now protects execution quality before momentum flips.';
+        ? 'Recovery profile suggests shorter bursts are safer, so rotate before control quality dips.'
+        : `${phaseLeverageLine} Rotating now protects execution quality before momentum flips.`;
     const confidenceScore = clamp(safeNum(tacticalAnalysis?.confidence, safeNum(combinedDecision?.confidence, 0.62)), 0, 1);
     const confidence = toConfidenceLabel(confidenceScore);
     const optionsLine = alternatives.length > 0
       ? `Other options: ${alternatives.slice(0, 3).join(', ')}.`
       : '';
+    const backupCandidateName = backupCandidateSummary
+      ? resolveRosterName(
+          backupCandidateSummary.player.id || backupCandidateSummary.player.name,
+          backupCandidateSummary.player.name
+        )
+      : '';
+    const shouldRotateNow = !safeContinue && hasReplacementOption;
+    const noEligibleReplacement = !safeContinue && !hasReplacementOption;
     const swap = {
       out: activeName,
       in: replacementName,
       reason: sanitizeCoachLine(
         safeContinue
-          ? optionsLine || 'Current spell is stable; keep alternatives warm if pressure rises.'
-          : tacticalAnalysis?.swap?.reason ||
-            tacticalAnalysis?.substitutionAdvice?.reason ||
-            'This change steadies control now and reduces escalation risk through the phase.',
+          ? `Tactical plan: Next over: stay with ${activeName}. Following over: ${backupCandidateName || replacementName} if pressure rises.`
+          : shouldRotateNow
+            ? `Tactical plan: Next over: ${replacementName} to reset pressure. Following over: ${backupCandidateName || activeName} based on control quality.`
+            : 'No eligible bowling replacement is available; use a strict one-over leash and reassess.',
         safeContinue
-          ? optionsLine || 'Current spell is stable; keep alternatives warm if pressure rises.'
-          : 'This change steadies control now and reduces escalation risk through the phase.',
+          ? `Tactical plan: Next over: stay with ${activeName}. Following over: ${backupCandidateName || replacementName} if pressure rises.`
+          : shouldRotateNow
+            ? `Tactical plan: Next over: ${replacementName} to reset pressure. Following over: ${backupCandidateName || activeName} based on control quality.`
+            : 'No eligible bowling replacement is available; use a strict one-over leash and reassess.',
         90
       ),
     };
     const recommendedMove = safeContinue
-      ? `Continue with ${activeName} for the next over — projected fatigue remains within safe range.`
-      : `Bring in ${swap.in} for ${swap.out} at the next over change and run a control-first plan.`;
+      ? `Continue with ${activeName} for one controlled over, then reassess before locking the next spell.`
+      : noEligibleReplacement
+        ? `No eligible replacement available — keep ${activeName} for one controlled over, then reassess.`
+        : `Bring in ${swap.in} for ${swap.out} next over to reset control before pressure compounds.`;
     const whyThisIsSmart = safeContinue
       ? dedupeBullets([
-          `Overs bowled: ${oversBowled.toFixed(1)}/${maxOvers}; no overuse signal.`,
-          `Fatigue: ${fatigue.toFixed(1)}/10; recovery: ${recoveryLabel}.`,
-          'Risk is low; maintain control-focused lines.',
+          `This avoids an unnecessary early change while preserving match rhythm.`,
+          `You keep a prepared fallback so the next decision stays proactive, not reactive.`,
+          backupCandidateName
+            ? `Backup option remains ${backupCandidateName} if pressure spikes after this over.`
+            : 'You preserve flexibility for the next tactical window.',
         ], 3)
-      : dedupeBullets([
-          sanitizeCoachLine(
-            tacticalAnalysis?.why?.[0] || `${swap.in} is the freshest compatible bowler for this phase.`,
-            `${swap.in} is the freshest compatible bowler for this phase.`,
-            90
-          ),
-          sanitizeCoachLine(
-            tacticalAnalysis?.why?.[1] || (elevatedInjuryRisk
-              ? 'Rotation now helps prevent injury risk from escalating late in the spell.'
-              : 'Rotation now protects execution before control risk compounds.'),
-            elevatedInjuryRisk
-              ? 'Rotation now helps prevent injury risk from escalating late in the spell.'
-              : 'Rotation now protects execution before control risk compounds.',
-            90
-          ),
-          sanitizeCoachLine(
-            tacticalAnalysis?.suggestedAdjustments?.[0] || 'Timing the switch here preserves tactical flexibility for later overs.',
-            'Timing the switch here preserves tactical flexibility for later overs.',
-            90
-          ),
-        ], 3);
+      : shouldRotateNow && selectedCandidateSummary
+        ? dedupeBullets([
+            sanitizeCoachLine(
+              `${replacementName} gives the best immediate reset for this phase and pressure profile.`,
+              `${replacementName} gives the best immediate reset for this phase.`,
+              90
+            ),
+            sanitizeCoachLine(
+              'Rotating now protects control in the following spell instead of waiting for execution to drift.',
+              'Rotating now protects control in the following spell.',
+              90
+            ),
+            sanitizeCoachLine(
+              backupCandidateName
+                ? `Secondary option: ${backupCandidateName} if scoring pressure changes after the next over.`
+                : 'This timing preserves flexibility for later overs and avoids forced reactive changes.',
+              backupCandidateName
+                ? `Secondary option: ${backupCandidateName}.`
+                : 'This timing preserves flexibility for later overs.',
+              90
+            ),
+          ], 3)
+        : dedupeBullets([
+            'No eligible replacement is available from the current bowling roster.',
+            `Use ${activeName} on a strict one-over leash with control-first fields.`,
+            'Reassess execution quality immediately before committing the following over.',
+          ], 3);
     const ifYouIgnore = safeContinue
-      ? 'Minimal risk; monitor strain if tempo increases.'
+      ? 'If control slips without a preplanned backup, the next over can force a rushed tactical change.'
       : sanitizeCoachLine(
           tacticalAnalysis?.ifIgnored ||
           finalRecommendation?.ifContinues?.riskSummary ||
           activeStrategicAnalysis?.tacticalRecommendation?.ifIgnored ||
-          'Keep a one-over leash, tighten the field, and switch immediately at the next break.',
-          'Keep a one-over leash, tighten the field, and switch immediately at the next break.',
+          'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.',
+          'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.',
           110
         );
     const hasShortOrInitialSection = (value: string): boolean => {
@@ -8022,35 +8154,46 @@ function Dashboard({
     };
     const deterministicFallback = (() => {
       const shouldRotate = injuryRiskToken === 'HIGH' || noBallRiskToken === 'HIGH' || fatigue >= 6.5 || strain >= 3.5;
+      const canFallbackRotate = shouldRotate && hasReplacementOption;
       const fallbackSwap = {
         out: activeName,
         in: replacementName,
         reason: safeContinue
-          ? optionsLine || 'Current spell is stable; keep alternatives warm if pressure rises.'
-          : shouldRotate
-          ? 'This switch protects control before risk compounds in this phase.'
-          : 'This proactive rotation keeps momentum stable and preserves tactical timing.',
+          ? `Tactical plan: Next over: stay with ${activeName}. Following over: ${backupCandidateName || replacementName} if pressure rises.`
+          : canFallbackRotate
+            ? `Tactical plan: Next over: ${replacementName} to reset pressure. Following over: ${backupCandidateName || activeName} based on control quality.`
+            : 'No eligible replacement is available, so apply a strict one-over leash and reassess.',
       };
       return {
         matchSituation: [matchSituationLine, scoreLine] as [string, string],
         assessment: [assessmentLine1, assessmentLine2] as [string, string],
         recommendedMove: safeContinue
-          ? `Continue with ${activeName} for the next over — projected fatigue remains within safe range.`
-          : `Bring in ${fallbackSwap.in} for ${fallbackSwap.out} at the next over change and run a control-first plan.`,
+          ? `Continue with ${activeName} for one controlled over, then reassess before locking the next spell.`
+          : canFallbackRotate
+            ? `Bring in ${fallbackSwap.in} for ${fallbackSwap.out} next over to reset control before pressure compounds.`
+            : `No eligible replacement available — keep ${activeName} for one controlled over, then reassess.`,
         whyThisIsSmart: safeContinue
           ? dedupeBullets([
-              `Overs bowled: ${oversBowled.toFixed(1)}/${maxOvers}; no overuse signal.`,
-              `Fatigue: ${fatigue.toFixed(1)}/10; recovery: ${recoveryLabel}.`,
-              'Risk is low; maintain control-focused lines.',
+              `This avoids an unnecessary early change while preserving match rhythm.`,
+              `You keep a prepared fallback so the next decision stays proactive, not reactive.`,
+              backupCandidateName
+                ? `Backup option remains ${backupCandidateName} if pressure spikes after this over.`
+                : 'You preserve flexibility for the next tactical window.',
             ], 3)
-          : dedupeBullets([
-              `${fallbackSwap.in} offers fresher execution for this phase.`,
-              'The timing of this change helps prevent control slippage under pressure.',
-              'You keep a safer path now while preserving options for the next tactical window.',
-            ], 3),
+          : canFallbackRotate
+            ? dedupeBullets([
+                `${fallbackSwap.in} changes the pressure profile at the right phase timing.`,
+                'The timing of this change helps prevent control slippage under pressure.',
+                'You keep a safer path now while preserving options for the next tactical window.',
+              ], 3)
+            : dedupeBullets([
+                'No eligible replacement is available from the current bowling roster.',
+                `Use ${activeName} on a strict one-over leash with control-first fields.`,
+                'Reassess execution quality immediately before committing the following over.',
+              ], 3),
         ifYouIgnore: safeContinue
-          ? 'Minimal risk; monitor strain if tempo increases.'
-          : 'Keep a one-over leash, tighten the field, and rotate immediately at the next break.',
+          ? 'If control slips without a preplanned backup, the next over can force a rushed tactical change.'
+          : 'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.',
         confidence,
         primaryPlayerName: activeName,
         swap: fallbackSwap,
@@ -8098,25 +8241,43 @@ function Dashboard({
   );
   const isBrokenTacticalText = (value: unknown): boolean => {
     const text = normalizeRecommendationText(value);
-    return !text || /(?:\bof\.?$|\bof$| of and )/i.test(text);
+    return !text || /(?:\bof\.?$|\bof$| of and )/i.test(text) || isIncompleteCoachSentence(text);
   };
-  const toCleanTacticalLines = (values: Array<unknown>, max = 3): string[] =>
+  const toCleanTacticalLines = (values: Array<unknown>, max = 3, fallback = 'Tactical recommendation updated.'): string[] =>
     values
-      .map((entry) => normalizeRecommendationText(entry))
+      .map((entry) => finalizeCoachSentence(entry, fallback, 160))
       .filter((entry) => !isBrokenTacticalText(entry))
       .slice(0, max);
-  const tacticalMatchSituationLines = toCleanTacticalLines(tacticalRecommendation.matchSituation, 2);
-  const tacticalAssessmentLines = toCleanTacticalLines(tacticalRecommendation.assessment, 2);
-  const tacticalWhyLines = toCleanTacticalLines(tacticalRecommendation.whyThisIsSmart, 3);
-  const tacticalRecommendedMove = isBrokenTacticalText(tacticalRecommendation.recommendedMove)
-    ? ''
-    : normalizeRecommendationText(tacticalRecommendation.recommendedMove);
-  const tacticalSwapReason = isBrokenTacticalText(tacticalRecommendation.swap.reason)
-    ? ''
-    : normalizeRecommendationText(tacticalRecommendation.swap.reason);
-  const tacticalIfIgnored = isBrokenTacticalText(tacticalRecommendation.ifYouIgnore)
-    ? ''
-    : normalizeRecommendationText(tacticalRecommendation.ifYouIgnore);
+  const tacticalMatchSituationLines = toCleanTacticalLines(
+    tacticalRecommendation.matchSituation,
+    2,
+    'Current phase is balanced; this over should be managed proactively.'
+  );
+  const tacticalAssessmentLines = toCleanTacticalLines(
+    tacticalRecommendation.assessment,
+    2,
+    'Control can dip if workload pressure is not managed early in the phase.'
+  );
+  const tacticalWhyLines = toCleanTacticalLines(
+    tacticalRecommendation.whyThisIsSmart,
+    3,
+    'This move protects control and reduces the chance of workload escalation.'
+  );
+  const tacticalRecommendedMove = finalizeCoachSentence(
+    tacticalRecommendation.recommendedMove,
+    'Bring in the top-ranked fresh option for the next over.',
+    160
+  );
+  const tacticalSwapReason = finalizeCoachSentence(
+    tacticalRecommendation.swap.reason,
+    'Next over: rotate to the recommended bowler and reassess immediately after.',
+    160
+  );
+  const tacticalIfIgnored = finalizeCoachSentence(
+    tacticalRecommendation.ifYouIgnore,
+    'Continuing the current spell may increase fatigue-related performance drop.',
+    160
+  );
   const tacticalRiskToken = String(
     riskAnalysis?.severity ||
     riskAnalysis?.injuryRisk ||

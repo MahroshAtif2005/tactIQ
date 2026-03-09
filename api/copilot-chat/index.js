@@ -163,8 +163,17 @@ const parseUpstreamCode = (rawBody) => {
   }
 };
 
-const DOMAIN_REFUSAL_REPLY =
-  "I'm designed to help with cricket tactics, player performance, match analysis, workload, fatigue, recovery, and injury-risk decisions. Ask me anything in the cricket and coaching domain.";
+const OUT_OF_SCOPE_REPLIES = [
+  "I specialize in cricket and sports performance analysis. If you'd like help planning the next over or managing fatigue risk, I'd be happy to help.",
+  'I can help with cricket strategy, workload, fatigue, recovery, and sports coaching decisions. Share your match situation and I can suggest the best next move.',
+  "I'm focused on cricket and sports tactics. Ask about match strategy, player readiness, or workload and I'll help you plan it.",
+];
+
+const GREETING_REPLIES = [
+  "Hey! I'm the tactIQ coaching assistant. Ask me anything about match tactics, fatigue, or player workload in this match.",
+  "Hi! I'm here to help with tactical calls, workload risk, and next-over planning. Share the current match situation and I'll break it down.",
+  'Hello! Ready when you are. Ask about the next over, bowling options, or player readiness and I will give a match-focused recommendation.',
+];
 
 const PERFORMANCE_INTENT_KEYWORDS = [
   'reliable',
@@ -397,14 +406,6 @@ const DOMAIN_BLOCKED_KEYWORDS = [
   'relationship',
   'joke',
   'meme',
-  'football',
-  'soccer',
-  'basketball',
-  'tennis',
-  'hockey',
-  'baseball',
-  'nfl',
-  'nba',
 ];
 
 const FOLLOW_UP_PATTERNS = [
@@ -419,6 +420,40 @@ const FOLLOW_UP_PATTERNS = [
   /\bhow sure\b/,
   /\bcan you justify\b/,
 ];
+
+const GREETING_PATTERNS = [
+  /^(hi|hey|hello|yo|hiya|howdy)[\s!.?]*$/,
+  /^(good\s(morning|afternoon|evening))[\s!.?]*$/,
+  /^(hi|hey|hello).{0,20}(coach|copilot|tactiq)?[\s!.?]*$/,
+];
+
+const hashText = (value) =>
+  String(value || '')
+    .split('')
+    .reduce((acc, char) => ((acc * 31) + char.charCodeAt(0)) >>> 0, 7);
+
+const pickReplyVariant = (variants, seedText) => {
+  if (!Array.isArray(variants) || variants.length === 0) return '';
+  return variants[hashText(seedText) % variants.length];
+};
+
+const isGreetingMessage = (message) => {
+  const normalized = String(message || '').trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.length > 42) return false;
+  return GREETING_PATTERNS.some((pattern) => pattern.test(normalized));
+};
+
+const buildCricketSmallTalkReply = (message) => {
+  const normalized = String(message || '').trim().toLowerCase();
+  if (/\b(best|better|greatest|goat|all[-\s]?time|versus|vs|compare|comparison)\b/.test(normalized)) {
+    return 'That depends on role, era, and format. Reputation matters, but match context matters more. If you want, I can compare options for this exact phase and recommend the best tactical move.';
+  }
+  if (/\b(team|teams|player|players|captain|captaincy|format|t20|odi|test)\b/.test(normalized)) {
+    return 'Both teams and players can look strong on paper, but tactical timing usually decides the result. If you share the current state, I can map the best move for this phase.';
+  }
+  return 'Good cricket question. Context usually matters more than reputation in live decisions. If you want, I can turn this into a match-specific tactical recommendation.';
+};
 
 const includesKeyword = (text, keyword) => {
   if (!text || !keyword) return false;
@@ -485,6 +520,28 @@ const DOMAIN_INTENT_KEYWORDS = [
   'noball',
 ];
 
+const SPORTS_DOMAIN_KEYWORDS = [
+  'sport',
+  'sports',
+  'athlete',
+  'athletic',
+  'coaching',
+  'coach',
+  'fitness',
+  'conditioning',
+  'injury prevention',
+  'workload',
+  'recovery',
+  'training',
+  'performance',
+  'football',
+  'soccer',
+  'basketball',
+  'tennis',
+  'hockey',
+  'baseball',
+];
+
 const collectAllowedKeywordHits = (normalizedMessage) =>
   DOMAIN_ALLOWED_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
 
@@ -502,6 +559,9 @@ const collectCricketEntityHits = (normalizedMessage) =>
 
 const collectPerformanceIntentHits = (normalizedMessage) =>
   PERFORMANCE_INTENT_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
+
+const collectSportsDomainHits = (normalizedMessage) =>
+  SPORTS_DOMAIN_KEYWORDS.filter((keyword) => includesKeyword(normalizedMessage, keyword));
 
 const hasCopilotContextSignals = (snapshot) => {
   const matchContext = asRecord(snapshot.matchContext);
@@ -524,6 +584,7 @@ const classifyCopilotDomain = (message, history, snapshot) => {
   const liveScopeHits = collectLiveScopeHits(normalizedMessage);
   const cricketEntityHits = collectCricketEntityHits(normalizedMessage);
   const performanceIntentHits = collectPerformanceIntentHits(normalizedMessage);
+  const sportsDomainHits = collectSportsDomainHits(normalizedMessage);
   const comparisonDetected =
     /\b(better|best|compare|comparison|vs|versus)\b/.test(normalizedMessage) && /\bor\b/.test(normalizedMessage);
   const followUpDetected = FOLLOW_UP_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
@@ -531,10 +592,13 @@ const classifyCopilotDomain = (message, history, snapshot) => {
   const hasContextSignals = hasCopilotContextSignals(snapshot);
   const hasDomainIntent = domainIntentHits.length > 0;
   const hasCricketSignal = hasDomainIntent || allowedHits.length > 0 || cricketEntityHits.length > 0;
+  const hasSportsSignal = sportsDomainHits.length > 0;
   const hasLiveScopeSignal = liveScopeHits.length > 0;
   const hasPerformanceIntent = performanceIntentHits.length > 0;
+  const greetingDetected = isGreetingMessage(normalizedMessage);
+  const hasDomainSignal = hasCricketSignal || hasSportsSignal || hasPerformanceIntent;
 
-  if (blockedHits.length > 0 && !hasCricketSignal) {
+  if (blockedHits.length > 0 && !hasDomainSignal) {
     return {
       allowed: false,
       handling: 'blocked',
@@ -545,12 +609,30 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       liveScopeHits,
       cricketEntityHits,
       performanceIntentHits,
+      sportsDomainHits,
       comparisonDetected,
       followUpDetected,
     };
   }
 
-  if (hasPerformanceIntent && (hasContextSignals || hasCricketSignal)) {
+  if (greetingDetected) {
+    return {
+      allowed: true,
+      handling: 'greeting',
+      reason: 'greeting',
+      allowedHits,
+      blockedHits,
+      domainIntentHits,
+      liveScopeHits,
+      cricketEntityHits,
+      performanceIntentHits,
+      sportsDomainHits,
+      comparisonDetected,
+      followUpDetected,
+    };
+  }
+
+  if (hasPerformanceIntent && (hasContextSignals || hasDomainSignal)) {
     return {
       allowed: true,
       handling: 'full',
@@ -561,6 +643,7 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       liveScopeHits,
       cricketEntityHits,
       performanceIntentHits,
+      sportsDomainHits,
       comparisonDetected,
       followUpDetected,
     };
@@ -577,12 +660,13 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       liveScopeHits,
       cricketEntityHits,
       performanceIntentHits,
+      sportsDomainHits,
       comparisonDetected,
       followUpDetected,
     };
   }
 
-  if (followUpDetected && (hasRecentTurns || hasContextSignals)) {
+  if (followUpDetected && (hasRecentTurns || hasContextSignals || hasDomainSignal)) {
     return {
       allowed: true,
       handling: 'full',
@@ -593,22 +677,24 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       liveScopeHits,
       cricketEntityHits,
       performanceIntentHits,
+      sportsDomainHits,
       comparisonDetected,
       followUpDetected,
     };
   }
 
-  if (hasCricketSignal || (comparisonDetected && cricketEntityHits.length > 0)) {
+  if (hasCricketSignal || hasSportsSignal || (comparisonDetected && cricketEntityHits.length > 0)) {
     return {
       allowed: true,
       handling: 'full',
-      reason: hasPerformanceIntent ? 'cricket_performance_question' : 'cricket_general',
+      reason: hasSportsSignal && !hasCricketSignal ? 'sports_general' : hasPerformanceIntent ? 'cricket_performance_question' : 'cricket_general',
       allowedHits,
       blockedHits,
       domainIntentHits,
       liveScopeHits,
       cricketEntityHits,
       performanceIntentHits,
+      sportsDomainHits,
       comparisonDetected,
       followUpDetected,
     };
@@ -624,6 +710,7 @@ const classifyCopilotDomain = (message, history, snapshot) => {
     liveScopeHits,
     cricketEntityHits,
     performanceIntentHits,
+    sportsDomainHits,
     comparisonDetected,
     followUpDetected,
   };
@@ -632,18 +719,14 @@ const classifyCopilotDomain = (message, history, snapshot) => {
 const buildCopilotSystemPrompt = () =>
   [
     'You are tactIQ Coach Copilot, a cricket tactical and performance intelligence assistant.',
-    'You are not a general chatbot.',
-    'You can answer questions about live match state, cricket tactics, format strategy (T20/ODI/Test), player comparisons, and cricket performance science.',
-    'Also answer questions about fatigue, workload, recovery, readiness, biomechanics, and injury-risk in cricket.',
-    'Treat player-reliability/readiness questions as in-domain and use provided roster metrics directly.',
-    'For player comparisons or reliability ranking, prioritize fatigue, fatigue limit, recovery, sleep, control, speed, power, injury risk, and no-ball risk.',
-    'Ground responses in provided context when relevant, but do not force match-state references when the user asks broader cricket knowledge questions.',
-    'Always use the structured live context block (match state, selected players, roster metrics, coach context) before giving advice.',
-    'When context is missing, state exactly which metric is missing in one short sentence.',
-    'Do not invent unavailable metrics; if a key value is missing, state that briefly.',
-    'Your response style must be coach-facing: clear answer, cricket-specific reasoning, subtle signal, and practical implication.',
-    'Be concise but insightful (typically 3-6 sentences).',
-    'If a question is unrelated to this domain, refuse politely and redirect to cricket match guidance.',
+    'You can answer live match tactical questions, bowling strategy, field placement, fatigue/workload management, multi-over planning, and general cricket strategy questions.',
+    'Allow short greetings and casual conversation naturally.',
+    'If match data is available, incorporate it directly.',
+    'If match data is not available, still answer using cricket expertise and best practices.',
+    'Never refuse a valid cricket question.',
+    'Only refuse questions that are clearly unrelated to cricket or sports.',
+    'Keep responses concise, conversational, and coach-facing.',
+    'When possible, steer the conversation back to match strategy and next-over decisions.',
   ].join(' ');
 
 const buildCopilotSignalSummary = (snapshot) => {
@@ -1014,11 +1097,15 @@ module.exports = async function copilotChat(context, req) {
       liveScopeHits: domain.liveScopeHits,
       cricketEntityHits: domain.cricketEntityHits,
       performanceIntentHits: domain.performanceIntentHits,
+      sportsDomainHits: domain.sportsDomainHits,
       comparisonDetected: domain.comparisonDetected,
       followUpDetected: domain.followUpDetected,
     });
 
     if (domain.handling === 'blocked') {
+      const redirectReply =
+        pickReplyVariant(OUT_OF_SCOPE_REPLIES, `${message}:${domain.reason}`) ||
+        OUT_OF_SCOPE_REPLIES[0];
       return respond(
         jsonResponse(
           200,
@@ -1029,8 +1116,52 @@ module.exports = async function copilotChat(context, req) {
             routeCalled,
             fallbackReason: `domain_guard:${domain.reason}`,
             analysisIdUsed,
-            reply: DOMAIN_REFUSAL_REPLY,
-            answer: DOMAIN_REFUSAL_REPLY,
+            reply: redirectReply,
+            answer: redirectReply,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+          },
+          {},
+          req
+        )
+      );
+    }
+
+    if (domain.handling === 'greeting') {
+      const greetingReply =
+        pickReplyVariant(GREETING_REPLIES, `${message}:${history.length}`) ||
+        GREETING_REPLIES[0];
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'ai',
+            mode: 'domain_greeting',
+            routeCalled,
+            analysisIdUsed,
+            reply: greetingReply,
+            answer: greetingReply,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+          },
+          {},
+          req
+        )
+      );
+    }
+
+    if (domain.handling === 'domain_redirect') {
+      const redirectReply = buildCricketSmallTalkReply(message);
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'ai',
+            mode: 'domain_redirect',
+            routeCalled,
+            analysisIdUsed,
+            reply: redirectReply,
+            answer: redirectReply,
             messagesUsed: Math.min(10, countUserTurns(history) + 1),
           },
           {},
