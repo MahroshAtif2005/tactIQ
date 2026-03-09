@@ -11902,7 +11902,9 @@ function Baselines({
                      <div className="flex flex-col items-center justify-center text-center">
                        <p className="text-lg font-semibold text-slate-200">No baseline players yet</p>
                        <p className="mt-2 text-sm text-slate-400">
-                         Add a baseline player or Reset Database to restore defaults.
+                         {demoMode
+                           ? 'Add a baseline player or Reset Database to restore demo defaults.'
+                           : 'No player baselines yet. Add a player baseline to begin.'}
                        </p>
                      </div>
                    </td>

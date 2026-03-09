@@ -69,12 +69,6 @@ const OPTIONAL_COSMOS_SETTINGS = [
   'COSMOS_CONTAINER_CHAT',
 ];
 
-const DEFAULT_BASELINES = [
-  { id: 'J. Archer', name: 'J. Archer', role: 'FAST', sleep: 7.5, recovery: 45, fatigueLimit: 6, control: 80, speed: 9, power: 0, active: true, inRoster: true, orderIndex: 1 },
-  { id: 'R. Khan', name: 'R. Khan', role: 'SPIN', sleep: 7.1, recovery: 40, fatigueLimit: 6, control: 86, speed: 8, power: 0, active: true, inRoster: true, orderIndex: 2 },
-  { id: 'M. Starc', name: 'M. Starc', role: 'FAST', sleep: 6.8, recovery: 50, fatigueLimit: 6, control: 79, speed: 9, power: 0, active: true, inRoster: true, orderIndex: 3 },
-];
-
 const BASELINE_LIMITS = {
   sleep: { min: 0, max: 12 },
   recovery: { min: 0, max: 120 },
@@ -812,8 +806,7 @@ const buildExistingBaselineIndexes = (docs = []) => {
 const getMemoryBaselines = (userId) => {
   const key = normalizeId(userId);
   if (!memoryBaselinesByUser.has(key)) {
-    const seeded = DEFAULT_BASELINES.map((row) => ({ ...row }));
-    memoryBaselinesByUser.set(key, seeded);
+    memoryBaselinesByUser.set(key, []);
   }
   return memoryBaselinesByUser.get(key) || [];
 };
@@ -1321,7 +1314,7 @@ const resetBaselines = async ({ userId, teamId, userEmail }) => {
     userId,
     teamId,
     userEmail,
-    payload: { players: DEFAULT_BASELINES.map((row) => ({ ...row })) },
+    payload: { players: [] },
   });
 };
 

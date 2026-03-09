@@ -180,11 +180,12 @@ module.exports = async function baselines(context, req) {
 
     if (method === 'POST') {
       if (isResetRoute) {
+        const beforeReset = await listBaselines({ userId: user.userId, teamId: user.teamId });
         const players = await resetBaselines({ userId: user.userId, teamId: user.teamId, userEmail: user.email || '' });
         logStorageFallback(context, method, user);
         context.res = jsonResponse(200, {
           ok: true,
-          deleted: players.length,
+          deleted: beforeReset.length,
           players,
           ...getStorageResponseMeta(),
         });
