@@ -977,8 +977,6 @@ export async function saveBaselines(baselines: Baseline[], signal?: AbortSignal)
     control: clamp(toNumberOr(row.control ?? row.controlBaseline, 78), BASELINE_LIMITS.control.min, BASELINE_LIMITS.control.max),
     speed: clamp(toNumberOr(row.speed, 7), BASELINE_LIMITS.speed.min, BASELINE_LIMITS.speed.max),
     power: clamp(toNumberOr(row.power, 0), BASELINE_LIMITS.power.min, BASELINE_LIMITS.power.max),
-    active: typeof row.active === 'boolean' ? row.active : row.isActive,
-    inRoster: typeof row.inRoster === 'boolean' ? row.inRoster : undefined,
     name: String(row.name || row.id || row.playerId || '').trim() || undefined,
     ...(normalizeOrderIndex(row.orderIndex) > 0 ? { orderIndex: normalizeOrderIndex(row.orderIndex) } : {}),
     createdAt: row.createdAt,

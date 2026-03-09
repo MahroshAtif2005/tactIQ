@@ -2137,15 +2137,9 @@ export default function App() {
     const applyBaselinesToRoster = (rows: Baseline[], reason: 'mount' | 'event') => {
       const orderedRows = orderBaselinesForDisplay(rows);
       const previousRosterIds = matchRosterIdsRef.current;
-      const rosterIdsFromBaselines = orderedRows
-        .map((row) => normalizeBaselineRecord(row))
-        .filter((row) => row.inRoster === true)
-        .map((row) => normalizeBaselineId(row.id || row.playerId || row.name));
       const baseRosterIds = rosterInitializedRef.current
         ? previousRosterIds
-        : isDemoSession
-          ? getRosterIds()
-          : rosterIdsFromBaselines;
+        : getRosterIds();
       const resolvedIds = resolveRosterIdsFromBaselines(baseRosterIds, orderedRows);
       const rosterIdSet = new Set(resolvedIds.map((id) => baselineKey(id)));
       const syncedBaselines = orderedRows.map((row) => {
@@ -2159,6 +2153,7 @@ export default function App() {
 
       rosterInitializedRef.current = true;
       setMatchRosterIds(resolvedIds);
+      setRosterIds(resolvedIds);
       setWorkingBaselines(syncedBaselines);
       setPlayers((prev) => {
         const derivedRoster = buildRosterPlayersFromBaselines(prev, syncedBaselines, resolvedIds);
@@ -2580,6 +2575,7 @@ export default function App() {
     rosterInitializedRef.current = true;
     setWorkingBaselines(nextBaselines);
     setMatchRosterIds(resolvedIds);
+    setRosterIds(resolvedIds);
     setPlayers((prevPlayers) => {
       const derivedRoster = buildRosterPlayersFromBaselines(prevPlayers, nextBaselines, resolvedIds);
       const hydratedRoster = hydrateDismissalStateFromSession(derivedRoster);
@@ -2602,12 +2598,8 @@ export default function App() {
   }, [workingBaselines]);
 
   const applyMatchRosterIds = useCallback((nextIdsInput: string[]): string[] => {
-    const resolvedIds = applyRosterIdsToState(nextIdsInput, 'explicit_user_action');
-    if (isDemoSession) {
-      setRosterIds(resolvedIds);
-    }
-    return resolvedIds;
-  }, [applyRosterIdsToState, isDemoSession]);
+    return applyRosterIdsToState(nextIdsInput, 'explicit_user_action');
+  }, [applyRosterIdsToState]);
 
   const deleteRosterPlayer = (rosterPlayerId: string) => {
     const normalizedId = normalizeBaselineId(rosterPlayerId);
@@ -4374,15 +4366,9 @@ export default function App() {
         .map((row) => normalizeBaselineRecord(row))
         .map((row) => baselineKey(row.id || row.playerId || row.name))
     );
-    const rosterIdsFromBaselines = orderedBaselines
-      .map((row) => normalizeBaselineRecord(row))
-      .filter((row) => row.inRoster === true)
-      .map((row) => normalizeBaselineId(row.id || row.playerId || row.name));
     const baseRosterIds = rosterInitializedRef.current
       ? previousRosterIds
-      : isDemoSession
-        ? getRosterIds()
-        : rosterIdsFromBaselines;
+      : getRosterIds();
     const seen = new Set(baseRosterIds.map((id) => baselineKey(id)));
     const additions = (options?.addToRosterIds || [])
       .map((id) => normalizeBaselineId(id))
@@ -4409,7 +4395,7 @@ export default function App() {
     setBaselineSource(source);
     setBaselineWarning(warning || null);
     setMatchRosterIds(resolvedRosterIds);
-    if (isDemoSession && (options?.addToRosterIds || []).length > 0) {
+    if (options?.persist !== false) {
       setRosterIds(resolvedRosterIds);
     }
     setPlayers((prev) => {
@@ -11201,9 +11187,6 @@ const draftRowToBaseline = (row: BaselineDraftRow): Baseline | null => {
     baselineId: resolvedId,
     name,
     role: row.role,
-    active: row.active,
-    isActive: row.active,
-    inRoster: row.inRoster,
     sleepHoursToday: clamp(safeNum(row.sleep, 7), BASELINE_METRIC_LIMITS.sleep.min, BASELINE_METRIC_LIMITS.sleep.max),
     recoveryMinutes: clamp(safeNum(row.recovery, 45), BASELINE_METRIC_LIMITS.recovery.min, BASELINE_METRIC_LIMITS.recovery.max),
     fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), BASELINE_METRIC_LIMITS.fatigueLimit.min, BASELINE_METRIC_LIMITS.fatigueLimit.max),
@@ -11247,8 +11230,6 @@ function Baselines({
         .map((row) => ({
           name: String(row.name || ''),
           role: row.role,
-          active: Boolean(row.active),
-          inRoster: Boolean(row.inRoster),
           sleep: clamp(safeNum(row.sleep, 7), BASELINE_METRIC_LIMITS.sleep.min, BASELINE_METRIC_LIMITS.sleep.max),
           recovery: clamp(safeNum(row.recovery, 45), BASELINE_METRIC_LIMITS.recovery.min, BASELINE_METRIC_LIMITS.recovery.max),
           fatigueLimit: clamp(safeNum(row.fatigueLimit, 6), BASELINE_METRIC_LIMITS.fatigueLimit.min, BASELINE_METRIC_LIMITS.fatigueLimit.max),
@@ -11260,8 +11241,6 @@ function Baselines({
         .map((row) => ({
           name: row.name,
           role: row.role,
-          active: row.active,
-          inRoster: row.inRoster,
           sleep: row.sleep,
           recovery: row.recovery,
           fatigueLimit: row.fatigueLimit,
@@ -11385,9 +11364,7 @@ function Baselines({
     try {
       const response = await getBaselinesWithMeta();
       const sourceRows = orderBaselinesForDisplay(response.baselines);
-      const rosterIdSet = demoMode
-        ? new Set((matchRosterIds.length > 0 ? matchRosterIds : getRosterIds()).map((id) => baselineKey(id)))
-        : undefined;
+      const rosterIdSet = new Set((matchRosterIds.length > 0 ? matchRosterIds : getRosterIds()).map((id) => baselineKey(id)));
       const normalized = sourceRows.map((row) => baselineToDraftRow(row, rosterIdSet));
       setSavedBaselines(normalized);
       setDraftBaselines(normalized.map((row) => ({ ...row })));
@@ -11425,7 +11402,6 @@ function Baselines({
   }, []);
 
   useEffect(() => {
-    if (!demoMode) return;
     const rosterIdSet = new Set(matchRosterIds.map((id) => baselineKey(id)));
     const syncRow = (row: BaselineDraftRow): BaselineDraftRow => {
       const resolvedId = normalizeBaselineId(row.id || row.name);
@@ -11436,7 +11412,7 @@ function Baselines({
     };
     setDraftBaselines((prev) => prev.map(syncRow));
     setSavedBaselines((prev) => prev.map(syncRow));
-  }, [demoMode, matchRosterIds]);
+  }, [matchRosterIds]);
 
   useEffect(() => {
     setBaselineDraftCache(draftBaselines.map((row) => ({ ...row })));
@@ -11775,7 +11751,7 @@ function Baselines({
           <p className="text-slate-400 mt-1">
             {demoMode
               ? 'Demo mode keeps player data in localStorage only.'
-              : 'Baseline and roster fields are saved to Cosmos playersByUser when you click Save Changes.'}
+              : 'Baseline fields are saved to Cosmos playersByUser. Roster selection is local session state.'}
           </p>
         </div>
         <div className="flex gap-4">
