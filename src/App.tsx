@@ -1657,6 +1657,7 @@ export default function App() {
           }
         : null
   );
+  const [authCheckResolved, setAuthCheckResolved] = useState<boolean>(() => initialDemoMode);
   const [, setCoachTeamId] = useState<string | null>(null);
   const [showSplash, setShowSplash] = useState(() => !isAuthPathOnLoad);
   const [authLocalHint, setAuthLocalHint] = useState<string | null>(null);
@@ -1730,9 +1731,18 @@ export default function App() {
     if (authStatus === 'authenticated' && Boolean(authUser?.userId)) return 'authenticated';
     return 'guest';
   }, [authStatus, authUser?.userId, demoMode]);
-  const authResolving = !demoMode && authStatus === 'checking';
+  const authResolving = !demoMode && (authStatus === 'checking' || !authCheckResolved);
   const isAppUnlocked = sessionMode !== 'guest';
   const isDemoSession = sessionMode === 'demo';
+  const signedInEmail = useMemo(() => {
+    const candidates = [authUser?.email, authUser?.name, authUser?.userId];
+    for (const candidate of candidates) {
+      const value = String(candidate || '').trim();
+      if (!value) continue;
+      if (value.includes('@')) return value;
+    }
+    return 'Signed in user';
+  }, [authUser?.email, authUser?.name, authUser?.userId]);
   const demoStep: DemoStep = useMemo(() => {
     if (page === 'setup') return 'match-context';
     if (page === 'dashboard' || page === 'baselines') return 'dashboard';
@@ -1920,7 +1930,6 @@ export default function App() {
   }, [isAppUnlocked]);
 
   useEffect(() => {
-    if (showSplash) return;
     let cancelled = false;
     if (demoMode) {
       console.log('[session]', {
@@ -1937,44 +1946,45 @@ export default function App() {
         name: 'Demo Coach',
         email: 'demo@local',
       });
+      setAuthCheckResolved(true);
       setCoachTeamId('demo-local-team');
       return () => {
         cancelled = true;
       };
     }
-    const preserveAuthenticatedState = authStatus === 'authenticated' && Boolean(authUser?.userId);
-    if (!preserveAuthenticatedState) {
-      setAuthStatus('checking');
-      setAuthUser(null);
-    }
+    setAuthCheckResolved(false);
+    setAuthStatus('checking');
+    setAuthUser(null);
     setCoachTeamId(null);
     console.log('[session]', {
       source: 'auth_hydration:start',
-      userId: authUser?.userId || null,
-      email: authUser?.email || null,
+      userId: null,
+      email: null,
       demoMode,
-      authStatus,
-      sessionMode: preserveAuthenticatedState ? 'authenticated' : 'guest',
-      preserveAuthenticatedState,
+      authStatus: 'checking',
+      sessionMode: 'guest',
+      preserveAuthenticatedState: false,
     });
-    void getUser().then((user) => {
-      if (cancelled) return;
-      if (user.isAuthenticated && user.userId) {
-        console.log('[session]', {
-          source: 'auth_hydration:authenticated',
-          userId: user.userId,
-          email: user.email || null,
-          demoMode: false,
-          authStatus: 'authenticated',
-          sessionMode: 'authenticated',
-        });
-        setAuthStatus('authenticated');
-        setAuthUser({
-          userId: user.userId,
-          ...(user.name ? { name: user.name } : {}),
-          ...(user.email ? { email: user.email } : {}),
-        });
-      } else {
+    void getUser()
+      .then((user) => {
+        if (cancelled) return;
+        if (user.isAuthenticated && user.userId) {
+          console.log('[session]', {
+            source: 'auth_hydration:authenticated',
+            userId: user.userId,
+            email: user.email || null,
+            demoMode: false,
+            authStatus: 'authenticated',
+            sessionMode: 'authenticated',
+          });
+          setAuthStatus('authenticated');
+          setAuthUser({
+            userId: user.userId,
+            ...(user.name ? { name: user.name } : {}),
+            ...(user.email ? { email: user.email } : {}),
+          });
+          return;
+        }
         console.log('[session]', {
           source: 'auth_hydration:guest',
           userId: null,
@@ -1986,12 +1996,22 @@ export default function App() {
         setAuthStatus('unauthenticated');
         setAuthUser(null);
         setCoachTeamId(null);
-      }
-    });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn('[auth] getUser failed during hydration', error);
+        setAuthStatus('unauthenticated');
+        setAuthUser(null);
+        setCoachTeamId(null);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setAuthCheckResolved(true);
+      });
     return () => {
       cancelled = true;
     };
-  }, [demoMode, showSplash]);
+  }, [demoMode]);
 
   useEffect(() => {
     if (sessionMode === 'guest') {
@@ -4605,7 +4625,7 @@ export default function App() {
                             maxWidth: '220px',
                           }}
                         >
-                          {authUser?.email || 'Signed in user'}
+                          {signedInEmail}
                         </div>
                       </div>
 

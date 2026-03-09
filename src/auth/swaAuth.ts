@@ -41,10 +41,19 @@ const getClaim = (claims: ClientPrincipalClaim[] | undefined, ...types: string[]
   return '';
 };
 
+const isLikelyEmail = (value: string): boolean => {
+  const candidate = String(value || '').trim();
+  return candidate.includes('@') && candidate.includes('.');
+};
+
 const toAuthUser = (principal: ClientPrincipal | null): AuthUser => {
   if (!principal) return { isAuthenticated: false, userId: '' };
   const claims = Array.isArray(principal.claims) ? principal.claims : [];
-  const email = getClaim(claims, 'emails', 'email', 'preferred_username', 'upn');
+  const userDetails = String(principal.userDetails || '').trim();
+  const email =
+    getClaim(claims, 'emails', 'email', 'preferred_username', 'upn') ||
+    (isLikelyEmail(userDetails) ? userDetails : '') ||
+    '';
   const userId =
     String(principal.userId || '').trim() ||
     getClaim(
@@ -57,7 +66,7 @@ const toAuthUser = (principal: ClientPrincipal | null): AuthUser => {
     email;
   if (!userId) return { isAuthenticated: false, userId: '' };
   const name =
-    String(principal.userDetails || '').trim() ||
+    (!isLikelyEmail(userDetails) ? userDetails : '') ||
     getClaim(claims, 'name', 'given_name');
   return {
     isAuthenticated: true,
