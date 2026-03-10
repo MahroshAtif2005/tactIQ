@@ -124,13 +124,24 @@ tactIQ
 ├── src/                         # React + TypeScript frontend application
 │   ├── components/              # Reusable UI components (charts, panels, controls)
 │   ├── pages/                   # Main dashboard views and tactical interfaces
-│   ├── hooks/                   # Custom React hooks for state and match logic
+│   ├── auth/                    # Authentication utilities (SWA auth integration)
+│   ├── lib/                     # API client, context builders, and shared utilities
+│   ├── data/                    # Demo roster and static data
+│   ├── types/                   # TypeScript type definitions
 │   ├── styles/                  # Global styles and UI theme configuration
 │
 ├── api/                         # Azure Functions serverless backend
-│   ├── functions/               # HTTP endpoints and AI orchestration logic
-│   ├── shared/                  # Shared utilities, prompts, and context builders
+│   ├── src/                     # TypeScript source for agents, orchestrator, and LLM layer
+│   │   ├── agents/              # Fatigue, risk, and tactical agent implementations
+│   │   ├── functions/           # HTTP endpoint handlers
+│   │   ├── orchestrator/        # Agent orchestration logic
+│   │   ├── llm/                 # LLM client and model routing layer
+│   │   └── shared/              # Shared utilities, prompts, and context builders
+│   ├── shared/                  # Shared runtime utilities (context builder, risk model)
+│   ├── scripts/                 # Utility and test scripts
+│   ├── health/, orchestrate/, fatigue/, risk/, tactical/, baselines/, copilot/, copilot-chat/, agents-fatigue/, agents-risk/, agents-tactical/, ai-status/, users-ensure/
 │
+├── server/                      # Bot framework server (Teams/Copilot Studio integration)
 ├── middleware/                  # Request middleware and shared processing helpers
 ├── archive/                     # Archived experimental agent framework (not used in production)
 ├── public/                      # Static assets served by the frontend
@@ -177,24 +188,30 @@ npm --prefix api install
 
 ## Configure Environment
 
-Create or update `api/local.settings.json` with the required environment variables.
+Copy `api/local.settings.json.example` to `api/local.settings.json` and fill in your values.
 
-Example configuration:
+Key settings required:
 
 {
   "IsEncrypted": false,
   "Values": {
-    "AZURE_OPENAI_ENDPOINT": "https://tactiq-router-eastus2-resource.services.ai.azure.com",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "AZURE_OPENAI_ENDPOINT": "https://YOUR_RESOURCE_NAME.openai.azure.com/",
     "AZURE_OPENAI_API_KEY": "YOUR_KEY",
-    "AZURE_OPENAI_DEPLOYMENT": "model-router",
+    "AZURE_OPENAI_DEPLOYMENT": "gpt-4o-mini",
     "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
+    "AI_ENABLED": "true",
     "CORS_ALLOWED_ORIGINS": "http://localhost:5173",
-    "COSMOS_ENDPOINT": "https://tactiq-cosmos.documents.azure.com:443/",
+    "COSMOS_ENDPOINT": "https://YOUR_ACCOUNT.documents.azure.com:443/",
     "COSMOS_KEY": "YOUR_COSMOS_KEY",
     "COSMOS_DB": "tactiq-db",
-    "COSMOS_CONTAINER_PLAYERS": "playersByUser"
+    "COSMOS_CONTAINER_PLAYERS": "playersByUser",
+    "COSMOS_CONTAINER_USERS": "users",
+    "COSMOS_CONTAINER_CHAT": "copilotChats"
   }
 }
+
+See `api/local.settings.json.example` for a full list of supported settings and aliases.
 
 These settings enable Azure OpenAI agent reasoning and Cosmos DB persistence.
 
@@ -229,7 +246,7 @@ http://localhost:5173
 
 ## Frontend API Configuration
 
-Create a `.env` file in the project root with:
+Copy `.env.example` to `.env` in the project root. The key variable for API routing is:
 
 VITE_API_BASE_URL=/api
 
@@ -258,11 +275,19 @@ curl -X POST http://localhost:7071/api/orchestrate -H "Content-Type: application
 
 ## Available Local API Endpoints
 
-GET  /api/health  
-POST /api/orchestrate  
-GET  /api/baselines  
-POST /api/baselines  
-POST /api/users/ensure
+GET         /api/health  
+GET, POST   /api/orchestrate  
+GET, POST   /api/baselines  
+POST        /api/fatigue  
+POST        /api/risk  
+POST        /api/tactical  
+POST        /api/agents/fatigue  
+POST        /api/agents/risk  
+POST        /api/agents/tactical  
+GET         /api/ai/status  
+POST        /api/copilot  
+POST        /api/copilot-chat  
+POST        /api/users/ensure
 
 ---
 
