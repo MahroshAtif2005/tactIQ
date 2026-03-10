@@ -4289,7 +4289,7 @@ export default function App() {
   useEffect(() => {
     if (page !== 'dashboard') return;
     fatigueAbortRef.current?.abort();
-    if (!analysisRequested) {
+    if (!analysisRequested && !analysisActive) {
       setAiAnalysis(null);
       setRiskAnalysis(null);
       setTacticalAnalysis(null);
@@ -4312,7 +4312,7 @@ export default function App() {
     return () => {
       fatigueAbortRef.current?.abort();
     };
-  }, [activePlayerId, page]);
+  }, [analysisActive, activePlayerId, page]);
 
   const dismissAnalysis = () => {
     fatigueAbortRef.current?.abort();
@@ -6139,6 +6139,7 @@ function Dashboard({
   const lastValidPressureRef = useRef<{ playerId: string; value: number } | null>(null);
   const lastCapturedAnalysisBundleIdRef = useRef<string>('');
   const previousSelectedPlayerIdRef = useRef<string>(String(activePlayer?.id || ''));
+  const playerSwitchResetRef = useRef<boolean>(false);
 
   useEffect(() => {
     setSubstitutionRecommendation(null);
@@ -6166,38 +6167,52 @@ function Dashboard({
       previousSelectedId.length > 0 &&
       nextSelectedId.length > 0 &&
       previousSelectedId !== nextSelectedId;
-    if (didSwitchPlayer) {
-      setIsCoachPanelSuppressedForSelection(true);
-    }
-    previousSelectedPlayerIdRef.current = nextSelectedId;
+    playerSwitchResetRef.current = didSwitchPlayer;
 
-    // Keep coach expansion local to the currently selected player.
-    setShowCoachInsights(false);
-    setShowCopilotChat(false);
-    setCopilotSessionAnalysisId('');
-    setCopilotVerifiedAnalysisId('');
-    setCopilotResetToken((value) => value + 1);
-    setShowRotateBowlerConfirm(false);
-    setRotateBowlerSuggestion(null);
-    setShowNextBatterConfirm(false);
-    setRecommendedNextBatter(null);
-    setNextBatterNotice(null);
-    setIsSuggestingNextBatter(false);
-    setFullAnalysisRunPending(false);
-    setFullAnalysisExecuted(false);
-    setAnalysisExecuted(false);
-    setAnalysisStale(false);
-    setAnalysisSnapshot(null);
-    setShowFullAnalysisInfo(false);
-    setShowDismissAnalysisInfo(false);
-    lastCapturedAnalysisBundleIdRef.current = '';
+    if (didSwitchPlayer) {
+      const hadOpenAnalysis =
+        analysisActive ||
+        showCoachInsights ||
+        fullAnalysisRunPending ||
+        fullAnalysisExecuted ||
+        analysisExecuted;
+
+      if (hadOpenAnalysis) {
+        onDismissAnalysis?.();
+      }
+
+      setSubstitutionRecommendation(null);
+      setShowCoachInsights(false);
+      setShowCopilotChat(false);
+      setCopilotSessionAnalysisId('');
+      setCopilotVerifiedAnalysisId('');
+      setCopilotResetToken((value) => value + 1);
+      setShowRouterSignals(false);
+      setShowRawTelemetry(false);
+      setShowRotateBowlerConfirm(false);
+      setRotateBowlerSuggestion(null);
+      setShowNextBatterConfirm(false);
+      setRecommendedNextBatter(null);
+      setNextBatterNotice(null);
+      setIsSuggestingNextBatter(false);
+      setFullAnalysisRunPending(false);
+      setFullAnalysisExecuted(false);
+      setAnalysisExecuted(false);
+      setAnalysisStale(false);
+      setAnalysisSnapshot(null);
+      setShowFullAnalysisInfo(false);
+      setShowDismissAnalysisInfo(false);
+      lastCapturedAnalysisBundleIdRef.current = String(analysisBundleId || '').trim();
+    }
+
+    setIsCoachPanelSuppressedForSelection(false);
+    previousSelectedPlayerIdRef.current = nextSelectedId;
   }, [activePlayer?.id]);
 
   useEffect(() => {
-    if (!showCoachInsights) return;
     if (!isCoachPanelSuppressedForSelection) return;
     setIsCoachPanelSuppressedForSelection(false);
-  }, [isCoachPanelSuppressedForSelection, showCoachInsights]);
+  }, [isCoachPanelSuppressedForSelection]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -6329,6 +6344,10 @@ function Dashboard({
 
   useEffect(() => {
     if (!fullAnalysisRunPending) return;
+    if (playerSwitchResetRef.current) {
+      setFullAnalysisRunPending(false);
+      return;
+    }
     if (agentState === 'thinking') return;
     if (agentState === 'done') {
       if (import.meta.env.DEV) {
@@ -6351,6 +6370,7 @@ function Dashboard({
   }, [agentState, analysisBundleId, analysisInputSnapshot, fullAnalysisRunPending]);
 
   useEffect(() => {
+    if (playerSwitchResetRef.current) return;
     if (agentState !== 'done' || !analysisActive) return;
     const completedBundleId = String(analysisBundleId || '').trim();
     if (!completedBundleId) return;
@@ -6369,10 +6389,18 @@ function Dashboard({
   }, [agentState, analysisActive, analysisBundleId, analysisInputSnapshot]);
 
   useEffect(() => {
+    if (playerSwitchResetRef.current) return;
     if (!analysisExecuted) return;
     if (fullAnalysisRunPending) return;
     const baseline = analysisSnapshot;
     if (!baseline) return;
+    if (
+      baseline.selectedPlayerId &&
+      analysisInputSnapshot.selectedPlayerId &&
+      baseline.selectedPlayerId !== analysisInputSnapshot.selectedPlayerId
+    ) {
+      return;
+    }
     const changedFields = (Object.keys(analysisInputSnapshot) as Array<keyof CoachAnalysisInputSnapshot>).filter(
       (field) => baseline[field] !== analysisInputSnapshot[field]
     );
@@ -7310,8 +7338,11 @@ function Dashboard({
   const routerNarrative =
     sanitizeRouterReason(routerDecisionForView?.rationale || routerDecisionForView?.reason || '') ||
     'Decision selected from current match signals.';
-  const isCoachOutputState = !isCoachPanelSuppressedForSelection && (analysisActive || showCoachInsights);
-  const shouldShowTelemetryGraph = showCoachInsights && (analysisActive || agentState !== 'idle');
+  const combinedAnalysisActive = Boolean(
+    showCoachInsights || analysisActive || analysisExecuted || fullAnalysisRunPending || fullAnalysisExecuted
+  );
+  const isCoachOutputState = !isCoachPanelSuppressedForSelection && combinedAnalysisActive;
+  const shouldShowTelemetryGraph = combinedAnalysisActive;
   const isFullAnalysis = runMode === 'full';
   const analysisRunModeLine = (() => {
     if (!isFullAnalysis) return '';
@@ -7377,7 +7408,6 @@ function Dashboard({
     Boolean(coachOutput) ||
     hasCoachOutputText
   );
-  const agentExecutionFinished = agentState !== 'thinking' && !Object.values(agentFeedStatus).some((state) => state === 'RUNNING');
   const hasCopilotActivationSignal = Boolean(
     hasCopilotRenderableOutput ||
     tacticalRecommendationSignal ||
@@ -7407,17 +7437,16 @@ function Dashboard({
     setCopilotSessionAnalysisId((prev) => prev || generatedId);
     setCopilotVerifiedAnalysisId((prev) => prev || generatedId);
   }, [hasCopilotActivationSignal, effectiveCopilotAnalysisId, activePlayer?.id, activePlayer?.name]);
-  const shouldRenderCopilotUnderGraph =
-    shouldShowTelemetryGraph && hasCoachOutputText && agentExecutionFinished;
+  const shouldRenderCopilotUnderGraph = shouldShowTelemetryGraph && showCopilotChat;
   useEffect(() => {
-    if (!hasCopilotActivationSignal) return;
+    if (!hasCopilotActivationSignal || !showCopilotChat) return;
     if (shouldRenderCopilotUnderGraph) return;
     console.error('[copilot] render suppressed', {
       shouldShowTelemetryGraph,
       hasAnyAnalysis,
       analysisId: effectiveCopilotAnalysisId,
     });
-  }, [hasCopilotActivationSignal, shouldRenderCopilotUnderGraph, shouldShowTelemetryGraph, hasAnyAnalysis, effectiveCopilotAnalysisId]);
+  }, [hasCopilotActivationSignal, showCopilotChat, shouldRenderCopilotUnderGraph, shouldShowTelemetryGraph, hasAnyAnalysis, effectiveCopilotAnalysisId]);
   const agentStatusRows: Array<{ agent: AgentKey; label: string; state: AgentFeedState; detail: string }> = [
     { agent: 'fatigue', label: 'Fatigue Agent', state: agentFeedStatus.fatigue, detail: '' },
     { agent: 'risk', label: 'Risk Agent', state: agentFeedStatus.risk, detail: '' },
@@ -7924,23 +7953,72 @@ function Dashboard({
       score >= 0.75 ? 'High' : score >= 0.5 ? 'Moderate' : 'Low';
     const modeLabel = String(inputMatchContext.matchMode || teamMode || 'BOWLING').toUpperCase();
     const formatLabel = normalizeRecommendationText(inputMatchContext.format || 'T20') || 'T20';
-    const phaseLabel = normalizeRecommendationText(inputMatchContext.phase || 'middle') || 'middle';
-    const scoreLine = `Score ${Math.max(0, matchState.runs)}/${Math.max(0, matchState.wickets)} after ${formatOverStr(Math.max(0, matchState.ballsBowled))} overs${Number.isFinite(matchState.target) ? `, chasing ${Math.max(0, Number(matchState.target))}.` : '.'}`;
+    const targetRuns = Number.isFinite(matchState.target) ? Math.max(0, Number(matchState.target)) : null;
+    const inningsOversLimit = Math.max(
+      1,
+      safeNum(getInningsTotalOvers(inputMatchContext.format), safeNum(matchState.totalOvers, getMaxOvers(inputMatchContext.format)))
+    );
+    const inningsBallsLimit = totalBallsFromOvers(inningsOversLimit);
+    const scoreboardBallsRaw = Math.max(0, Math.floor(matchState.ballsBowled));
+    const scoreboardBalls = Math.min(scoreboardBallsRaw, inningsBallsLimit);
+    const ballsRemainingInInnings = Math.max(0, inningsBallsLimit - scoreboardBalls);
+    const hasNextOverAvailable = ballsRemainingInInnings > 0;
+    const hasFollowingOverPlan = ballsRemainingInInnings > 6;
+    const isFinalOverWindow = ballsRemainingInInnings > 0 && ballsRemainingInInnings <= 6;
+    const overProgressValue = scoreboardBalls / 6;
+    const derivePhaseFromOvers = (): { token: 'powerplay' | 'middle' | 'death'; label: 'Powerplay' | 'Middle' | 'Death' } => {
+      const formatToken = formatLabel.toLowerCase();
+      const deathThreshold = formatToken.includes('t20')
+        ? 16
+        : formatToken.includes('odi')
+          ? 40
+          : Math.max(6, inningsOversLimit - Math.max(4, Math.round(inningsOversLimit * 0.2)));
+      if (overProgressValue < 6) return { token: 'powerplay', label: 'Powerplay' };
+      if (overProgressValue >= deathThreshold) return { token: 'death', label: 'Death' };
+      return { token: 'middle', label: 'Middle' };
+    };
+    const derivedPhase = derivePhaseFromOvers();
+    const phaseLabel = derivedPhase.label;
+    const phaseToken = derivedPhase.token;
+    const phaseDescriptor = isFinalOverWindow
+      ? 'Death-over closeout phase.'
+      : phaseToken === 'death'
+        ? 'Death-over phase.'
+        : phaseToken === 'powerplay'
+          ? 'Powerplay phase.'
+          : 'Middle-overs phase.';
     const pressureCue =
       modeLabel === 'BATTING'
-        ? Number.isFinite(matchState.target)
+        ? targetRuns != null
           ? requiredRunRate > currentRunRate + 0.75
             ? 'chase pressure is climbing'
             : requiredRunRate > currentRunRate - 0.25
               ? 'the chase is finely balanced'
               : 'batting momentum is under control'
           : 'the innings rhythm is building'
-        : phaseLabel.toLowerCase().includes('death')
-          ? 'death-over timing is critical'
-          : matchState.wickets >= 5
-            ? 'pressure is on the batting side'
-            : 'control in this spell will shape momentum';
-    const matchSituationLine = `${formatLabel} ${phaseLabel.toLowerCase()} phase; ${pressureCue}.`;
+        : isFinalOverWindow
+          ? 'final-over execution is decisive'
+          : phaseToken === 'death'
+            ? 'death-over timing is critical'
+            : matchState.wickets >= 5
+              ? 'pressure is on the batting side'
+              : 'control in this spell will shape momentum';
+    const matchSituationLine =
+      modeLabel === 'BOWLING'
+        ? targetRuns != null
+          ? isFinalOverWindow
+            ? `Final over defending ${targetRuns}.`
+            : `Defending ${targetRuns}.`
+          : isFinalOverWindow
+            ? 'Final over in progress.'
+            : 'Bowling innings in progress.'
+        : targetRuns != null
+          ? `Chasing ${targetRuns}.`
+          : 'Setting a first-innings total.';
+    const scoreLine =
+      modeLabel === 'BOWLING'
+        ? `Opposition ${Math.max(0, matchState.runs)}/${Math.max(0, matchState.wickets)} after ${formatOverStr(scoreboardBalls)} overs${targetRuns != null ? `, target ${targetRuns}` : ''}. ${phaseDescriptor} ${finalizeCoachSentence(pressureCue, 'control remains critical in this phase', 70)}`
+        : `Score ${Math.max(0, matchState.runs)}/${Math.max(0, matchState.wickets)} after ${formatOverStr(scoreboardBalls)} overs${targetRuns != null ? `, chasing ${targetRuns}.` : '.'} ${phaseDescriptor} ${finalizeCoachSentence(pressureCue, 'the innings rhythm is building', 70)}`;
     const unresolvedActiveName = resolveRosterName(
       telemetry.playerId || telemetry.playerName,
       activePlayer?.name || telemetry.playerName || 'Current player'
@@ -7958,7 +8036,6 @@ function Dashboard({
         baselineKey(player.name) !== baselineKey(activeName)
     );
     const compatibleBowlers = replacementPool.filter((player) => isBowlingCompatible(player.role));
-    const phaseToken = String(inputMatchContext.phase || '').trim().toLowerCase();
     const normalizeRiskToken = (value: unknown): 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' | 'UNKNOWN' => {
       const token = String(value || '').trim().toUpperCase();
       if (token === 'LOW') return 'LOW';
@@ -8060,6 +8137,15 @@ function Dashboard({
       : phaseToken.includes('powerplay')
         ? 'Fielding restrictions make control and intent shifts more visible in this phase.'
         : 'Middle-overs tempo control now determines how much pressure carries forward.';
+    const composeTacticalPlan = (nextOverPlan: string, followingOverPlan?: string): string => {
+      if (!hasNextOverAvailable) {
+        return 'Tactical plan: Innings complete — no further overs remain.';
+      }
+      if (!hasFollowingOverPlan || !followingOverPlan) {
+        return `Tactical plan: ${nextOverPlan} Reassess at over end.`;
+      }
+      return `Tactical plan: ${nextOverPlan} ${followingOverPlan}`;
+    };
     const assessmentLine1 = safeContinue
       ? `${activeName} can continue, but this over should be used as a control checkpoint.`
       : elevatedControlRisk && elevatedInjuryRisk
@@ -8070,7 +8156,9 @@ function Dashboard({
             ? `${activeName} is showing early control drift; proactive rotation is tactically cleaner than reactive change.`
             : `${activeName} is competing well, but the phase timing favors a proactive reset now.`;
     const assessmentLine2 = safeContinue
-      ? `${phaseLeverageLine} Keep a prepared change option for the following over.`
+      ? hasFollowingOverPlan
+        ? `${phaseLeverageLine} Keep a prepared change option for the following over.`
+        : `${phaseLeverageLine} This is the closeout window, so keep execution control-first through the over.`
       : constrainedRecoveryProfile
         ? 'Recovery profile suggests shorter bursts are safer, so rotate before control quality dips.'
         : `${phaseLeverageLine} Rotating now protects execution quality before momentum flips.`;
@@ -8087,35 +8175,54 @@ function Dashboard({
       : '';
     const shouldRotateNow = !safeContinue && hasReplacementOption;
     const noEligibleReplacement = !safeContinue && !hasReplacementOption;
+    const continuePlan = composeTacticalPlan(
+      `Next over: stay with ${activeName}.`,
+      `Following over: ${backupCandidateName || replacementName} if pressure rises.`
+    );
+    const rotatePlan = composeTacticalPlan(
+      `Next over: ${replacementName} to reset pressure.`,
+      `Following over: ${backupCandidateName || activeName} based on control quality.`
+    );
+    const noEligiblePlan = hasNextOverAvailable
+      ? 'Tactical plan: No eligible bowling replacement is available. Use a strict one-over leash and reassess.'
+      : 'Tactical plan: Innings complete — no further overs remain.';
     const swap = {
       out: activeName,
       in: replacementName,
       reason: sanitizeCoachLine(
         safeContinue
-          ? `Tactical plan: Next over: stay with ${activeName}. Following over: ${backupCandidateName || replacementName} if pressure rises.`
+          ? continuePlan
           : shouldRotateNow
-            ? `Tactical plan: Next over: ${replacementName} to reset pressure. Following over: ${backupCandidateName || activeName} based on control quality.`
-            : 'No eligible bowling replacement is available; use a strict one-over leash and reassess.',
+            ? rotatePlan
+            : noEligiblePlan,
         safeContinue
-          ? `Tactical plan: Next over: stay with ${activeName}. Following over: ${backupCandidateName || replacementName} if pressure rises.`
+          ? continuePlan
           : shouldRotateNow
-            ? `Tactical plan: Next over: ${replacementName} to reset pressure. Following over: ${backupCandidateName || activeName} based on control quality.`
-            : 'No eligible bowling replacement is available; use a strict one-over leash and reassess.',
-        90
+            ? rotatePlan
+            : noEligiblePlan,
+        180
       ),
     };
-    const recommendedMove = safeContinue
-      ? `Continue with ${activeName} for one controlled over, then reassess before locking the next spell.`
-      : noEligibleReplacement
-        ? `No eligible replacement available — keep ${activeName} for one controlled over, then reassess.`
-        : `Bring in ${swap.in} for ${swap.out} next over to reset control before pressure compounds.`;
+    const recommendedMove = !hasNextOverAvailable
+      ? 'Innings complete — no next over remains for a bowling change.'
+      : safeContinue
+        ? hasFollowingOverPlan
+          ? `Continue with ${activeName} for one controlled over, then reassess before locking the next spell.`
+          : `Continue with ${activeName} for this closeout over with a strict control-first plan.`
+        : noEligibleReplacement
+          ? hasFollowingOverPlan
+            ? `No eligible replacement available — keep ${activeName} for one controlled over, then reassess.`
+            : `No eligible replacement available — keep ${activeName} for the closeout over and reassess at over end.`
+          : `Bring in ${swap.in} for ${swap.out} next over to reset control before pressure compounds.`;
     const whyThisIsSmart = safeContinue
       ? dedupeBullets([
           `This avoids an unnecessary early change while preserving match rhythm.`,
           `You keep a prepared fallback so the next decision stays proactive, not reactive.`,
-          backupCandidateName
+          backupCandidateName && hasFollowingOverPlan
             ? `Backup option remains ${backupCandidateName} if pressure spikes after this over.`
-            : 'You preserve flexibility for the next tactical window.',
+            : hasFollowingOverPlan
+              ? 'You preserve flexibility for the next tactical window.'
+              : 'This keeps the closeout over simple and execution-first.',
         ], 3)
       : shouldRotateNow && selectedCandidateSummary
         ? dedupeBullets([
@@ -8125,33 +8232,45 @@ function Dashboard({
               90
             ),
             sanitizeCoachLine(
-              'Rotating now protects control in the following spell instead of waiting for execution to drift.',
-              'Rotating now protects control in the following spell.',
+              hasFollowingOverPlan
+                ? 'Rotating now protects control in the following spell instead of waiting for execution to drift.'
+                : 'Rotating now protects control through the closeout over instead of waiting for execution to drift.',
+              hasFollowingOverPlan
+                ? 'Rotating now protects control in the following spell.'
+                : 'Rotating now protects control through the closeout over.',
               90
             ),
             sanitizeCoachLine(
-              backupCandidateName
+              backupCandidateName && hasFollowingOverPlan
                 ? `Secondary option: ${backupCandidateName} if scoring pressure changes after the next over.`
-                : 'This timing preserves flexibility for later overs and avoids forced reactive changes.',
-              backupCandidateName
+                : 'This timing keeps the closeout plan simple and avoids forced reactive changes.',
+              backupCandidateName && hasFollowingOverPlan
                 ? `Secondary option: ${backupCandidateName}.`
-                : 'This timing preserves flexibility for later overs.',
+                : 'This timing keeps the closeout plan simple.',
               90
             ),
           ], 3)
         : dedupeBullets([
             'No eligible replacement is available from the current bowling roster.',
             `Use ${activeName} on a strict one-over leash with control-first fields.`,
-            'Reassess execution quality immediately before committing the following over.',
+            hasFollowingOverPlan
+              ? 'Reassess execution quality immediately before committing the following over.'
+              : 'Reassess execution quality ball-by-ball through this closeout over.',
           ], 3);
     const ifYouIgnore = safeContinue
-      ? 'If control slips without a preplanned backup, the next over can force a rushed tactical change.'
+      ? hasFollowingOverPlan
+        ? 'If control slips without a preplanned backup, the next over can force a rushed tactical change.'
+        : 'If control slips now, the closeout over can leak pressure quickly.'
       : sanitizeCoachLine(
           tacticalAnalysis?.ifIgnored ||
           finalRecommendation?.ifContinues?.riskSummary ||
           activeStrategicAnalysis?.tacticalRecommendation?.ifIgnored ||
-          'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.',
-          'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.',
+          (hasFollowingOverPlan
+            ? 'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.'
+            : 'If the change is delayed, control drop and pressure release are more likely in the remaining deliveries.'),
+          hasFollowingOverPlan
+            ? 'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.'
+            : 'If the change is delayed, control drop and pressure release are more likely in the remaining deliveries.',
           110
         );
     const hasShortOrInitialSection = (value: string): boolean => {
@@ -8165,41 +8284,57 @@ function Dashboard({
         out: activeName,
         in: replacementName,
         reason: safeContinue
-          ? `Tactical plan: Next over: stay with ${activeName}. Following over: ${backupCandidateName || replacementName} if pressure rises.`
+          ? continuePlan
           : canFallbackRotate
-            ? `Tactical plan: Next over: ${replacementName} to reset pressure. Following over: ${backupCandidateName || activeName} based on control quality.`
-            : 'No eligible replacement is available, so apply a strict one-over leash and reassess.',
+            ? rotatePlan
+            : noEligiblePlan,
       };
       return {
         matchSituation: [matchSituationLine, scoreLine] as [string, string],
         assessment: [assessmentLine1, assessmentLine2] as [string, string],
-        recommendedMove: safeContinue
-          ? `Continue with ${activeName} for one controlled over, then reassess before locking the next spell.`
-          : canFallbackRotate
-            ? `Bring in ${fallbackSwap.in} for ${fallbackSwap.out} next over to reset control before pressure compounds.`
-            : `No eligible replacement available — keep ${activeName} for one controlled over, then reassess.`,
+        recommendedMove: !hasNextOverAvailable
+          ? 'Innings complete — no next over remains for a bowling change.'
+          : safeContinue
+            ? hasFollowingOverPlan
+              ? `Continue with ${activeName} for one controlled over, then reassess before locking the next spell.`
+              : `Continue with ${activeName} for this closeout over with a strict control-first plan.`
+            : canFallbackRotate
+              ? `Bring in ${fallbackSwap.in} for ${fallbackSwap.out} next over to reset control before pressure compounds.`
+              : hasFollowingOverPlan
+                ? `No eligible replacement available — keep ${activeName} for one controlled over, then reassess.`
+                : `No eligible replacement available — keep ${activeName} for the closeout over and reassess at over end.`,
         whyThisIsSmart: safeContinue
           ? dedupeBullets([
               `This avoids an unnecessary early change while preserving match rhythm.`,
               `You keep a prepared fallback so the next decision stays proactive, not reactive.`,
-              backupCandidateName
+              backupCandidateName && hasFollowingOverPlan
                 ? `Backup option remains ${backupCandidateName} if pressure spikes after this over.`
-                : 'You preserve flexibility for the next tactical window.',
+                : hasFollowingOverPlan
+                  ? 'You preserve flexibility for the next tactical window.'
+                  : 'This keeps the closeout over simple and execution-first.',
             ], 3)
           : canFallbackRotate
             ? dedupeBullets([
                 `${fallbackSwap.in} changes the pressure profile at the right phase timing.`,
                 'The timing of this change helps prevent control slippage under pressure.',
-                'You keep a safer path now while preserving options for the next tactical window.',
+                hasFollowingOverPlan
+                  ? 'You keep a safer path now while preserving options for the next tactical window.'
+                  : 'You keep a safer path now while simplifying the closeout execution.',
               ], 3)
             : dedupeBullets([
                 'No eligible replacement is available from the current bowling roster.',
                 `Use ${activeName} on a strict one-over leash with control-first fields.`,
-                'Reassess execution quality immediately before committing the following over.',
+                hasFollowingOverPlan
+                  ? 'Reassess execution quality immediately before committing the following over.'
+                  : 'Reassess execution quality ball-by-ball through this closeout over.',
               ], 3),
         ifYouIgnore: safeContinue
-          ? 'If control slips without a preplanned backup, the next over can force a rushed tactical change.'
-          : 'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.',
+          ? hasFollowingOverPlan
+            ? 'If control slips without a preplanned backup, the next over can force a rushed tactical change.'
+            : 'If control slips now, the closeout over can leak pressure quickly.'
+          : hasFollowingOverPlan
+            ? 'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.'
+            : 'If the change is delayed, control drop and pressure release are more likely in the remaining deliveries.',
         confidence,
         primaryPlayerName: activeName,
         swap: fallbackSwap,
@@ -8297,6 +8432,47 @@ function Dashboard({
       : tacticalRiskToken === 'MED' || tacticalRiskToken === 'MEDIUM' || tacticalNoBallToken === 'MED' || tacticalNoBallToken === 'MEDIUM'
         ? 'Monitor'
         : 'Stable';
+  const copilotTacticalRecommendationState = useMemo(() => {
+    const outgoing = String(tacticalRecommendation.swap?.out || activePlayer?.name || currentTelemetry.playerName || '').trim();
+    const incoming = String(tacticalRecommendation.swap?.in || '').trim();
+    const state: Record<string, unknown> = {
+      recommendedOutgoingPlayer: outgoing || undefined,
+      recommendedReplacementPlayer: outgoing || undefined,
+      recommendedIncomingPlayer: incoming || undefined,
+      recommendedMove: tacticalRecommendedMove,
+      tacticalPlan: tacticalSwapReason,
+      assessment: tacticalAssessmentLines.join(' '),
+      whyThisIsSmart: tacticalWhyLines.join(' '),
+      riskIfIgnored: tacticalIfIgnored,
+      confidence: tacticalRecommendation.confidence,
+      matchSituation: tacticalMatchSituationLines.join(' '),
+      priority: tacticalPriority,
+      reason: tacticalWhyLines[0] || tacticalAssessmentLines[0] || tacticalRecommendedMove,
+      fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
+      riskLevel:
+        tacticalPriority === 'Immediate'
+          ? 'High'
+          : tacticalPriority === 'Monitor'
+            ? 'Moderate'
+            : 'Low',
+    };
+    return state;
+  }, [
+    activePlayer?.fatigue,
+    activePlayer?.name,
+    currentTelemetry.fatigueIndex,
+    currentTelemetry.playerName,
+    tacticalAssessmentLines,
+    tacticalIfIgnored,
+    tacticalMatchSituationLines,
+    tacticalPriority,
+    tacticalRecommendation.confidence,
+    tacticalRecommendation.swap?.in,
+    tacticalRecommendation.swap?.out,
+    tacticalRecommendedMove,
+    tacticalSwapReason,
+    tacticalWhyLines,
+  ]);
   const tacticalPriorityBadgeClass =
     tacticalPriority === 'Immediate'
       ? 'border-rose-400/45 bg-rose-500/15 text-rose-100'
@@ -8934,6 +9110,7 @@ function Dashboard({
 
   const runCoachAgentAuto = useCallback(
     async (modeOverride?: TeamMode) => {
+      playerSwitchResetRef.current = false;
       const resolvedMode = modeOverride || teamMode;
       const resolvedFocusRole: 'BOWLER' | 'BATTER' = resolvedMode === 'BATTING' ? 'BATTER' : 'BOWLER';
       setShowCoachInsights(true);
@@ -9303,6 +9480,7 @@ function Dashboard({
       return;
     }
     const execute = (modeOverride: TeamMode) => {
+      playerSwitchResetRef.current = false;
       const resolvedFocusRole: 'BOWLER' | 'BATTER' = modeOverride === 'BATTING' ? 'BATTER' : 'BOWLER';
       setShowCoachInsights(true);
       setShowFullAnalysisInfo(false);
@@ -9912,13 +10090,14 @@ function Dashboard({
                     {shouldRenderCopilotUnderGraph && (
                       <div className="md:col-span-2" style={copilotSectionStyle}>
                         <CopilotChatPanel
-                          analysisReady={hasCoachOutputText && agentExecutionFinished}
+                          analysisReady={combinedAnalysisActive}
                           analysisId={effectiveCopilotAnalysisId || analysisBundleId}
                           analysisExecuted={analysisExecuted}
                           analysisStale={analysisStale}
                           resetKey={copilotResetKey}
                           suggestedQuestions={copilotSuggestedQuestions}
                           fallbackContext={copilotFallbackContext}
+                          tacticalRecommendationState={copilotTacticalRecommendationState}
                           forceFallbackMode={copilotFallbackMode}
                           onAnalysisIdSync={(analysisId) => {
                             setCopilotSessionAnalysisId(analysisId);
@@ -10165,13 +10344,14 @@ function Dashboard({
                   {shouldRenderCopilotUnderGraph && (
                     <div style={copilotSectionStyle}>
                       <CopilotChatPanel
-                        analysisReady={hasCoachOutputText && agentExecutionFinished}
+                        analysisReady={combinedAnalysisActive}
                         analysisId={effectiveCopilotAnalysisId || analysisBundleId}
                         analysisExecuted={analysisExecuted}
                         analysisStale={analysisStale}
                         resetKey={copilotResetKey}
                         suggestedQuestions={copilotSuggestedQuestions}
                         fallbackContext={copilotFallbackContext}
+                        tacticalRecommendationState={copilotTacticalRecommendationState}
                         forceFallbackMode={copilotFallbackMode}
                         onAnalysisIdSync={(analysisId) => {
                           setCopilotSessionAnalysisId(analysisId);
@@ -10664,12 +10844,12 @@ function Dashboard({
                                       <div>
                                         <p className="text-[10px] uppercase tracking-wide text-slate-400">Recommended Move</p>
                                         {tacticalRecommendedMove && (
-                                          <p className="text-sm text-white mt-1 leading-relaxed">
+                                          <p className="text-sm text-white mt-1 leading-relaxed break-words whitespace-normal">
                                             {tacticalRecommendedMove}
                                           </p>
                                         )}
                                         {tacticalSwapReason && (
-                                          <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">{tacticalSwapReason}</p>
+                                          <p className="text-[11px] text-slate-400 mt-1 leading-relaxed break-words whitespace-normal">{tacticalSwapReason}</p>
                                         )}
                                       </div>
                                     )}
@@ -10935,80 +11115,74 @@ function Dashboard({
                         </p>
                       )}
                       <div className="min-h-[48px] flex items-center">
-                        {!fullAnalysisExecuted || analysisStale ? (
-                          <button type="button"
-                            onClick={(event) => handleRunCoachFull(event)}
-                            disabled={agentState === 'thinking'}
-                            className={`w-full py-3 rounded-2xl border text-sm font-semibold transition-all duration-200 relative text-center ${agentState === 'thinking' ? 'cursor-not-allowed' : ''}`}
-                            style={agentState === 'thinking'
-                              ? {
-                                  background: 'rgba(15, 23, 42, 0.7)',
-                                  border: '1px solid rgba(100, 116, 139, 0.55)',
-                                  color: 'rgba(148, 163, 184, 0.9)',
-                                  boxShadow: 'none',
-                                  backdropFilter: 'blur(6px)',
-                                }
-                              : {
-                                  background: 'linear-gradient(135deg, rgba(160,60,72,0.42), rgba(138,48,66,0.48))',
-                                  border: '1px solid rgba(220,120,140,0.38)',
-                                  color: '#ffffff',
-                                  boxShadow: '0 8px 20px rgba(120,40,60,0.18)',
-                                  backdropFilter: 'blur(6px)',
-                                }}
-                          >
-                            <span className="block w-full whitespace-nowrap">{agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}</span>
-                            <span
-                              className="absolute inline-flex items-center justify-center rounded-full p-0.5 text-sky-100/60 transition-colors duration-150 hover:text-sky-100/90 focus-visible:text-sky-100/90"
-                              style={{ right: 14, top: '50%', transform: 'translateY(-50%)' }}
-                              onMouseEnter={() => setShowFullAnalysisInfo(true)}
-                              onMouseLeave={() => setShowFullAnalysisInfo(false)}
-                              onFocus={() => setShowFullAnalysisInfo(true)}
-                              onBlur={() => setShowFullAnalysisInfo(false)}
-                              tabIndex={0}
-                              role="button"
-                              aria-label="About full combined analysis"
-                              onMouseDown={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
+                        <button type="button"
+                          onClick={(event) => handleRunCoachFull(event)}
+                          disabled={agentState === 'thinking'}
+                          className={`w-full py-3 rounded-2xl border text-sm font-semibold transition-all duration-200 relative text-center ${agentState === 'thinking' ? 'cursor-not-allowed' : ''}`}
+                          style={agentState === 'thinking'
+                            ? {
+                                background: 'rgba(15, 23, 42, 0.7)',
+                                border: '1px solid rgba(100, 116, 139, 0.55)',
+                                color: 'rgba(148, 163, 184, 0.9)',
+                                boxShadow: 'none',
+                                backdropFilter: 'blur(6px)',
+                              }
+                            : {
+                                background: 'linear-gradient(135deg, rgba(160,60,72,0.42), rgba(138,48,66,0.48))',
+                                border: '1px solid rgba(220,120,140,0.38)',
+                                color: '#ffffff',
+                                boxShadow: '0 8px 20px rgba(120,40,60,0.18)',
+                                backdropFilter: 'blur(6px)',
                               }}
-                              onClick={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
+                        >
+                          <span className="block w-full whitespace-nowrap">{agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}</span>
+                          <span
+                            className="absolute inline-flex items-center justify-center rounded-full p-0.5 text-sky-100/60 transition-colors duration-150 hover:text-sky-100/90 focus-visible:text-sky-100/90"
+                            style={{ right: 14, top: '50%', transform: 'translateY(-50%)' }}
+                            onMouseEnter={() => setShowFullAnalysisInfo(true)}
+                            onMouseLeave={() => setShowFullAnalysisInfo(false)}
+                            onFocus={() => setShowFullAnalysisInfo(true)}
+                            onBlur={() => setShowFullAnalysisInfo(false)}
+                            tabIndex={0}
+                            role="button"
+                            aria-label="About full combined analysis"
+                            onMouseDown={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                            }}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                            }}
+                          >
+                            <Info className="h-3.5 w-3.5" />
+                            <span
+                              role="tooltip"
+                              className={`pointer-events-none absolute transition-all duration-150 ${showFullAnalysisInfo ? 'opacity-100 scale-100 -translate-y-0.5' : 'opacity-0 scale-95 translate-y-0'}`}
+                              style={{
+                                position: 'absolute',
+                                right: 0,
+                                bottom: 'calc(100% + 10px)',
+                                maxWidth: 240,
+                                width: 'max-content',
+                                padding: '10px 12px',
+                                borderRadius: 12,
+                                background: 'rgba(10, 18, 36, 0.96)',
+                                border: '1px solid rgba(120, 150, 210, 0.22)',
+                                boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
+                                color: '#e8eefc',
+                                fontSize: 13,
+                                lineHeight: 1.4,
+                                textAlign: 'left',
+                                zIndex: 60,
+                                transformOrigin: 'bottom right',
+                                whiteSpace: 'normal',
                               }}
                             >
-                              <Info className="h-3.5 w-3.5" />
-                              <span
-                                role="tooltip"
-                                className={`pointer-events-none absolute transition-all duration-150 ${showFullAnalysisInfo ? 'opacity-100 scale-100 -translate-y-0.5' : 'opacity-0 scale-95 translate-y-0'}`}
-                                style={{
-                                  position: 'absolute',
-                                  right: 0,
-                                  bottom: 'calc(100% + 10px)',
-                                  maxWidth: 240,
-                                  width: 'max-content',
-                                  padding: '10px 12px',
-                                  borderRadius: 12,
-                                  background: 'rgba(10, 18, 36, 0.96)',
-                                  border: '1px solid rgba(120, 150, 210, 0.22)',
-                                  boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
-                                  color: '#e8eefc',
-                                  fontSize: 13,
-                                  lineHeight: 1.4,
-                                  textAlign: 'left',
-                                  zIndex: 60,
-                                  transformOrigin: 'bottom right',
-                                  whiteSpace: 'normal',
-                                }}
-                              >
-                                Combines outputs from fatigue, risk, and tactical agents into one unified coaching recommendation.
-                              </span>
+                              Combines outputs from fatigue, risk, and tactical agents into one unified coaching recommendation.
                             </span>
-                          </button>
-                        ) : (
-                          <p className="w-full text-center text-xs text-slate-400/80">
-                            Combined analysis executed
-                          </p>
-                        )}
+                          </span>
+                        </button>
                       </div>
 
                       <button type="button"

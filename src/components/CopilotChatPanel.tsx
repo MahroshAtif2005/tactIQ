@@ -28,6 +28,7 @@ interface CopilotChatPanelProps {
     matchId?: string;
     sessionId?: string;
   };
+  tacticalRecommendationState?: Record<string, unknown>;
 }
 
 const DEFAULT_QUESTIONS = [
@@ -61,9 +62,323 @@ const normalizeRisk = (value: unknown): 'LOW' | 'MED' | 'HIGH' => {
   return 'LOW';
 };
 
+const normalizeForCopilotMatch = (value: unknown): string =>
+  String(value ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const compactForCopilotMatch = (value: unknown): string =>
+  normalizeForCopilotMatch(value).replace(/\s+/g, '');
+
+const REPLACEMENT_PROMPT_PATTERNS = [
+  /\bwho\s+should\s+i\s+change\b/i,
+  /\bwho\s+should\s+replace\b/i,
+  /\bwho\s+do\s+i\s+sub(?:stitute)?\s+in\b/i,
+  /\bchange\s+.+\s+with\b/i,
+  /\breplace\s+.+\s+with\b/i,
+  /\bswap\s+.+\s+with\b/i,
+  /\bsub(?:stitute)?\s+in\s+.+\s+for\b/i,
+  /\btake\s+.+\s+off\b/i,
+  /\bnext\s+bowler\b/i,
+  /\bsafest\s+next\s+over\b/i,
+];
+
+const extractSwapFromCopilotText = (value: unknown): { out: string; in: string } => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return { out: '', in: '' };
+  const sanitizeName = (name: string): string =>
+    name
+      .replace(/\b(?:next|this|following|coming)\s+over.*$/i, '')
+      .replace(/\b(?:for|to|because|based on|if)\b.*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  const patterns = [
+    {
+      regex: /\bbring in\s+([^,!?;]+?)\s+for\s+([^,!?;]+?)(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match: RegExpMatchArray) => ({ in: match[1], out: match[2] }),
+    },
+    {
+      regex: /\breplace\s+([^,!?;]+?)\s+with\s+([^,!?;]+?)(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match: RegExpMatchArray) => ({ out: match[1], in: match[2] }),
+    },
+    {
+      regex: /\bswap\s+(?:out\s+)?([^,!?;]+?)\s+(?:for|with)\s+([^,!?;]+?)(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match: RegExpMatchArray) => ({ out: match[1], in: match[2] }),
+    },
+    {
+      regex: /\b([a-z][a-z.\s'-]{1,40})\s+for\s+([a-z][a-z.\s'-]{1,40})(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match: RegExpMatchArray) => ({ in: match[1], out: match[2] }),
+    },
+  ];
+  for (const entry of patterns) {
+    const match = text.match(entry.regex);
+    if (!match) continue;
+    const parsed = entry.parse(match);
+    const out = sanitizeName(String(parsed.out || '').replace(/\s+/g, ' ').trim());
+    const incoming = sanitizeName(String(parsed.in || '').replace(/\s+/g, ' ').trim());
+    if (!out || !incoming) continue;
+    if (normalizeForCopilotMatch(out) === normalizeForCopilotMatch(incoming)) continue;
+    return { out, in: incoming };
+  }
+  return { out: '', in: '' };
+};
+
+const resolveMentionedRosterName = (message: string, names: string[]): string => {
+  const normalizedMessage = normalizeForCopilotMatch(message);
+  const compactMessage = compactForCopilotMatch(message);
+  for (const name of names) {
+    const normalizedName = normalizeForCopilotMatch(name);
+    if (!normalizedName || normalizedName.length < 3) continue;
+    if (normalizedMessage.includes(normalizedName)) return name;
+    const compactName = normalizedName.replace(/\s+/g, '');
+    if (compactName.length >= 3 && compactMessage.includes(compactName)) return name;
+  }
+  return '';
+};
+
+const resolveCopilotSwapSuggestion = (...sources: unknown[]): { out: string; in: string } => {
+  for (const source of sources) {
+    if (!source) continue;
+    if (typeof source === 'object' && !Array.isArray(source)) {
+      const record = source as Record<string, unknown>;
+      const out = String(record.out ?? '').replace(/\s+/g, ' ').trim();
+      const incoming = String(record.in ?? '').replace(/\s+/g, ' ').trim();
+      if (out && incoming && normalizeForCopilotMatch(out) !== normalizeForCopilotMatch(incoming)) {
+        return { out, in: incoming };
+      }
+      const reasonText = String(record.reason ?? '').trim();
+      if (reasonText) {
+        const parsed = extractSwapFromCopilotText(reasonText);
+        if (parsed.in && parsed.out) return parsed;
+      }
+    }
+    const parsed = extractSwapFromCopilotText(source);
+    if (parsed.in && parsed.out) return parsed;
+  }
+  return { out: '', in: '' };
+};
+
+const normalizeRiskBand = (value: unknown): 'Low' | 'Moderate' | 'High' | '' => {
+  const token = String(value ?? '').trim().toUpperCase();
+  if (!token) return '';
+  if (token === 'HIGH' || token === 'CRITICAL') return 'High';
+  if (token === 'MED' || token === 'MEDIUM') return 'Moderate';
+  return 'Low';
+};
+
+const toConfidenceLabel = (value: unknown): string => {
+  const token = String(value ?? '').trim();
+  if (!token) return '';
+  const numeric = Number(token);
+  if (Number.isFinite(numeric)) {
+    if (numeric >= 0.75) return 'High';
+    if (numeric >= 0.45) return 'Moderate';
+    return 'Low';
+  }
+  const normalized = token.toLowerCase();
+  if (normalized === 'high' || normalized === 'moderate' || normalized === 'low') {
+    return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+  }
+  return token;
+};
+
+const buildTacticalRecommendationState = (
+  context?: CopilotChatPanelProps['fallbackContext'],
+  override?: Record<string, unknown>
+): Record<string, unknown> | undefined => {
+  const provided = override && typeof override === 'object' ? override : undefined;
+  if (provided && Object.keys(provided).length > 0) {
+    return provided;
+  }
+  if (!context) return undefined;
+  const telemetry = ((context.telemetry || {}) as Record<string, unknown>);
+  const coachOutput = ((context.coachOutput || {}) as Record<string, unknown>);
+  const tacticalRecommendation = ((coachOutput.tacticalRecommendation || {}) as Record<string, unknown>);
+  const combinedDecision = ((coachOutput.combinedDecision || {}) as Record<string, unknown>);
+  const swap = resolveCopilotSwapSuggestion(
+    tacticalRecommendation.swap,
+    tacticalRecommendation.substitutionAdvice,
+    tacticalRecommendation.nextAction,
+    tacticalRecommendation.primary,
+    combinedDecision.substitutionAdvice,
+    combinedDecision.immediateAction,
+    coachOutput.substitutionAdvice,
+    coachOutput.summary
+  );
+
+  const recommendedReplacementPlayer = readText(swap.out);
+  const recommendedIncomingPlayer = readText(swap.in);
+  const recommendedMove = readText(
+    tacticalRecommendation.recommendedMove,
+    tacticalRecommendation.nextAction,
+    tacticalRecommendation.primary,
+    combinedDecision.immediateAction
+  );
+  const tacticalPlan = readText(
+    tacticalRecommendation.tacticalPlan,
+    tacticalRecommendation.swapReason,
+    (tacticalRecommendation.swap as Record<string, unknown> | undefined)?.reason,
+    (combinedDecision.substitutionAdvice as Record<string, unknown> | undefined)?.reason
+  );
+  const assessment = readText(
+    tacticalRecommendation.assessment,
+    ...(Array.isArray((tacticalRecommendation as Record<string, unknown>).assessment)
+      ? (tacticalRecommendation as Record<string, unknown>).assessment as unknown[]
+      : [])
+  );
+  const whyThisIsSmart = readText(
+    tacticalRecommendation.whyThisIsSmart,
+    ...(Array.isArray((tacticalRecommendation as Record<string, unknown>).whyThisIsSmart)
+      ? (tacticalRecommendation as Record<string, unknown>).whyThisIsSmart as unknown[]
+      : []),
+    tacticalRecommendation.why
+  );
+  const riskIfIgnored = readText(
+    tacticalRecommendation.riskIfIgnored,
+    tacticalRecommendation.ifIgnored,
+    tacticalRecommendation.ifYouIgnore
+  );
+  const matchSituation = readText(
+    tacticalRecommendation.matchSituation,
+    ...(Array.isArray((tacticalRecommendation as Record<string, unknown>).matchSituation)
+      ? (tacticalRecommendation as Record<string, unknown>).matchSituation as unknown[]
+      : [])
+  );
+  const priority = readText(
+    tacticalRecommendation.priority,
+    (coachOutput.priority as unknown),
+    (coachOutput.riskLevel as unknown)
+  );
+  const reason = readText(
+    tacticalRecommendation.reason,
+    tacticalRecommendation.why,
+    whyThisIsSmart,
+    assessment,
+    combinedDecision.rationale,
+    coachOutput.summary
+  );
+  const fatigueIndexRaw = telemetry.fatigueIndex;
+  const fatigueIndex = Number.isFinite(Number(fatigueIndexRaw)) ? Number(fatigueIndexRaw) : undefined;
+  const injuryRisk = normalizeRiskBand(telemetry.injuryRisk);
+  const noBallRisk = normalizeRiskBand(telemetry.noBallRisk);
+  const riskLevel =
+    injuryRisk === 'High' || noBallRisk === 'High'
+      ? 'High'
+      : injuryRisk === 'Moderate' || noBallRisk === 'Moderate'
+        ? 'Moderate'
+        : (injuryRisk || noBallRisk || '');
+  const confidence = toConfidenceLabel(
+    tacticalRecommendation.confidence || combinedDecision.confidence
+  );
+
+  const state: Record<string, unknown> = {};
+  if (recommendedReplacementPlayer) state.recommendedOutgoingPlayer = recommendedReplacementPlayer;
+  if (recommendedReplacementPlayer) state.recommendedReplacementPlayer = recommendedReplacementPlayer;
+  if (recommendedIncomingPlayer) state.recommendedIncomingPlayer = recommendedIncomingPlayer;
+  if (recommendedMove) state.recommendedMove = recommendedMove;
+  if (tacticalPlan) state.tacticalPlan = tacticalPlan;
+  if (assessment) state.assessment = assessment;
+  if (whyThisIsSmart) state.whyThisIsSmart = whyThisIsSmart;
+  if (riskIfIgnored) state.riskIfIgnored = riskIfIgnored;
+  if (matchSituation) state.matchSituation = matchSituation;
+  if (priority) state.priority = priority;
+  if (reason) state.reason = reason;
+  if (typeof fatigueIndex === 'number') state.fatigueIndex = fatigueIndex;
+  if (riskLevel) state.riskLevel = riskLevel;
+  if (confidence) state.confidence = confidence;
+  return Object.keys(state).length > 0 ? state : undefined;
+};
+
+const isAlignmentSensitivePrompt = (prompt: string, tacticalState?: Record<string, unknown>): boolean => {
+  const normalizedPrompt = normalizeForCopilotMatch(prompt);
+  if (!normalizedPrompt) return false;
+  if (REPLACEMENT_PROMPT_PATTERNS.some((pattern) => pattern.test(normalizedPrompt))) return true;
+  if (/\b(rotate|rotation|replace|swap|change|next over|next bowler|who should|why|keep|continue)\b/.test(normalizedPrompt)) {
+    return true;
+  }
+  const outgoing = normalizeForCopilotMatch(
+    tacticalState?.recommendedOutgoingPlayer || tacticalState?.recommendedReplacementPlayer
+  );
+  const incoming = normalizeForCopilotMatch(tacticalState?.recommendedIncomingPlayer);
+  return Boolean((outgoing && normalizedPrompt.includes(outgoing)) || (incoming && normalizedPrompt.includes(incoming)));
+};
+
+const isDetailedTacticalPrompt = (prompt: string): boolean => {
+  const normalizedPrompt = normalizeForCopilotMatch(prompt);
+  if (!normalizedPrompt) return false;
+  return /\b(full reasoning|full detail|detailed|breakdown|step by step|show all|all reasons|deep dive|give full)\b/.test(
+    normalizedPrompt
+  );
+};
+
+const buildGroundedCoachReplyFromState = (
+  prompt: string,
+  tacticalState: Record<string, unknown>,
+  fallbackPlayerName: string
+): string => {
+  const outgoing = readText(
+    tacticalState.recommendedOutgoingPlayer,
+    tacticalState.recommendedReplacementPlayer,
+    fallbackPlayerName
+  );
+  const incoming = readText(tacticalState.recommendedIncomingPlayer);
+  if (!outgoing || !incoming) return '';
+
+  const normalizedPrompt = normalizeForCopilotMatch(prompt);
+  const reason = readText(
+    tacticalState.reason,
+    tacticalState.assessment,
+    tacticalState.whyThisIsSmart,
+    'Rotation is recommended now to prevent control drift in this phase.'
+  );
+  const recommendedMove = readText(
+    tacticalState.recommendedMove,
+    `Bring in ${incoming} for ${outgoing} next over.`
+  );
+  const confidence = readText(tacticalState.confidence, 'Moderate');
+  const tacticalPlan = readText(tacticalState.tacticalPlan);
+  const riskIfIgnored = readText(tacticalState.riskIfIgnored);
+  const fatigue = typeof tacticalState.fatigueIndex === 'number' ? Number(tacticalState.fatigueIndex).toFixed(1) : '';
+  const risk = readText(tacticalState.riskLevel);
+
+  const isWhyQuestion = /\b(why|reason|because|justify|explain)\b/.test(normalizedPrompt);
+  const isReplacementQuestion = REPLACEMENT_PROMPT_PATTERNS.some((pattern) => pattern.test(normalizedPrompt));
+  const isNextBowlerQuestion = /\b(best next bowler|who bowls next|who should bowl next|next bowler)\b/.test(normalizedPrompt);
+  const isContinueQuestion = /\b(continue|keep|stay|still okay|ok to continue)\b/.test(normalizedPrompt);
+  const detailed = isDetailedTacticalPrompt(normalizedPrompt);
+
+  let response = '';
+  if (isReplacementQuestion || isNextBowlerQuestion) {
+    response = `${recommendedMove} ${reason}`;
+  } else if (isWhyQuestion) {
+    response = `${outgoing} is still effective, but rotating now is safer because ${reason}`;
+  } else if (isContinueQuestion) {
+    response = `${outgoing} is still capable, but the tactical recommendation is to rotate now. ${recommendedMove}`;
+  } else {
+    response = `${recommendedMove} ${reason}`;
+  }
+  response = response.replace(/\s+/g, ' ').trim();
+
+  if (!detailed) return response;
+
+  const detailLines = [
+    `Recommended move: ${recommendedMove}`,
+    `Why this is smart: ${readText(tacticalState.whyThisIsSmart, reason)}`,
+    tacticalPlan ? `Tactical plan: ${tacticalPlan}` : '',
+    riskIfIgnored ? `Risk if ignored: ${riskIfIgnored}` : '',
+    fatigue ? `Fatigue index: ${fatigue}` : '',
+    risk ? `Risk level: ${risk}` : '',
+    `Confidence: ${confidence}.`,
+  ].filter(Boolean);
+  return `${response}\n\n${detailLines.join('\n')}`.trim();
+};
+
 const buildDemoCopilotReply = (
   prompt: string,
-  context?: CopilotChatPanelProps['fallbackContext']
+  context?: CopilotChatPanelProps['fallbackContext'],
+  tacticalStateOverride?: Record<string, unknown>
 ): string => {
   const snapshot = (context?.matchContextSnapshot || {}) as Record<string, unknown>;
   const telemetry = ((context?.telemetry || snapshot.telemetry || {}) as Record<string, unknown>);
@@ -71,6 +386,8 @@ const buildDemoCopilotReply = (
   const players = ((context?.players || snapshot.players || {}) as Record<string, unknown>);
   const coachOutput = (context?.coachOutput || {}) as Record<string, unknown>;
   const tacticalRecommendation = (coachOutput.tacticalRecommendation || {}) as Record<string, unknown>;
+  const combinedDecision = (coachOutput.combinedDecision || {}) as Record<string, unknown>;
+  const tacticalState = buildTacticalRecommendationState(context, tacticalStateOverride);
 
   const playerName =
     readText(telemetry.playerName)
@@ -83,13 +400,16 @@ const buildDemoCopilotReply = (
   const noBallRisk = normalizeRisk(telemetry.noBallRisk);
   const phase = readText(match.phase, 'middle overs');
   const recovery = readText((telemetry.heartRateRecovery || telemetry.recovery), 'Moderate');
-  const tacticalNextAction = readText(tacticalRecommendation.nextAction || tacticalRecommendation.primary);
+  const tacticalNextAction = readText(
+    tacticalRecommendation.nextAction || tacticalRecommendation.primary || combinedDecision.immediateAction
+  );
   const benchList = Array.isArray(players.bench)
     ? players.bench.map((entry) => String(entry || '').trim()).filter(Boolean).slice(0, 3)
     : [];
   const benchHint = benchList.length > 0 ? ` Keep ${benchList.join(', ')} ready as rotation options.` : '';
 
   const promptLower = prompt.toLowerCase();
+  const isReplacementPrompt = REPLACEMENT_PROMPT_PATTERNS.some((pattern) => pattern.test(promptLower));
   const isReliabilityPrompt = /(reliable|reliability|lowest fatigue|fatigue risk|safest (bowler|batter|player)|best condition|ready to bowl|ready to bat|in best condition|lowest injury risk|workload risk|who should bowl|who should bat)/.test(
     promptLower
   );
@@ -101,6 +421,46 @@ const buildDemoCopilotReply = (
         .map((entry) => (entry && typeof entry === 'object' ? entry as Record<string, unknown> : null))
         .filter((entry): entry is Record<string, unknown> => Boolean(entry))
     : [];
+  if (tacticalState && isAlignmentSensitivePrompt(promptLower, tacticalState)) {
+    const groundedReply = buildGroundedCoachReplyFromState(promptLower, tacticalState, playerName);
+    if (groundedReply) {
+      return groundedReply;
+    }
+  }
+
+  if (isReplacementPrompt) {
+    const rosterNames = rosterMetrics
+      .map((row) => readText(row.name, row.playerName))
+      .filter(Boolean);
+    const mentionedPlayer = resolveMentionedRosterName(promptLower, rosterNames);
+    const swap = resolveCopilotSwapSuggestion(
+      tacticalRecommendation.swap,
+      tacticalRecommendation.substitutionAdvice,
+      tacticalRecommendation.nextAction,
+      tacticalRecommendation.primary,
+      combinedDecision.substitutionAdvice,
+      combinedDecision.immediateAction,
+      coachOutput.summary
+    );
+    const replacementIn = readText(swap.in);
+    const replacementOut = readText(swap.out, mentionedPlayer, playerName);
+    const replacementReason = readText(
+      tacticalRecommendation.reason,
+      tacticalRecommendation.why,
+      combinedDecision.rationale,
+      coachOutput.summary,
+      'This is the safest pressure reset based on current workload and control signals.'
+    );
+
+    if (replacementIn) {
+      return `Replace ${replacementOut || playerName} with ${replacementIn} next over. ${replacementReason}`;
+    }
+
+    if (tacticalNextAction) {
+      return `Best next-over move: ${tacticalNextAction}. ${replacementReason}`;
+    }
+  }
+
   if (isReliabilityPrompt && rosterMetrics.length > 0) {
     const normalizeRiskBand = (value: unknown): 'LOW' | 'MED' | 'HIGH' => {
       const token = String(value || '').trim().toUpperCase();
@@ -207,6 +567,7 @@ export default function CopilotChatPanel({
   analysisExecuted = false,
   analysisStale = false,
   fallbackContext,
+  tacticalRecommendationState: tacticalRecommendationStateProp,
 }: CopilotChatPanelProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<CopilotTurn[]>([]);
@@ -330,6 +691,10 @@ export default function CopilotChatPanel({
           historyTurns: history.length,
         });
       }
+      const tacticalRecommendationState = buildTacticalRecommendationState(
+        fallbackContext,
+        tacticalRecommendationStateProp
+      );
       const basePayload = {
         analysisId: resolvedAnalysisId,
         message: prompt,
@@ -339,6 +704,7 @@ export default function CopilotChatPanel({
         ...(fallbackContext?.matchContext ? { matchContext: fallbackContext.matchContext } : {}),
         ...(fallbackContext?.players ? { players: fallbackContext.players } : {}),
         ...(fallbackContext?.coachOutput ? { coachOutput: fallbackContext.coachOutput } : {}),
+        ...(tacticalRecommendationState ? { tacticalRecommendationState } : {}),
         ...(fallbackContext?.matchId ? { matchId: fallbackContext.matchId } : {}),
         ...(fallbackContext?.sessionId ? { sessionId: fallbackContext.sessionId } : {}),
       };
@@ -354,7 +720,7 @@ export default function CopilotChatPanel({
         const assistantTurn: CopilotTurn = {
           id: nextTurnId(),
           role: 'assistant',
-          content: buildDemoCopilotReply(prompt, fallbackContext),
+          content: buildDemoCopilotReply(prompt, fallbackContext, tacticalRecommendationState),
         };
         setMessages((prev) => [...prev, assistantTurn]);
         setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
@@ -407,7 +773,11 @@ export default function CopilotChatPanel({
           error: sendError instanceof Error ? sendError.message : String(sendError),
         });
       }
-      const fallbackReply = buildDemoCopilotReply(prompt, fallbackContext);
+      const fallbackReply = buildDemoCopilotReply(
+        prompt,
+        fallbackContext,
+        buildTacticalRecommendationState(fallbackContext, tacticalRecommendationStateProp)
+      );
       const assistantTurn: CopilotTurn = {
         id: nextTurnId(),
         role: 'assistant',

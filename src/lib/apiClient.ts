@@ -624,6 +624,7 @@ export interface CopilotChatRequest {
   matchContext?: Record<string, unknown>;
   players?: Record<string, unknown>;
   coachOutput?: Record<string, unknown>;
+  tacticalRecommendationState?: Record<string, unknown>;
   matchId?: string;
   sessionId?: string;
 }

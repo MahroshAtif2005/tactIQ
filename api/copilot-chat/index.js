@@ -455,9 +455,50 @@ const buildCricketSmallTalkReply = (message) => {
   return 'Good cricket question. Context usually matters more than reputation in live decisions. If you want, I can turn this into a match-specific tactical recommendation.';
 };
 
+const normalizeForKeywordMatch = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const compactForKeywordMatch = (value) => normalizeForKeywordMatch(value).replace(/\s+/g, '');
+
 const includesKeyword = (text, keyword) => {
-  if (!text || !keyword) return false;
-  return text.includes(keyword);
+  const normalizedText = normalizeForKeywordMatch(text);
+  const normalizedKeyword = normalizeForKeywordMatch(keyword);
+  if (!normalizedText || !normalizedKeyword) return false;
+  return normalizedText.includes(normalizedKeyword);
+};
+
+const REPLACEMENT_INTENT_PATTERNS = [
+  /\bwho\s+should\s+i\s+change\b/,
+  /\bwho\s+should\s+replace\b/,
+  /\bwho\s+do\s+i\s+sub(?:stitute)?\s+in\b/,
+  /\bwho\s+should\s+i\s+sub(?:stitute)?\s+in\b/,
+  /\bchange\s+.+\s+with\b/,
+  /\breplace\s+.+\s+with\b/,
+  /\bswap\s+.+\s+with\b/,
+  /\bsub(?:stitute)?\s+in\s+.+\s+for\b/,
+  /\btake\s+.+\s+off\b/,
+  /\bbring\s+.+\s+in\b/,
+  /\bnext\s+bowler\b/,
+  /\bwho\s+after\b/,
+];
+
+const TACTICAL_QUERY_PATTERNS = [
+  /\bsafest\s+plan\b/,
+  /\bsafest\s+next\s+over\b/,
+  /\bplan\s+the\s+next\b/,
+  /\bnext\s+2\s+overs?\b/,
+  /\bnext\s+two\s+overs?\b/,
+  /\bwho\s+should\s+bowl\s+next\b/,
+  /\brotate\s+now\b/,
+];
+
+const matchesAnyPattern = (text, patterns) => {
+  if (!text) return false;
+  return patterns.some((pattern) => pattern.test(text));
 };
 
 const DOMAIN_INTENT_KEYWORDS = [
@@ -576,6 +617,63 @@ const hasCopilotContextSignals = (snapshot) => {
   );
 };
 
+const collectSnapshotPlayerNames = (snapshot) => {
+  const telemetry = asRecord(snapshot.telemetry);
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const tacticalState = asRecord(snapshot.tacticalRecommendationState);
+  const names = [];
+  const pushName = (...values) => {
+    const value = toText(...values);
+    if (value) names.push(value);
+  };
+  pushName(telemetry.playerName, telemetry.name);
+  pushName(players.selectedBowler, snapshotPlayers.selectedBowler, players.bowler, snapshotPlayers.bowler);
+  pushName(players.selectedBatter, snapshotPlayers.selectedBatter, players.striker, snapshotPlayers.striker);
+  pushName(players.nonStriker, snapshotPlayers.nonStriker);
+  pushName(
+    tacticalState.recommendedOutgoingPlayer,
+    tacticalState.recommendedReplacementPlayer,
+    tacticalState.replacementOut,
+    tacticalState.out,
+    tacticalState.recommendedIncomingPlayer,
+    tacticalState.replacementIn,
+    tacticalState.in
+  );
+
+  const ingestRoster = (source) => {
+    if (!Array.isArray(source)) return;
+    for (const entry of source) {
+      const row = asRecord(entry);
+      pushName(row.name, row.playerName);
+    }
+  };
+  ingestRoster(players.rosterMetrics);
+  ingestRoster(snapshotPlayers.rosterMetrics);
+
+  const dedupe = new Set();
+  return names.filter((name) => {
+    const key = normalizeForKeywordMatch(name);
+    if (!key || key.length < 3 || dedupe.has(key)) return false;
+    dedupe.add(key);
+    return true;
+  });
+};
+
+const hasContextPlayerMention = (message, snapshot) => {
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  const compactMessage = compactForKeywordMatch(message);
+  if (!normalizedMessage) return false;
+  const playerNames = collectSnapshotPlayerNames(snapshot);
+  return playerNames.some((name) => {
+    const normalizedName = normalizeForKeywordMatch(name);
+    if (!normalizedName || normalizedName.length < 3) return false;
+    if (normalizedMessage.includes(normalizedName)) return true;
+    const compactName = normalizedName.replace(/\s+/g, '');
+    return compactName.length >= 3 && compactMessage.includes(compactName);
+  });
+};
+
 const classifyCopilotDomain = (message, history, snapshot) => {
   const normalizedMessage = String(message || '').trim().toLowerCase();
   const allowedHits = collectAllowedKeywordHits(normalizedMessage);
@@ -588,15 +686,24 @@ const classifyCopilotDomain = (message, history, snapshot) => {
   const comparisonDetected =
     /\b(better|best|compare|comparison|vs|versus)\b/.test(normalizedMessage) && /\bor\b/.test(normalizedMessage);
   const followUpDetected = FOLLOW_UP_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
+  const replacementIntentDetected = matchesAnyPattern(normalizedMessage, REPLACEMENT_INTENT_PATTERNS);
+  const tacticalPromptDetected = matchesAnyPattern(normalizedMessage, TACTICAL_QUERY_PATTERNS);
   const hasRecentTurns = Array.isArray(history) && history.length > 0;
   const hasContextSignals = hasCopilotContextSignals(snapshot);
+  const contextPlayerMention = hasContextPlayerMention(normalizedMessage, snapshot);
   const hasDomainIntent = domainIntentHits.length > 0;
-  const hasCricketSignal = hasDomainIntent || allowedHits.length > 0 || cricketEntityHits.length > 0;
+  const hasCricketSignal =
+    hasDomainIntent ||
+    allowedHits.length > 0 ||
+    cricketEntityHits.length > 0 ||
+    replacementIntentDetected ||
+    tacticalPromptDetected ||
+    contextPlayerMention;
   const hasSportsSignal = sportsDomainHits.length > 0;
-  const hasLiveScopeSignal = liveScopeHits.length > 0;
+  const hasLiveScopeSignal = liveScopeHits.length > 0 || replacementIntentDetected || tacticalPromptDetected;
   const hasPerformanceIntent = performanceIntentHits.length > 0;
   const greetingDetected = isGreetingMessage(normalizedMessage);
-  const hasDomainSignal = hasCricketSignal || hasSportsSignal || hasPerformanceIntent;
+  const hasDomainSignal = hasCricketSignal || hasSportsSignal || hasPerformanceIntent || contextPlayerMention;
 
   if (blockedHits.length > 0 && !hasDomainSignal) {
     return {
@@ -612,6 +719,9 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       sportsDomainHits,
       comparisonDetected,
       followUpDetected,
+      replacementIntentDetected,
+      tacticalPromptDetected,
+      contextPlayerMention,
     };
   }
 
@@ -629,6 +739,9 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       sportsDomainHits,
       comparisonDetected,
       followUpDetected,
+      replacementIntentDetected,
+      tacticalPromptDetected,
+      contextPlayerMention,
     };
   }
 
@@ -646,6 +759,9 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       sportsDomainHits,
       comparisonDetected,
       followUpDetected,
+      replacementIntentDetected,
+      tacticalPromptDetected,
+      contextPlayerMention,
     };
   }
 
@@ -663,6 +779,9 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       sportsDomainHits,
       comparisonDetected,
       followUpDetected,
+      replacementIntentDetected,
+      tacticalPromptDetected,
+      contextPlayerMention,
     };
   }
 
@@ -680,6 +799,9 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       sportsDomainHits,
       comparisonDetected,
       followUpDetected,
+      replacementIntentDetected,
+      tacticalPromptDetected,
+      contextPlayerMention,
     };
   }
 
@@ -697,6 +819,9 @@ const classifyCopilotDomain = (message, history, snapshot) => {
       sportsDomainHits,
       comparisonDetected,
       followUpDetected,
+      replacementIntentDetected,
+      tacticalPromptDetected,
+      contextPlayerMention,
     };
   }
 
@@ -713,6 +838,9 @@ const classifyCopilotDomain = (message, history, snapshot) => {
     sportsDomainHits,
     comparisonDetected,
     followUpDetected,
+    replacementIntentDetected,
+    tacticalPromptDetected,
+    contextPlayerMention,
   };
 };
 
@@ -727,6 +855,12 @@ const buildCopilotSystemPrompt = () =>
     'Only refuse questions that are clearly unrelated to cricket or sports.',
     'Keep responses concise, conversational, and coach-facing.',
     'When possible, steer the conversation back to match strategy and next-over decisions.',
+    'Treat the tactical recommendation engine output as the primary decision source for immediate rotation/substitution choices.',
+    'Do not contradict an explicit recommended replacement (out/in) provided in context.',
+    'If users ask about the outgoing player, acknowledge strengths briefly but explain why rotation is still recommended now.',
+    'When relevant, explicitly restate the recommended move and confidence from the tactical recommendation state.',
+    'Synthesize a fresh conversational answer; do not paste raw recommendation blocks unless the user explicitly asks for a full breakdown.',
+    'Keep tactical answers concise by default (1-3 core reasons), and expand only when asked for detailed reasoning.',
   ].join(' ');
 
 const buildCopilotSignalSummary = (snapshot) => {
@@ -737,6 +871,7 @@ const buildCopilotSignalSummary = (snapshot) => {
   const coachOutput = asRecord(snapshot.coachOutput);
   const tacticalRecommendation = asRecord(coachOutput.tacticalRecommendation);
   const combinedDecision = asRecord(coachOutput.combinedDecision);
+  const tacticalState = resolveTacticalRecommendationState(snapshot);
 
   const lines = [
     `mode=${toText(matchContext.matchMode, matchContextSnapshot.matchMode, 'unknown')}`,
@@ -764,6 +899,10 @@ const buildCopilotSignalSummary = (snapshot) => {
       coachOutput.summary,
       'n/a'
     )}`,
+    `recommendedOut=${toText(tacticalState.recommendedReplacementPlayer, 'n/a')}`,
+    `recommendedIn=${toText(tacticalState.recommendedIncomingPlayer, 'n/a')}`,
+    `recommendedMove=${toText(tacticalState.recommendedMove, 'n/a')}`,
+    `recommendationConfidence=${toText(tacticalState.confidence, 'n/a')}`,
   ];
 
   return lines.join('\n');
@@ -868,6 +1007,7 @@ const buildCopilotContextBlock = (snapshot) => {
     coachOutput.summary,
     'None'
   );
+  const tacticalState = resolveTacticalRecommendationState(snapshot);
 
   return [
     'MATCH STATE',
@@ -900,7 +1040,371 @@ const buildCopilotContextBlock = (snapshot) => {
     )}`,
     `- Routing mode: ${toText(coachOutput.routingMode, 'n/a')}`,
     `- LLM mode: ${toText(coachOutput.llmMode, 'n/a')}`,
+    '',
+    'TACTICAL RECOMMENDATION STATE',
+    `- recommendedOutgoingPlayer: ${toText(tacticalState.recommendedOutgoingPlayer, tacticalState.recommendedReplacementPlayer, 'n/a')}`,
+    `- recommendedReplacementPlayer: ${toText(tacticalState.recommendedReplacementPlayer, 'n/a')}`,
+    `- recommendedIncomingPlayer: ${toText(tacticalState.recommendedIncomingPlayer, 'n/a')}`,
+    `- recommendedMove: ${toText(tacticalState.recommendedMove, 'n/a')}`,
+    `- tacticalPlan: ${toText(tacticalState.tacticalPlan, 'n/a')}`,
+    `- assessment: ${toText(tacticalState.assessment, 'n/a')}`,
+    `- whyThisIsSmart: ${toText(tacticalState.whyThisIsSmart, 'n/a')}`,
+    `- riskIfIgnored: ${toText(tacticalState.riskIfIgnored, 'n/a')}`,
+    `- matchSituation: ${toText(tacticalState.matchSituation, 'n/a')}`,
+    `- priority: ${toText(tacticalState.priority, 'n/a')}`,
+    `- reason: ${toText(tacticalState.reason, 'n/a')}`,
+    `- fatigueIndex: ${toText(tacticalState.fatigueIndex, 'n/a')}`,
+    `- riskLevel: ${toText(tacticalState.riskLevel, 'n/a')}`,
+    `- confidence: ${toText(tacticalState.confidence, 'n/a')}`,
   ].join('\n');
+};
+
+const cleanPlayerName = (value) =>
+  String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[^a-z0-9]+|[^a-z0-9. ]+$/gi, '')
+    .trim();
+
+const sanitizeSwapName = (value) =>
+  cleanPlayerName(value)
+    .replace(/\b(?:next|this|following|coming)\s+over.*$/i, '')
+    .replace(/\b(?:for|to|because|based on|if)\b.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const extractSwapFromText = (text) => {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return { out: '', in: '' };
+
+  const patterns = [
+    {
+      re: /\bbring in\s+([^,!?;]+?)\s+for\s+([^,!?;]+?)(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match) => ({ in: match[1], out: match[2] }),
+    },
+    {
+      re: /\breplace\s+([^,!?;]+?)\s+with\s+([^,!?;]+?)(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match) => ({ out: match[1], in: match[2] }),
+    },
+    {
+      re: /\bswap\s+(?:out\s+)?([^,!?;]+?)\s+(?:for|with)\s+([^,!?;]+?)(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match) => ({ out: match[1], in: match[2] }),
+    },
+    {
+      re: /\b([a-z][a-z.\s'-]{1,40})\s+for\s+([a-z][a-z.\s'-]{1,40})(?:\s+(?:next|this|following|coming)\s+over\b|[,!?;]|$)/i,
+      parse: (match) => ({ in: match[1], out: match[2] }),
+    },
+  ];
+
+  for (const entry of patterns) {
+    const match = normalized.match(entry.re);
+    if (!match) continue;
+    const parsed = entry.parse(match);
+    const out = sanitizeSwapName(parsed.out);
+    const incoming = sanitizeSwapName(parsed.in);
+    if (!out || !incoming) continue;
+    if (normalizeForKeywordMatch(out) === normalizeForKeywordMatch(incoming)) continue;
+    return { out, in: incoming };
+  }
+
+  return { out: '', in: '' };
+};
+
+const resolveReplacementSuggestion = (tacticalRecommendation, combinedDecision, coachOutput) => {
+  const structuredCandidates = [
+    asRecord(tacticalRecommendation.swap),
+    asRecord(tacticalRecommendation.substitutionAdvice),
+    asRecord(combinedDecision.substitutionAdvice),
+    asRecord(coachOutput.substitutionAdvice),
+  ];
+
+  for (const candidate of structuredCandidates) {
+    const out = cleanPlayerName(candidate.out);
+    const incoming = cleanPlayerName(candidate.in);
+    if (out && incoming && normalizeForKeywordMatch(out) !== normalizeForKeywordMatch(incoming)) {
+      return {
+        out,
+        in: incoming,
+        reason: toText(candidate.reason),
+      };
+    }
+  }
+
+  const textCandidates = [
+    toText(tacticalRecommendation.nextAction),
+    toText(tacticalRecommendation.primary),
+    toText(combinedDecision.immediateAction),
+    toText(coachOutput.summary),
+    toText(coachOutput.combinedBriefing),
+  ];
+
+  for (const line of textCandidates) {
+    const parsed = extractSwapFromText(line);
+    if (parsed.in && parsed.out) {
+      return {
+        out: parsed.out,
+        in: parsed.in,
+        reason: '',
+      };
+    }
+  }
+
+  return { out: '', in: '', reason: '' };
+};
+
+const resolveMentionedPlayerName = (question, names) => {
+  const normalizedQuestion = normalizeForKeywordMatch(question);
+  const compactQuestion = compactForKeywordMatch(question);
+  for (const name of names) {
+    const normalizedName = normalizeForKeywordMatch(name);
+    if (!normalizedName || normalizedName.length < 3) continue;
+    if (normalizedQuestion.includes(normalizedName)) return name;
+    const compactName = normalizedName.replace(/\s+/g, '');
+    if (compactName.length >= 3 && compactQuestion.includes(compactName)) return name;
+  }
+  return '';
+};
+
+const toConfidenceLabel = (value) => {
+  const token = String(value || '').trim();
+  if (!token) return '';
+  const numeric = Number(token);
+  if (Number.isFinite(numeric)) {
+    if (numeric >= 0.75) return 'High';
+    if (numeric >= 0.45) return 'Moderate';
+    return 'Low';
+  }
+  const normalized = token.toLowerCase();
+  if (normalized === 'high' || normalized === 'moderate' || normalized === 'low') {
+    return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+  }
+  return token;
+};
+
+const resolveRiskLevel = (telemetry) => {
+  const injury = String(toText(telemetry.injuryRisk) || '').trim().toUpperCase();
+  const noBall = String(toText(telemetry.noBallRisk) || '').trim().toUpperCase();
+  if (injury === 'HIGH' || injury === 'CRITICAL' || noBall === 'HIGH' || noBall === 'CRITICAL') return 'High';
+  if (injury === 'MED' || injury === 'MEDIUM' || noBall === 'MED' || noBall === 'MEDIUM') return 'Moderate';
+  if (injury || noBall) return 'Low';
+  return '';
+};
+
+const resolveTacticalRecommendationState = (snapshot) => {
+  const tacticalState = asRecord(snapshot.tacticalRecommendationState);
+  const coachOutput = asRecord(snapshot.coachOutput);
+  const tacticalRecommendation = asRecord(coachOutput.tacticalRecommendation);
+  const combinedDecision = asRecord(coachOutput.combinedDecision);
+  const telemetry = asRecord(snapshot.telemetry);
+
+  const explicitOut = toText(
+    tacticalState.recommendedOutgoingPlayer,
+    tacticalState.recommendedReplacementPlayer,
+    tacticalState.replacementOut,
+    tacticalState.out
+  );
+  const explicitIn = toText(
+    tacticalState.recommendedIncomingPlayer,
+    tacticalState.replacementIn,
+    tacticalState.in
+  );
+  let replacement = {
+    out: explicitOut,
+    in: explicitIn,
+    reason: toText(tacticalState.reason, tacticalState.reasoning),
+  };
+
+  if (!replacement.out || !replacement.in) {
+    replacement = resolveReplacementSuggestion(tacticalRecommendation, combinedDecision, coachOutput);
+  }
+
+  const fatigueIndex = toText(tacticalState.fatigueIndex, telemetry.fatigueIndex);
+  const riskLevel = toText(tacticalState.riskLevel, resolveRiskLevel(telemetry));
+  const reason = toText(
+    replacement.reason,
+    tacticalState.reason,
+    tacticalState.reasoning,
+    tacticalState.assessment,
+    tacticalRecommendation.why,
+    combinedDecision.rationale,
+    coachOutput.summary
+  );
+  const confidence = toText(
+    toConfidenceLabel(tacticalState.confidence),
+    toConfidenceLabel(tacticalRecommendation.confidence),
+    toConfidenceLabel(combinedDecision.confidence)
+  );
+
+  const recommendedMove = toText(
+    tacticalState.recommendedMove,
+    tacticalState.nextAction,
+    tacticalRecommendation.nextAction,
+    tacticalRecommendation.primary,
+    combinedDecision.immediateAction
+  );
+  const tacticalPlan = toText(
+    tacticalState.tacticalPlan,
+    tacticalState.swapReason,
+    tacticalState.plan,
+    asRecord(tacticalRecommendation.swap).reason,
+    asRecord(combinedDecision.substitutionAdvice).reason
+  );
+  const assessment = toText(
+    tacticalState.assessment,
+    ...(Array.isArray(tacticalState.assessmentLines) ? tacticalState.assessmentLines : []),
+    ...(Array.isArray(tacticalState.matchAssessment) ? tacticalState.matchAssessment : []),
+    tacticalRecommendation.assessment
+  );
+  const whyThisIsSmart = toText(
+    tacticalState.whyThisIsSmart,
+    ...(Array.isArray(tacticalState.whyThisIsSmart) ? tacticalState.whyThisIsSmart : []),
+    ...(Array.isArray(tacticalState.why) ? tacticalState.why : []),
+    tacticalRecommendation.why
+  );
+  const riskIfIgnored = toText(
+    tacticalState.riskIfIgnored,
+    tacticalState.ifIgnored,
+    tacticalState.ifYouIgnore,
+    tacticalRecommendation.ifIgnored
+  );
+  const matchSituation = toText(
+    tacticalState.matchSituation,
+    ...(Array.isArray(tacticalState.matchSituationLines) ? tacticalState.matchSituationLines : [])
+  );
+  const priority = toText(tacticalState.priority);
+
+  return {
+    recommendedReplacementPlayer: replacement.out,
+    recommendedOutgoingPlayer: replacement.out,
+    recommendedIncomingPlayer: replacement.in,
+    reason,
+    fatigueIndex,
+    riskLevel,
+    confidence,
+    recommendedMove,
+    tacticalPlan,
+    assessment,
+    whyThisIsSmart,
+    riskIfIgnored,
+    matchSituation,
+    priority,
+  };
+};
+
+const isDetailedTacticalRequest = (message) => {
+  const normalized = normalizeForKeywordMatch(message);
+  if (!normalized) return false;
+  return /\b(full reasoning|full detail|detailed|breakdown|step by step|show all|all reasons|deep dive|give full)\b/.test(
+    normalized
+  );
+};
+
+const buildAlignedTacticalReply = (state, message = '') => {
+  const replacementOut = toText(state.recommendedOutgoingPlayer, state.recommendedReplacementPlayer);
+  const replacementIn = toText(state.recommendedIncomingPlayer);
+  if (!replacementOut || !replacementIn) return '';
+
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  const reason = toText(
+    state.reason,
+    state.assessment,
+    state.whyThisIsSmart,
+    'Rotation is recommended now to prevent control drift in this phase.'
+  );
+  const recommendedMove = toText(
+    state.recommendedMove,
+    `Bring in ${replacementIn} for ${replacementOut} next over.`
+  );
+  const confidence = toText(state.confidence, 'Moderate');
+  const tacticalPlan = toText(state.tacticalPlan);
+  const riskIfIgnored = toText(state.riskIfIgnored);
+  const fatigueDetail = toText(state.fatigueIndex);
+  const riskDetail = toText(state.riskLevel);
+
+  const isWhyQuestion = /\b(why|reason|because|justify|explain)\b/.test(normalizedMessage);
+  const isReplacementQuestion = matchesAnyPattern(normalizedMessage, REPLACEMENT_INTENT_PATTERNS);
+  const isNextBowlerQuestion = /\b(best next bowler|who bowls next|who should bowl next|next bowler)\b/.test(
+    normalizedMessage
+  );
+  const isContinueQuestion = /\b(continue|keep|stay|still okay|ok to continue)\b/.test(normalizedMessage);
+  const wantsDetailedBreakdown = isDetailedTacticalRequest(normalizedMessage);
+
+  let response = '';
+  if (isReplacementQuestion || isNextBowlerQuestion) {
+    response = `${recommendedMove} ${reason}`;
+  } else if (isWhyQuestion) {
+    response = `${replacementOut} is still effective, but rotating now is safer because ${reason}`;
+  } else if (isContinueQuestion) {
+    response = `${replacementOut} is still capable, but the tactical recommendation is to rotate now. ${recommendedMove}`;
+  } else {
+    response = `${recommendedMove} ${reason}`;
+  }
+  response = clipText(response, 320);
+
+  if (!wantsDetailedBreakdown) {
+    return response;
+  }
+
+  const detailLines = [
+    `Recommended move: ${recommendedMove}`,
+    `Why this is smart: ${toText(state.whyThisIsSmart, reason)}`,
+    tacticalPlan ? `Tactical plan: ${tacticalPlan}` : '',
+    riskIfIgnored ? `Risk if ignored: ${riskIfIgnored}` : '',
+    fatigueDetail ? `Fatigue index: ${fatigueDetail}` : '',
+    riskDetail ? `Risk level: ${riskDetail}` : '',
+    `Confidence: ${confidence}.`,
+  ].filter(Boolean);
+
+  return `${response}\n\n${detailLines.join('\n')}`.trim();
+};
+
+const isAlignmentSensitiveQuestion = (message, state) => {
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  if (!normalizedMessage) return false;
+  const replacementOut = normalizeForKeywordMatch(
+    toText(state.recommendedOutgoingPlayer, state.recommendedReplacementPlayer)
+  );
+  const replacementIn = normalizeForKeywordMatch(state.recommendedIncomingPlayer);
+  const hasReplacementIntent =
+    matchesAnyPattern(normalizedMessage, REPLACEMENT_INTENT_PATTERNS) ||
+    matchesAnyPattern(normalizedMessage, TACTICAL_QUERY_PATTERNS) ||
+    /\b(rotate|rotation|replace|swap|sub(?:stitute)?|change|next over|next bowler|safest|who should|should we|why)\b/.test(
+      normalizedMessage
+    );
+  if (hasReplacementIntent) return true;
+  if (replacementOut && normalizedMessage.includes(replacementOut)) return true;
+  if (replacementIn && normalizedMessage.includes(replacementIn)) return true;
+  return false;
+};
+
+const enforceAlignmentOnReply = (message, reply, state) => {
+  const baseReply = String(reply || '').trim();
+  if (!baseReply) return baseReply;
+  if (!toText(state.recommendedIncomingPlayer)) return baseReply;
+  if (!isAlignmentSensitiveQuestion(message, state)) return baseReply;
+
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  const normalizedReply = normalizeForKeywordMatch(baseReply);
+  const outgoing = normalizeForKeywordMatch(
+    toText(state.recommendedOutgoingPlayer, state.recommendedReplacementPlayer)
+  );
+  const incoming = normalizeForKeywordMatch(state.recommendedIncomingPlayer);
+  const mentionsIncoming = incoming && normalizedReply.includes(incoming);
+  const mentionsOutgoing = outgoing && normalizedReply.includes(outgoing);
+  const replacementIntent = matchesAnyPattern(normalizedMessage, REPLACEMENT_INTENT_PATTERNS);
+  const asksAboutOutgoing = Boolean(outgoing && normalizedMessage.includes(outgoing));
+  const contradiction =
+    mentionsOutgoing &&
+    /\b(keep|continue|stay|stick|persist|back)\b/.test(normalizedReply) &&
+    !mentionsIncoming;
+  const missingRecommendedMove = replacementIntent && !mentionsIncoming;
+  const missingRecommendationForOutgoing = asksAboutOutgoing && !mentionsIncoming;
+
+  if (contradiction || missingRecommendedMove || missingRecommendationForOutgoing) {
+    const aligned = buildAlignedTacticalReply(state, message);
+    if (aligned) return aligned;
+  }
+
+  return baseReply;
 };
 
 const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
@@ -909,6 +1413,13 @@ const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
   const combinedDecision = asRecord(coachOutput.combinedDecision);
   const players = asRecord(payload.players);
   const telemetry = asRecord(payload.telemetry);
+  const tacticalState = resolveTacticalRecommendationState({
+    coachOutput,
+    telemetry,
+    players,
+    matchContextSnapshot: asRecord(payload.matchContextSnapshot),
+    tacticalRecommendationState: asRecord(payload.tacticalRecommendationState),
+  });
   const playerName = toText(telemetry.playerName, players.bowler, 'the current bowler');
   const nextAction = toText(
     tacticalRecommendation.nextAction,
@@ -917,6 +1428,7 @@ const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
     'continue with monitored execution and reassess after this over'
   );
   const rationale = toText(
+    tacticalState.reason,
     tacticalRecommendation.why,
     combinedDecision.rationale,
     coachOutput.summary,
@@ -967,6 +1479,14 @@ const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
   const isReliabilityPrompt = /(reliable|reliability|lowest fatigue|fatigue risk|safest (bowler|batter|player)|best condition|ready to bowl|ready to bat|in best condition|lowest injury risk|workload risk|who should bowl|who should bat)/.test(
     normalizedQuestion
   );
+  const isReplacementPrompt =
+    matchesAnyPattern(normalizedQuestion, REPLACEMENT_INTENT_PATTERNS) ||
+    matchesAnyPattern(normalizedQuestion, TACTICAL_QUERY_PATTERNS);
+
+  if (isAlignmentSensitiveQuestion(normalizedQuestion, tacticalState)) {
+    const aligned = buildAlignedTacticalReply(tacticalState, normalizedQuestion);
+    if (aligned) return aligned;
+  }
 
   if (isReliabilityPrompt) {
     const snapshotPlayers = asRecord(payload.matchContextSnapshot).players;
@@ -1000,6 +1520,53 @@ const buildFallbackReply = (userMessage, payload, fallbackReason = '') => {
         return `Based on current recovery and fatigue metrics, ${best.name} appears the most reliable option today. ${best.name}'s fatigue is ${best.fatigue.toFixed(1)}/${best.fatigueLimit.toFixed(1)}, recovery is ${best.recoveryBand}, and injury/no-ball risk remains ${best.injuryRisk}/${best.noBallRisk}. ${comparisonLine}`;
       }
     }
+  }
+
+  if (isReplacementPrompt) {
+    const payloadSnapshot = {
+      players: asRecord(payload.players),
+      matchContextSnapshot: asRecord(payload.matchContextSnapshot),
+    };
+    const rosterNames = collectRosterMetrics(payloadSnapshot)
+      .map((row) => toText(row.name, row.playerName))
+      .filter(Boolean);
+    const mentionedPlayer = resolveMentionedPlayerName(normalizedQuestion, rosterNames);
+    const replacement = resolveReplacementSuggestion(tacticalRecommendation, combinedDecision, coachOutput);
+    const outPlayer = toText(
+      replacement.out,
+      tacticalState.recommendedOutgoingPlayer,
+      tacticalState.recommendedReplacementPlayer,
+      tacticalState.replacementOut,
+      tacticalState.out,
+      mentionedPlayer,
+      playerName
+    );
+    const inPlayer = toText(
+      replacement.in,
+      tacticalState.recommendedIncomingPlayer,
+      tacticalState.replacementIn,
+      tacticalState.in
+    );
+    const reason = clipText(
+      toText(
+        replacement.reason,
+        tacticalState.reason,
+        tacticalState.reasoning,
+        tacticalRecommendation.why,
+        combinedDecision.rationale,
+        coachOutput.summary,
+        rationale,
+        'This is the safest pressure reset based on current workload and control signals.'
+      ),
+      220
+    );
+
+    if (inPlayer) {
+      return `Replace ${outPlayer || playerName} with ${inPlayer} next over. ${reason}`;
+    }
+
+    const directAction = clipText(nextAction, 220);
+    return `Best next-over move: ${directAction}. ${reason}`;
   }
 
   if (/are you sure|are u sure|are you even ai|are u even ai|are you ai/.test(normalizedQuestion)) {
@@ -1072,6 +1639,7 @@ module.exports = async function copilotChat(context, req) {
       matchContext: asRecord(payload.matchContext),
       players: asRecord(payload.players),
       coachOutput: asRecord(payload.coachOutput),
+      tacticalRecommendationState: asRecord(payload.tacticalRecommendationState),
       matchId: toText(payload.matchId),
       sessionId: toText(payload.sessionId),
     };
@@ -1083,6 +1651,7 @@ module.exports = async function copilotChat(context, req) {
       prompt: message,
       historyTurns: history.length,
     });
+    const tacticalState = resolveTacticalRecommendationState(contextSnapshot);
 
     const domain = classifyCopilotDomain(message, history, contextSnapshot);
     context.log?.('[copilot-chat] domain_guard', {
@@ -1100,9 +1669,35 @@ module.exports = async function copilotChat(context, req) {
       sportsDomainHits: domain.sportsDomainHits,
       comparisonDetected: domain.comparisonDetected,
       followUpDetected: domain.followUpDetected,
+      replacementIntentDetected: domain.replacementIntentDetected,
+      tacticalPromptDetected: domain.tacticalPromptDetected,
+      contextPlayerMention: domain.contextPlayerMention,
+      tacticalRecommendationState: tacticalState,
     });
 
     if (domain.handling === 'blocked') {
+      const alignedReply = isAlignmentSensitiveQuestion(message, tacticalState)
+        ? buildAlignedTacticalReply(tacticalState, message)
+        : '';
+      if (alignedReply) {
+        return respond(
+          jsonResponse(
+            200,
+            {
+              ok: true,
+              source: 'ai',
+              mode: 'aligned_tactical',
+              routeCalled,
+              analysisIdUsed,
+              reply: alignedReply,
+              answer: alignedReply,
+              messagesUsed: Math.min(10, countUserTurns(history) + 1),
+            },
+            {},
+            req
+          )
+        );
+      }
       const redirectReply =
         pickReplyVariant(OUT_OF_SCOPE_REPLIES, `${message}:${domain.reason}`) ||
         OUT_OF_SCOPE_REPLIES[0];
@@ -1189,7 +1784,8 @@ module.exports = async function copilotChat(context, req) {
       const fallbackReason = aoai.missing && aoai.missing.length > 0
         ? `missing_config:${aoai.missing.join(',')}`
         : 'aoai_not_available';
-      const reply = buildFallbackReply(message, payload, fallbackReason);
+      const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
+      const reply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
       context.log?.('[copilot-chat] fallback', {
         traceId,
         routeCalled,
@@ -1220,11 +1816,18 @@ module.exports = async function copilotChat(context, req) {
     const systemPrompt = buildCopilotSystemPrompt();
     const signalSummary = buildCopilotSignalSummary(contextSnapshot);
     const structuredContext = buildCopilotContextBlock(contextSnapshot);
+    const tacticalStateJson = compactJson(tacticalState, 1200);
 
     const messages = [
       { role: 'system', content: systemPrompt },
       { role: 'system', content: `High-signal coaching context:\n${signalSummary}` },
       { role: 'system', content: `Structured live context:\n${structuredContext}` },
+      {
+        role: 'system',
+        content:
+          `Tactical recommendation state (prioritize this for immediate move consistency):\n${tacticalStateJson}\n` +
+          'Do not contradict this tactical recommendation when answering replacement/rotation questions.',
+      },
       ...history.map((turn) => ({ role: turn.role, content: turn.content })),
       { role: 'user', content: message },
     ];
@@ -1258,7 +1861,8 @@ module.exports = async function copilotChat(context, req) {
           body,
         });
         const fallbackReason = `aoai_http_${String(status || 'error')}`;
-        const reply = buildFallbackReply(message, payload, fallbackReason);
+        const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
+        const reply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
         return respond(
           jsonResponse(
             200,
@@ -1290,7 +1894,8 @@ module.exports = async function copilotChat(context, req) {
       } catch {
         parsed = {};
       }
-      const reply = extractCompletionText(parsed);
+      const rawReply = extractCompletionText(parsed);
+      const reply = enforceAlignmentOnReply(message, rawReply, tacticalState);
       if (!reply) {
         const fallbackReason = 'aoai_empty_response';
         context.log?.('[copilot-chat] fallback', {
@@ -1299,7 +1904,8 @@ module.exports = async function copilotChat(context, req) {
           source: 'fallback',
           reason: fallbackReason,
         });
-        const fallbackReply = buildFallbackReply(message, payload, fallbackReason);
+        const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
+        const fallbackReply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
         return respond(
           jsonResponse(
             200,
@@ -1357,7 +1963,8 @@ module.exports = async function copilotChat(context, req) {
         reason: fallbackReason,
         ...(typeof status === 'number' ? { status } : {}),
       });
-      const reply = buildFallbackReply(message, payload, fallbackReason);
+      const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
+      const reply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
       return respond(
         jsonResponse(
           200,
