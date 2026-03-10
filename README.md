@@ -1,7 +1,7 @@
 # tactIQ
 
-## Live Demo
-
+## Live Demo : 
+## Demo Video : 
 
 
 ### AI Tactical Coach for Player and Match Decisions
@@ -656,7 +656,7 @@ This creates a **user-scoped player intelligence layer**, allowing tactIQ to bui
 
 ---
 
-## 11. ## Observability & Debug Telemetry
+## 11. Observability & Debug Telemetry
 
 tactIQ includes observability to monitor the AI pipeline and system behavior.
 
