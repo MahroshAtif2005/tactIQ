@@ -46,6 +46,11 @@ It converts match context and player state into coach like actionable guidance.
 tactIQ introduces a router based multi-agent architecture that dynamically selects specialized AI agents based on live match signals.
 Instead of running a single model prompt, the system orchestrates fatigue analysis, injury risk assessment, and tactical reasoning agents to produce explainable coaching decisions.
 
+Quick Rotation
+
+tactIQ includes a quick rotation notification system designed for fast decision making during live matches. When the coach triggers a rotation action, the AI immediately analyzes the current match phase, player fatigue levels, workload, and tactical context.
+
+Instead of requiring the coach to read a full analytical report, tactIQ generates a real-time notification suggesting the next best player substitution from the current roster. This allows coaches to make rapid decisions during high pressure match moments.
 ---
 
 ## Tactical Decision Support
