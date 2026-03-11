@@ -175,6 +175,85 @@ const GREETING_REPLIES = [
   'Hello! Ready when you are. Ask about the next over, bowling options, or player readiness and I will give a match-focused recommendation.',
 ];
 
+const ACKNOWLEDGEMENT_REPLIES = [
+  "Glad to help. Let me know if you'd like to evaluate another bowler or plan the next over.",
+  'Anytime. You can also ask about another player or simulate the next-over strategy.',
+  "Great, happy to help. If you want, I can quickly compare your next two tactical options.",
+];
+
+const CONVERSATION_END_REPLIES = [
+  'Bye! Feel free to come back anytime to analyze another match situation.',
+  "Goodbye. Come back anytime and we'll break down the next match scenario.",
+  'See you soon. I can help again whenever you want to evaluate the next-over decision.',
+];
+
+const ACKNOWLEDGEMENT_EXACT_MATCHES = new Set([
+  'thanks',
+  'thank you',
+  'ok',
+  'okay',
+  'alright',
+  'all right',
+  'ok thanks',
+  'okay thanks',
+  'alright thanks',
+  'all right thanks',
+  'cool thanks',
+  'got it',
+  'got it thanks',
+  'makes sense',
+  'makes sense thanks',
+  'understood',
+  'understood thanks',
+]);
+
+const ACKNOWLEDGEMENT_PATTERNS = [
+  /^(?:ok|okay|alright|all right|cool)\s+(?:thanks|thank you)$/,
+  /^(?:thanks|thank you)(?:\s+(?:ok|okay|alright|got it|makes sense|understood))?$/,
+  /^(?:got it|makes sense|understood)(?:\s+(?:thanks|thank you))?$/,
+];
+
+const CONVERSATION_END_EXACT_MATCHES = new Set([
+  'bye',
+  'goodbye',
+  'see you',
+  'see ya',
+  'cya',
+  'later',
+  'talk later',
+  'bye for now',
+]);
+
+const CONVERSATION_END_PATTERNS = [
+  /^(?:bye|goodbye|see you|see ya|cya|later)[\s!.?]*$/,
+  /^(?:talk|catch)\s+you\s+(?:later|soon)[\s!.?]*$/,
+  /^(?:see\s+you|bye)\s+(?:later|soon|next time)[\s!.?]*$/,
+];
+
+const isAcknowledgementMessage = (message) => {
+  const normalized = normalizeForKeywordMatch(message);
+  if (!normalized) return false;
+  if (normalized.length > 40) return false;
+  if (ACKNOWLEDGEMENT_EXACT_MATCHES.has(normalized)) return true;
+  if (ACKNOWLEDGEMENT_PATTERNS.some((pattern) => pattern.test(normalized))) return true;
+  return false;
+};
+
+const buildAcknowledgementReply = (message) =>
+  pickReplyVariant(ACKNOWLEDGEMENT_REPLIES, `ack:${message}`) || ACKNOWLEDGEMENT_REPLIES[0];
+
+const isConversationEndingMessage = (message) => {
+  const normalized = normalizeForKeywordMatch(message);
+  if (!normalized) return false;
+  if (normalized.length > 42) return false;
+  if (CONVERSATION_END_EXACT_MATCHES.has(normalized)) return true;
+  if (CONVERSATION_END_PATTERNS.some((pattern) => pattern.test(normalized))) return true;
+  return false;
+};
+
+const buildConversationEndingReply = (message) =>
+  pickReplyVariant(CONVERSATION_END_REPLIES, `bye:${message}`) || CONVERSATION_END_REPLIES[0];
+
 const PERFORMANCE_INTENT_KEYWORDS = [
   'reliable',
   'reliability',
@@ -1452,28 +1531,165 @@ const shouldValidatePlayerReferences = (message, domain) => {
   );
 };
 
-const validatePlayerReferencesForMatchContext = (message, snapshot, domain) => {
+const collectBaselineContextPlayerNames = (snapshot) => {
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const names = [];
+  const seen = new Set();
+
+  const pushName = (...values) => {
+    for (const value of values) {
+      const normalized = cleanPlayerName(value);
+      const key = normalizeForKeywordMatch(normalized);
+      if (!key || key.length < 2 || seen.has(key)) continue;
+      seen.add(key);
+      names.push(normalized);
+    }
+  };
+
+  const ingestCollection = (collection) => {
+    if (Array.isArray(collection)) {
+      for (const entry of collection) {
+        if (typeof entry === 'string') {
+          pushName(entry);
+          continue;
+        }
+        const record = asRecord(entry);
+        pushName(record.name, record.playerName, record.displayName);
+      }
+      return;
+    }
+    const recordCollection = asRecord(collection);
+    for (const value of Object.values(recordCollection)) {
+      const record = asRecord(value);
+      if (Object.keys(record).length === 0) continue;
+      pushName(record.name, record.playerName, record.displayName);
+    }
+  };
+
+  ingestCollection(players.baselineModels);
+  ingestCollection(snapshotPlayers.baselineModels);
+  ingestCollection(players.allPlayers);
+  ingestCollection(snapshotPlayers.allPlayers);
+  ingestCollection(players.rosterMetrics);
+  ingestCollection(snapshotPlayers.rosterMetrics);
+  return names;
+};
+
+const collectHistoryMentionedPlayerNames = (history, candidateNames) => {
+  if (!Array.isArray(history) || history.length === 0) return [];
+  const candidates = Array.isArray(candidateNames) ? candidateNames.filter(Boolean) : [];
+  if (candidates.length === 0) return [];
+  const mentioned = new Set();
+
+  const addMention = (value) => {
+    const normalized = cleanPlayerName(value);
+    const key = normalizeForKeywordMatch(normalized);
+    if (!key || key.length < 2) return;
+    mentioned.add(normalized);
+  };
+
+  for (const turn of history) {
+    const content = clipText(asRecord(turn).content, 1000);
+    if (!content) continue;
+    const normalizedContent = normalizeForKeywordMatch(content);
+    const compactContent = compactForKeywordMatch(content);
+
+    for (const candidate of candidates) {
+      const normalizedCandidate = normalizeForKeywordMatch(candidate);
+      if (!normalizedCandidate) continue;
+      if (normalizedContent.includes(normalizedCandidate)) {
+        addMention(candidate);
+        continue;
+      }
+      const compactCandidate = compactForKeywordMatch(candidate);
+      if (compactCandidate && compactContent.includes(compactCandidate)) {
+        addMention(candidate);
+      }
+    }
+
+    const extractedMentions = extractLikelyPlayerReferences(content);
+    for (const mention of extractedMentions) {
+      const matched = resolveReferencedPlayerMatch(mention, candidates);
+      if (matched) {
+        addMention(matched);
+        continue;
+      }
+      // Keep direct mention continuity even when the name is not in current roster/baseline candidates.
+      addMention(mention);
+    }
+
+    const looseMentionMatches = content.matchAll(/\b([a-z]\.\s*[a-z][a-z.'-]+|[a-z][a-z.'-]+\s+[a-z][a-z.'-]+)\b/gi);
+    for (const match of looseMentionMatches) {
+      const looseMention = cleanPlayerName(match[1]);
+      const normalizedLoose = normalizeForKeywordMatch(looseMention);
+      const tokens = normalizedLoose.split(' ').filter(Boolean);
+      if (tokens.length !== 2) continue;
+      const firstToken = tokens[0];
+      const secondToken = tokens[1];
+      const validInitialSurname = firstToken.length === 1 && secondToken.length >= 3;
+      const validTwoPartName =
+        firstToken.length >= 3 &&
+        secondToken.length >= 3 &&
+        !INVALID_PLAYER_MENTION_TOKENS.has(firstToken) &&
+        !INVALID_PLAYER_MENTION_TOKENS.has(secondToken);
+      if (!validInitialSurname && !validTwoPartName) continue;
+      addMention(looseMention);
+    }
+  }
+
+  return Array.from(mentioned);
+};
+
+const validatePlayerReferencesForMatchContext = (message, snapshot, domain, history = []) => {
   if (!shouldValidatePlayerReferences(message, domain)) {
-    return { hasUnknownPlayers: false, unknownPlayers: [] };
+    return { hasUnknownPlayers: false, unknownPlayers: [], bypassedUnknowns: [] };
   }
 
   const availableNames = collectAvailableContextPlayerNames(snapshot);
-  if (availableNames.length === 0) {
-    return { hasUnknownPlayers: false, unknownPlayers: [] };
+  const baselineContextNames = collectBaselineContextPlayerNames(snapshot);
+  const historyCandidateNames = Array.from(new Set([...availableNames, ...baselineContextNames]));
+  const historyMentionedNames = collectHistoryMentionedPlayerNames(history, historyCandidateNames);
+  const searchSpaceNames = Array.from(new Set([
+    ...availableNames,
+    ...baselineContextNames,
+    ...historyMentionedNames,
+  ]));
+  if (searchSpaceNames.length === 0) {
+    return { hasUnknownPlayers: false, unknownPlayers: [], bypassedUnknowns: [] };
   }
 
   const mentions = extractLikelyPlayerReferences(message);
   if (mentions.length === 0) {
-    return { hasUnknownPlayers: false, unknownPlayers: [] };
+    return { hasUnknownPlayers: false, unknownPlayers: [], bypassedUnknowns: [] };
   }
 
   const unknownPlayers = [];
+  const bypassedUnknowns = [];
   for (const mention of mentions) {
     const matchedPlayer = resolveReferencedPlayerMatch(mention, availableNames);
     if (matchedPlayer) continue;
+    const baselineMatched = resolveReferencedPlayerMatch(mention, baselineContextNames);
+    if (baselineMatched) {
+      bypassedUnknowns.push({
+        mention,
+        matchedPlayer: baselineMatched,
+        reason: 'baseline_context_match',
+      });
+      continue;
+    }
+    const historyMatched = resolveReferencedPlayerMatch(mention, historyMentionedNames);
+    if (historyMatched) {
+      bypassedUnknowns.push({
+        mention,
+        matchedPlayer: historyMatched,
+        reason: 'history_match',
+      });
+      continue;
+    }
     unknownPlayers.push({
       mention,
-      suggestion: resolveClosestPlayerSuggestion(mention, availableNames),
+      suggestion: resolveClosestPlayerSuggestion(mention, searchSpaceNames),
     });
   }
 
@@ -1482,6 +1698,10 @@ const validatePlayerReferencesForMatchContext = (message, snapshot, domain) => {
     unknownPlayers,
     mentions,
     availableNames,
+    baselineContextNames,
+    historyMentionedNames,
+    searchSpaceNames,
+    bypassedUnknowns,
   };
 };
 
@@ -2330,6 +2550,58 @@ module.exports = async function copilotChat(context, req) {
     });
     const tacticalState = resolveTacticalRecommendationState(contextSnapshot);
 
+    if (isAcknowledgementMessage(message)) {
+      const acknowledgementReply = buildAcknowledgementReply(message);
+      context.log?.('[copilot-chat] acknowledgement', {
+        traceId,
+        routeCalled,
+        prompt: message,
+      });
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'ai',
+            mode: 'acknowledgement',
+            routeCalled,
+            analysisIdUsed,
+            reply: acknowledgementReply,
+            answer: acknowledgementReply,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+          },
+          {},
+          req
+        )
+      );
+    }
+
+    if (isConversationEndingMessage(message)) {
+      const closingReply = buildConversationEndingReply(message);
+      context.log?.('[copilot-chat] conversation_close', {
+        traceId,
+        routeCalled,
+        prompt: message,
+      });
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'ai',
+            mode: 'conversation_close',
+            routeCalled,
+            analysisIdUsed,
+            reply: closingReply,
+            answer: closingReply,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+          },
+          {},
+          req
+        )
+      );
+    }
+
     const domain = classifyCopilotDomain(message, history, contextSnapshot);
     context.log?.('[copilot-chat] domain_guard', {
       traceId,
@@ -2353,7 +2625,10 @@ module.exports = async function copilotChat(context, req) {
     });
 
     const playerReferenceResolution = resolveAmbiguousPlayerReference(message, contextSnapshot, domain);
-    const bypassBlockedDomainGuard = domain.handling === 'blocked' && playerReferenceResolution.applies;
+    const hasDirectPlayerIntent = shouldValidatePlayerReferences(message, domain)
+      && extractLikelyPlayerReferences(message).length > 0;
+    const bypassBlockedDomainGuard =
+      domain.handling === 'blocked' && (playerReferenceResolution.applies || hasDirectPlayerIntent);
     const intentBucket = classifyMessageIntentBucket(message, domain, playerReferenceResolution);
     const effectiveMessage = playerReferenceResolution.resolvedPlayerName
       ? buildResolvedPlayerPrompt(message, playerReferenceResolution.resolvedPlayerName)
@@ -2364,6 +2639,7 @@ module.exports = async function copilotChat(context, req) {
       intentBucket,
       handling: domain.handling,
       bypassBlockedDomainGuard,
+      hasDirectPlayerIntent,
     });
     if (playerReferenceResolution.applies) {
       context.log?.('[copilot-chat] player_reference_resolution', {
@@ -2404,7 +2680,10 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
-    if (intentBucket === 'OFF_TOPIC' || (domain.handling === 'blocked' && !bypassBlockedDomainGuard)) {
+    if (
+      (intentBucket === 'OFF_TOPIC' && !hasDirectPlayerIntent)
+      || (domain.handling === 'blocked' && !bypassBlockedDomainGuard)
+    ) {
       const redirectReply = OFF_TOPIC_REDIRECT_REPLY;
       return respond(
         jsonResponse(
@@ -2468,7 +2747,23 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
-    const playerValidation = validatePlayerReferencesForMatchContext(message, contextSnapshot, domain);
+    const playerValidation = validatePlayerReferencesForMatchContext(message, contextSnapshot, domain, history);
+    const playerValidationBypasses = asArray(playerValidation.bypassedUnknowns)
+      .map((entry) => {
+        const record = asRecord(entry);
+        return `${toText(record.mention)}=>${toText(record.matchedPlayer)}:${toText(record.reason)}`;
+      })
+      .filter(Boolean);
+    if (playerValidationBypasses.length > 0) {
+      context.log?.('[copilot-chat] player_validation', {
+        traceId,
+        routeCalled,
+        prompt: message,
+        unknownPlayer: undefined,
+        suggestedPlayer: undefined,
+        bypassedUnknowns: playerValidationBypasses,
+      });
+    }
     if (playerValidation.hasUnknownPlayers) {
       const firstUnknown = asRecord(playerValidation.unknownPlayers[0]);
       const unknownName = cleanPlayerName(firstUnknown.mention) || 'that player';
@@ -2482,6 +2777,7 @@ module.exports = async function copilotChat(context, req) {
         prompt: message,
         unknownPlayer: unknownName,
         suggestedPlayer: suggestion || undefined,
+        bypassedUnknowns: playerValidationBypasses,
       });
       return respond(
         jsonResponse(
