@@ -553,6 +553,7 @@ In this mode, the orchestrator executes **all agents in parallel**, generating a
 ---
 
 The combined agent outputs are then merged into a **final explainable recommendation**, which is returned to the coaching interface and the **Copilot conversational layer**.
+
 ---
 
 ## 6. Specialist AI Agents
