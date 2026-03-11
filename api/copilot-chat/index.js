@@ -163,11 +163,11 @@ const parseUpstreamCode = (rawBody) => {
   }
 };
 
-const OUT_OF_SCOPE_REPLIES = [
-  "I specialize in cricket and sports performance analysis. If you'd like help planning the next over or managing fatigue risk, I'd be happy to help.",
-  'I can help with cricket strategy, workload, fatigue, recovery, and sports coaching decisions. Share your match situation and I can suggest the best next move.',
-  "I'm focused on cricket and sports tactics. Ask about match strategy, player readiness, or workload and I'll help you plan it.",
-];
+const OFF_TOPIC_REDIRECT_REPLY =
+  "I'm focused on the current match state, player risk, substitutions, and tactical decisions. Ask me about the selected player or next-over plan.";
+
+const NO_ACTIVE_PLAYER_REPLY =
+  "I need a selected player to assess that. Choose a player from the roster and I'll evaluate their workload, risk, and next-over decision.";
 
 const GREETING_REPLIES = [
   "Hey! I'm the tactIQ coaching assistant. Ask me anything about match tactics, fatigue, or player workload in this match.",
@@ -482,6 +482,7 @@ const REPLACEMENT_INTENT_PATTERNS = [
   /\bsub(?:stitute)?\s+in\s+.+\s+for\b/,
   /\btake\s+.+\s+off\b/,
   /\bbring\s+.+\s+in\b/,
+  /\bbring\s+.+\s+to\s+(?:bowl|bat)\b/,
   /\bnext\s+bowler\b/,
   /\bwho\s+after\b/,
 ];
@@ -846,21 +847,17 @@ const classifyCopilotDomain = (message, history, snapshot) => {
 
 const buildCopilotSystemPrompt = () =>
   [
-    'You are tactIQ Coach Copilot, a cricket tactical and performance intelligence assistant.',
-    'You can answer live match tactical questions, bowling strategy, field placement, fatigue/workload management, multi-over planning, and general cricket strategy questions.',
-    'Allow short greetings and casual conversation naturally.',
-    'If match data is available, incorporate it directly.',
-    'If match data is not available, still answer using cricket expertise and best practices.',
-    'Never refuse a valid cricket question.',
-    'Only refuse questions that are clearly unrelated to cricket or sports.',
-    'Keep responses concise, conversational, and coach-facing.',
-    'When possible, steer the conversation back to match strategy and next-over decisions.',
-    'Treat the tactical recommendation engine output as the primary decision source for immediate rotation/substitution choices.',
+    'You are Tactical Coach AI inside the tactIQ live cricket decision-support app.',
+    'Answer only within the scope of current match state, selected player fitness/workload/risk, substitutions, next-over tactics, bowling decisions, and matchup recommendations.',
+    'Use provided live UI context as the source of truth for every answer, including the first user message.',
+    'If the user says "he", "him", "the player", or "this bowler", resolve that to the active selected player when one exists.',
+    'If the question is ambiguous and no active player exists, ask for player selection instead of guessing.',
+    'Treat tactical recommendation engine output as the primary decision source for immediate rotation/substitution choices.',
     'Do not contradict an explicit recommended replacement (out/in) provided in context.',
-    'If users ask about the outgoing player, acknowledge strengths briefly but explain why rotation is still recommended now.',
-    'When relevant, explicitly restate the recommended move and confidence from the tactical recommendation state.',
-    'Synthesize a fresh conversational answer; do not paste raw recommendation blocks unless the user explicitly asks for a full breakdown.',
-    'Keep tactical answers concise by default (1-3 core reasons), and expand only when asked for detailed reasoning.',
+    'If the user asks why rotation is recommended, acknowledge strengths briefly but explain why the rotation is still safer now.',
+    'Keep responses concise, conversational, and coach-facing.',
+    'Synthesize a fresh answer; do not paste raw recommendation blocks unless the user explicitly asks for full detail.',
+    'If a question is unrelated to match/tactical context, do not answer as a general chatbot; redirect to match-related help.',
   ].join(' ');
 
 const buildCopilotSignalSummary = (snapshot) => {
@@ -1162,6 +1159,686 @@ const resolveMentionedPlayerName = (question, names) => {
     if (compactName.length >= 3 && compactQuestion.includes(compactName)) return name;
   }
   return '';
+};
+
+const collectAvailableContextPlayerNames = (snapshot) => {
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const matchContext = asRecord(snapshot.matchContext);
+  const snapshotMatchContext = asRecord(asRecord(snapshot.matchContextSnapshot).matchContext);
+  const names = [];
+  const seen = new Set();
+
+  const pushName = (...values) => {
+    for (const value of values) {
+      const normalized = cleanPlayerName(value);
+      const key = normalizeForKeywordMatch(normalized);
+      if (!key || key.length < 2 || seen.has(key)) continue;
+      seen.add(key);
+      names.push(normalized);
+    }
+  };
+
+  const ingestNameList = (source) => {
+    if (!Array.isArray(source)) return;
+    for (const entry of source) {
+      if (typeof entry === 'string') {
+        pushName(entry);
+        continue;
+      }
+      const record = asRecord(entry);
+      pushName(record.name, record.playerName, record.displayName);
+    }
+  };
+
+  const rosterRows = collectRosterMetrics(snapshot);
+  for (const row of rosterRows) {
+    pushName(row.name, row.playerName, row.displayName);
+  }
+
+  ingestNameList(players.bench);
+  ingestNameList(snapshotPlayers.bench);
+  ingestNameList(matchContext.bench);
+  ingestNameList(snapshotMatchContext.bench);
+
+  const snapshotNames = collectSnapshotPlayerNames(snapshot);
+  for (const name of snapshotNames) {
+    pushName(name);
+  }
+
+  return names;
+};
+
+const PLAYER_REFERENCE_EXTRACT_PATTERNS = [
+  /\bwho\s+(?:should|do)\s+i\s+change\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+with\b/i,
+  /\bwho\s+should\s+replace\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\breplace\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+with\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\bchange\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+with\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\bswap\s+(?:out\s+)?([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+(?:for|with)\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\bbring\s+(?:in\s+)?([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+for\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\bbring\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+to\s+(?:bowl|bat)\b/i,
+  /\bsub(?:stitute)?\s+(?:in\s+)?([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\bswitch\s+to\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\b(?:continue|keep|stick)\s+with\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+  /\btake\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+off\b/i,
+  /\b([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\s+vs\.?\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2})\b/i,
+];
+
+const INVALID_PLAYER_MENTION_TOKENS = new Set([
+  'bowler',
+  'batter',
+  'batters',
+  'batsman',
+  'batsmen',
+  'player',
+  'players',
+  'spinner',
+  'spinners',
+  'pacer',
+  'pacers',
+  'seamer',
+  'seamers',
+  'allrounder',
+  'all rounder',
+  'match',
+  'team',
+  'squad',
+  'bench',
+  'over',
+  'overs',
+  'phase',
+  'plan',
+  'risk',
+  'fatigue',
+  'workload',
+  'injury',
+  'control',
+  'pressure',
+  'option',
+  'options',
+  'current',
+  'he',
+  'him',
+  'his',
+  'her',
+  'hers',
+  'they',
+  'them',
+  'their',
+  'next',
+  'this',
+  'following',
+  'coming',
+]);
+
+const sanitizeMentionCandidate = (value) => {
+  const cleaned = sanitizeSwapName(value);
+  if (!cleaned) return '';
+  const normalized = normalizeForKeywordMatch(cleaned);
+  if (!normalized) return '';
+  if (INVALID_PLAYER_MENTION_TOKENS.has(normalized)) return '';
+  if (normalized.split(' ').every((token) => INVALID_PLAYER_MENTION_TOKENS.has(token))) return '';
+  return cleaned;
+};
+
+const extractLikelyPlayerReferences = (message) => {
+  const rawText = String(message || '').trim();
+  if (!rawText) return [];
+  const mentions = [];
+  const seen = new Set();
+
+  const pushMention = (value) => {
+    const cleaned = sanitizeMentionCandidate(value);
+    if (!cleaned) return;
+    const key = normalizeForKeywordMatch(cleaned);
+    if (!key || key.length < 3 || seen.has(key)) return;
+    seen.add(key);
+    mentions.push(cleaned);
+  };
+
+  const parsedSwap = extractSwapFromText(rawText);
+  pushMention(parsedSwap.out);
+  pushMention(parsedSwap.in);
+
+  for (const basePattern of PLAYER_REFERENCE_EXTRACT_PATTERNS) {
+    const flags = basePattern.flags.includes('g') ? basePattern.flags : `${basePattern.flags}g`;
+    const pattern = new RegExp(basePattern.source, flags);
+    let match;
+    while ((match = pattern.exec(rawText)) !== null) {
+      for (let index = 1; index < match.length; index += 1) {
+        pushMention(match[index]);
+      }
+      if (pattern.lastIndex === match.index) {
+        pattern.lastIndex += 1;
+      }
+    }
+  }
+
+  return mentions;
+};
+
+const resolveReferencedPlayerMatch = (mention, availableNames) => {
+  const normalizedMention = normalizeForKeywordMatch(mention);
+  const compactMention = compactForKeywordMatch(mention);
+  if (!normalizedMention) return '';
+
+  for (const name of availableNames) {
+    const normalizedName = normalizeForKeywordMatch(name);
+    if (!normalizedName) continue;
+    if (normalizedName === normalizedMention) return name;
+  }
+
+  for (const name of availableNames) {
+    const compactName = compactForKeywordMatch(name);
+    if (!compactName || !compactMention) continue;
+    if (compactName === compactMention) return name;
+  }
+
+  const mentionTokens = normalizedMention.split(' ').filter(Boolean);
+  if (mentionTokens.length === 1 && mentionTokens[0].length >= 3) {
+    const token = mentionTokens[0];
+    for (const name of availableNames) {
+      const normalizedName = normalizeForKeywordMatch(name);
+      if (!normalizedName) continue;
+      const nameTokens = normalizedName.split(' ').filter(Boolean);
+      if (nameTokens.includes(token) || nameTokens[nameTokens.length - 1] === token) return name;
+    }
+  }
+
+  if (mentionTokens.length >= 2) {
+    const mentionFirst = mentionTokens[0];
+    const mentionLast = mentionTokens[mentionTokens.length - 1];
+    for (const name of availableNames) {
+      const normalizedName = normalizeForKeywordMatch(name);
+      if (!normalizedName) continue;
+      const nameTokens = normalizedName.split(' ').filter(Boolean);
+      const nameFirst = nameTokens[0] || '';
+      const nameLast = nameTokens[nameTokens.length - 1] || '';
+      const firstMatches =
+        mentionFirst === nameFirst ||
+        (mentionFirst.length === 1 && nameFirst.startsWith(mentionFirst)) ||
+        (nameFirst.length === 1 && mentionFirst.startsWith(nameFirst));
+      if (mentionLast.length >= 3 && mentionLast === nameLast && firstMatches) {
+        return name;
+      }
+    }
+  }
+
+  for (const name of availableNames) {
+    const normalizedName = normalizeForKeywordMatch(name);
+    if (!normalizedName || normalizedName.length < 4 || normalizedMention.length < 4) continue;
+    if (normalizedName.includes(normalizedMention) || normalizedMention.includes(normalizedName)) {
+      return name;
+    }
+  }
+
+  return '';
+};
+
+const computeEditDistance = (leftValue, rightValue) => {
+  const left = String(leftValue || '');
+  const right = String(rightValue || '');
+  if (!left) return right.length;
+  if (!right) return left.length;
+  const rows = left.length + 1;
+  const cols = right.length + 1;
+  const table = Array.from({ length: rows }, () => Array(cols).fill(0));
+  for (let row = 0; row < rows; row += 1) table[row][0] = row;
+  for (let col = 0; col < cols; col += 1) table[0][col] = col;
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      const substitutionCost = left[row - 1] === right[col - 1] ? 0 : 1;
+      table[row][col] = Math.min(
+        table[row - 1][col] + 1,
+        table[row][col - 1] + 1,
+        table[row - 1][col - 1] + substitutionCost
+      );
+    }
+  }
+  return table[rows - 1][cols - 1];
+};
+
+const resolveClosestPlayerSuggestion = (mention, availableNames) => {
+  if (!Array.isArray(availableNames) || availableNames.length === 0) return '';
+  const normalizedMention = normalizeForKeywordMatch(mention);
+  if (!normalizedMention) return '';
+
+  const mentionTokens = normalizedMention.split(' ').filter(Boolean);
+  const mentionLast = mentionTokens[mentionTokens.length - 1] || '';
+  if (mentionLast.length >= 3) {
+    const surnameMatches = availableNames.filter((candidate) => {
+      const tokens = normalizeForKeywordMatch(candidate).split(' ').filter(Boolean);
+      return tokens[tokens.length - 1] === mentionLast;
+    });
+    if (surnameMatches.length === 1) return surnameMatches[0];
+    if (surnameMatches.length > 1 && mentionTokens[0]) {
+      const mentionFirst = mentionTokens[0];
+      const initialMatch = surnameMatches.find((candidate) => {
+        const firstToken = normalizeForKeywordMatch(candidate).split(' ').filter(Boolean)[0] || '';
+        return firstToken.startsWith(mentionFirst.charAt(0));
+      });
+      if (initialMatch) return initialMatch;
+    }
+  }
+
+  let bestCandidate = '';
+  let bestDistance = Number.POSITIVE_INFINITY;
+  const compactMention = compactForKeywordMatch(mention);
+  for (const candidate of availableNames) {
+    const compactCandidate = compactForKeywordMatch(candidate);
+    if (!compactCandidate) continue;
+    const distance = computeEditDistance(compactMention, compactCandidate);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestCandidate = candidate;
+    }
+  }
+
+  if (!bestCandidate) return '';
+  const maxLength = Math.max(compactMention.length, compactForKeywordMatch(bestCandidate).length);
+  const threshold = Math.max(1, Math.floor(maxLength * 0.4));
+  return bestDistance <= threshold ? bestCandidate : '';
+};
+
+const shouldValidatePlayerReferences = (message, domain) => {
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  if (!normalizedMessage) return false;
+  const liveScopeHits = Array.isArray(domain.liveScopeHits) ? domain.liveScopeHits : [];
+  if (domain.replacementIntentDetected || domain.tacticalPromptDetected || liveScopeHits.length > 0) {
+    return true;
+  }
+  return /\b(?:bring|replace|change|swap|sub(?:stitute)?|switch|rotate|take|continue|keep|rest)\b/.test(
+    normalizedMessage
+  );
+};
+
+const validatePlayerReferencesForMatchContext = (message, snapshot, domain) => {
+  if (!shouldValidatePlayerReferences(message, domain)) {
+    return { hasUnknownPlayers: false, unknownPlayers: [] };
+  }
+
+  const availableNames = collectAvailableContextPlayerNames(snapshot);
+  if (availableNames.length === 0) {
+    return { hasUnknownPlayers: false, unknownPlayers: [] };
+  }
+
+  const mentions = extractLikelyPlayerReferences(message);
+  if (mentions.length === 0) {
+    return { hasUnknownPlayers: false, unknownPlayers: [] };
+  }
+
+  const unknownPlayers = [];
+  for (const mention of mentions) {
+    const matchedPlayer = resolveReferencedPlayerMatch(mention, availableNames);
+    if (matchedPlayer) continue;
+    unknownPlayers.push({
+      mention,
+      suggestion: resolveClosestPlayerSuggestion(mention, availableNames),
+    });
+  }
+
+  return {
+    hasUnknownPlayers: unknownPlayers.length > 0,
+    unknownPlayers,
+    mentions,
+    availableNames,
+  };
+};
+
+const AMBIGUOUS_PLAYER_REFERENCE_PATTERNS = [
+  /\bthe player\b/,
+  /\bthis player\b/,
+  /\bthat player\b/,
+  /\bthis bowler\b/,
+  /\bthat bowler\b/,
+  /\bcurrent player\b/,
+  /\bcurrent bowler\b/,
+  /\bis he\b/,
+  /\bis him\b/,
+  /\bshould he\b/,
+  /\bcan he continue\b/,
+  /\bshould i rotate him\b/,
+  /\bcan him continue\b/,
+];
+
+const AMBIGUOUS_PLAYER_INTENT_PATTERNS = [
+  /\b(?:continue|bowl|bat|replace|change|swap|sub(?:stitute)?|switch|rotate|rest|remove|assess|evaluate)\b/,
+  /\b(?:unfit|fit|injur|risk|fatigue|strain|recovery|workload|availability)\b/,
+  /\b(?:next over|next bowler|spell)\b/,
+];
+
+const normalizeRiskToken = (value) => {
+  const token = String(value || '').trim().toUpperCase();
+  if (token === 'CRITICAL') return 'CRITICAL';
+  if (token === 'HIGH') return 'HIGH';
+  if (token === 'MED' || token === 'MEDIUM') return 'MEDIUM';
+  if (token === 'LOW') return 'LOW';
+  return '';
+};
+
+const deriveFlaggedPlayerState = (row) => {
+  const availabilityToken = String(toText(row.availabilityStatus, row.status, row.markedFitStatus) || '').trim().toUpperCase();
+  const isUnfit = Boolean(row.isUnfit) || Boolean(row.isInjured) || availabilityToken === 'UNFIT';
+  if (isUnfit) return { bucket: 'unfit', status: 'unfit' };
+
+  const injuryRisk = normalizeRiskToken(row.injuryRisk);
+  if (injuryRisk === 'CRITICAL') return { bucket: 'critical', status: 'critical injury risk' };
+
+  const substitutionRequired = Boolean(row.substitutionRequired);
+  if (substitutionRequired || availabilityToken === 'UNAVAILABLE') {
+    return { bucket: 'limited', status: 'substitution required' };
+  }
+
+  const fatigue = Number(row.fatigueIndex);
+  const fatigueLimit = Number(row.fatigueLimit);
+  const strain = Number(row.strainIndex);
+  const hasElevatedWorkload =
+    availabilityToken === 'LIMITED' ||
+    availabilityToken === 'TACTICAL_RISK' ||
+    (Number.isFinite(fatigue) && Number.isFinite(fatigueLimit) && fatigueLimit > 0 && fatigue >= fatigueLimit) ||
+    (Number.isFinite(strain) && strain >= 7);
+  if (hasElevatedWorkload) return { bucket: 'limited', status: 'elevated workload' };
+
+  return null;
+};
+
+const buildPlayerReferenceResolutionContext = (snapshot) => {
+  const telemetry = asRecord(snapshot.telemetry);
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const rosterRows = collectRosterMetrics(snapshot);
+
+  const selectedPlayerId = toText(telemetry.playerId, telemetry.id);
+  const selectedPlayerNameHint = toText(
+    telemetry.playerName,
+    players.selectedBowler,
+    snapshotPlayers.selectedBowler,
+    players.selectedBatter,
+    snapshotPlayers.selectedBatter,
+    players.bowler,
+    snapshotPlayers.bowler,
+    players.striker,
+    snapshotPlayers.striker
+  );
+
+  let activeRow = rosterRows.find((entry) => asRecord(entry).active === true);
+  if (!activeRow && selectedPlayerId) {
+    activeRow = rosterRows.find((entry) => toText(asRecord(entry).id) === selectedPlayerId);
+  }
+  if (!activeRow && selectedPlayerNameHint) {
+    const selectedNameToken = normalizeForKeywordMatch(selectedPlayerNameHint);
+    activeRow = rosterRows.find(
+      (entry) => normalizeForKeywordMatch(toText(asRecord(entry).name, asRecord(entry).playerName)) === selectedNameToken
+    );
+  }
+
+  const activeName = toText(asRecord(activeRow).name, asRecord(activeRow).playerName, selectedPlayerNameHint);
+  const activeId = toText(asRecord(activeRow).id, selectedPlayerId);
+
+  const flaggedPlayers = [];
+  const unfitPlayers = [];
+  const criticalPlayers = [];
+  const limitedPlayers = [];
+  const seen = new Set();
+  for (const row of rosterRows) {
+    const record = asRecord(row);
+    const name = toText(record.name, record.playerName);
+    if (!name) continue;
+    const key = normalizeForKeywordMatch(name);
+    if (!key || seen.has(key)) continue;
+
+    const flaggedState = deriveFlaggedPlayerState(record);
+    if (!flaggedState) continue;
+
+    const playerFlag = {
+      name,
+      status: flaggedState.status,
+      id: toText(record.id),
+    };
+    flaggedPlayers.push(playerFlag);
+    seen.add(key);
+    if (flaggedState.bucket === 'unfit') unfitPlayers.push(playerFlag);
+    if (flaggedState.bucket === 'critical') criticalPlayers.push(playerFlag);
+    if (flaggedState.bucket === 'limited') limitedPlayers.push(playerFlag);
+  }
+
+  return {
+    activePlayer: activeName
+      ? {
+          id: activeId,
+          name: activeName,
+        }
+      : null,
+    selectedPlayerId: activeId,
+    flaggedPlayers,
+    unfitPlayers,
+    criticalPlayers,
+    limitedPlayers,
+  };
+};
+
+const hasAmbiguousPlayerReference = (message, snapshot, domain) => {
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  if (!normalizedMessage) return false;
+  const hasExplicitNameMention = hasContextPlayerMention(message, snapshot);
+  if (hasExplicitNameMention) return false;
+
+  const hasNamedMentions = extractLikelyPlayerReferences(message).length > 0;
+  if (hasNamedMentions) return false;
+
+  const hasAmbiguousCue = AMBIGUOUS_PLAYER_REFERENCE_PATTERNS.some((pattern) => pattern.test(normalizedMessage))
+    || /\b(?:he|him|his)\b/.test(normalizedMessage);
+  if (!hasAmbiguousCue) return false;
+
+  const liveScopeHits = Array.isArray(domain?.liveScopeHits) ? domain.liveScopeHits : [];
+  const hasDomainIntent =
+    Boolean(domain?.replacementIntentDetected) ||
+    Boolean(domain?.tacticalPromptDetected) ||
+    liveScopeHits.length > 0 ||
+    AMBIGUOUS_PLAYER_INTENT_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
+
+  return hasDomainIntent;
+};
+
+const formatFlaggedPlayerCandidates = (players) => {
+  const labels = asArray(players)
+    .map((entry) => {
+      const record = asRecord(entry);
+      const name = toText(record.name);
+      const status = toText(record.status);
+      if (!name) return '';
+      return status ? `${name} (${status})` : name;
+    })
+    .filter(Boolean)
+    .slice(0, 4);
+  if (labels.length === 0) return '';
+  if (labels.length === 1) return labels[0];
+  if (labels.length === 2) return `${labels[0]} and ${labels[1]}`;
+  return `${labels.slice(0, -1).join(', ')}, and ${labels[labels.length - 1]}`;
+};
+
+const buildResolvedPlayerPrompt = (message, playerName) => {
+  const baseMessage = String(message || '').trim();
+  const resolvedName = toText(playerName);
+  if (!baseMessage || !resolvedName) return baseMessage;
+  const normalizedMessage = normalizeForKeywordMatch(baseMessage);
+  const normalizedName = normalizeForKeywordMatch(resolvedName);
+  if (normalizedName && normalizedMessage.includes(normalizedName)) {
+    return baseMessage;
+  }
+  return `${baseMessage}\n\nResolved player reference: ${resolvedName}.`;
+};
+
+const applyResolutionAssumptionToReply = (reply, resolution) => {
+  const baseReply = String(reply || '').trim();
+  if (!baseReply) return baseReply;
+  const assumptionPrefix = toText(resolution?.assumptionPrefix);
+  if (!assumptionPrefix) return baseReply;
+  const normalizedReply = normalizeForKeywordMatch(baseReply);
+  const normalizedPrefix = normalizeForKeywordMatch(assumptionPrefix);
+  if (normalizedPrefix && normalizedReply.startsWith(normalizedPrefix)) return baseReply;
+  return `${assumptionPrefix} ${baseReply}`.trim();
+};
+
+const resolveAmbiguousPlayerReference = (message, snapshot, domain) => {
+  const resolutionContext = buildPlayerReferenceResolutionContext(snapshot);
+  if (!hasAmbiguousPlayerReference(message, snapshot, domain)) {
+    return {
+      applies: false,
+      context: resolutionContext,
+    };
+  }
+
+  const activePlayerName = toText(asRecord(resolutionContext.activePlayer).name);
+  if (activePlayerName) {
+    return {
+      applies: true,
+      resolvedPlayerName: activePlayerName,
+      resolutionSource: 'active_selected_player',
+      context: resolutionContext,
+    };
+  }
+
+  const flaggedPlayers = asArray(resolutionContext.flaggedPlayers);
+  if (flaggedPlayers.length === 1) {
+    const candidate = asRecord(flaggedPlayers[0]);
+    const candidateName = toText(candidate.name);
+    if (candidateName) {
+      return {
+        applies: true,
+        resolvedPlayerName: candidateName,
+        resolutionSource: 'single_flagged_player',
+        assumptionPrefix: `If you mean ${candidateName},`,
+        context: resolutionContext,
+      };
+    }
+  }
+
+  if (flaggedPlayers.length > 1) {
+    const candidateSummary = formatFlaggedPlayerCandidates(flaggedPlayers);
+    return {
+      applies: true,
+      needsClarification: true,
+      clarificationReply: candidateSummary
+        ? `I see multiple flagged players right now: ${candidateSummary}. Which player should I assess?`
+        : NO_ACTIVE_PLAYER_REPLY,
+      resolutionSource: 'multiple_flagged_players',
+      context: resolutionContext,
+    };
+  }
+
+  return {
+    applies: true,
+    needsClarification: true,
+    clarificationReply: NO_ACTIVE_PLAYER_REPLY,
+    resolutionSource: 'no_resolution_candidate',
+    context: resolutionContext,
+  };
+};
+
+const HISTORICAL_TRIVIA_PATTERNS = [
+  /\bwho\s+won\b/,
+  /\bwhen\s+did\b/,
+  /\bwhat\s+happened\s+in\b/,
+  /\bworld\s+cup\b.*\b(?:19|20)\d{2}\b/,
+  /\b(?:19|20)\d{2}\b.*\bworld\s+cup\b/,
+];
+
+const isHistoricalTriviaQuestion = (normalizedMessage) => {
+  if (!normalizedMessage) return false;
+  return HISTORICAL_TRIVIA_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
+};
+
+const classifyMessageIntentBucket = (message, domain, playerResolution) => {
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  if (!normalizedMessage) return 'OFF_TOPIC';
+
+  const liveScopeHits = Array.isArray(domain.liveScopeHits) ? domain.liveScopeHits : [];
+  const cricketEntityHits = Array.isArray(domain.cricketEntityHits) ? domain.cricketEntityHits : [];
+  const performanceIntentHits = Array.isArray(domain.performanceIntentHits) ? domain.performanceIntentHits : [];
+  const tacticalSignal =
+    Boolean(domain.replacementIntentDetected) ||
+    Boolean(domain.tacticalPromptDetected) ||
+    Boolean(domain.contextPlayerMention) ||
+    liveScopeHits.length > 0 ||
+    performanceIntentHits.length > 0 ||
+    cricketEntityHits.length > 0;
+
+  if (isHistoricalTriviaQuestion(normalizedMessage)) {
+    return 'OFF_TOPIC';
+  }
+
+  if (domain.handling === 'blocked' && !playerResolution.applies) {
+    return 'OFF_TOPIC';
+  }
+
+  if (
+    playerResolution.applies &&
+    (Boolean(playerResolution.resolvedPlayerName) || Boolean(playerResolution.needsClarification))
+  ) {
+    return 'AMBIGUOUS_BUT_POSSIBLY_MATCH_RELATED';
+  }
+
+  if (tacticalSignal || domain.handling === 'full' || domain.handling === 'domain_redirect') {
+    return 'MATCH_RELATED';
+  }
+
+  return 'OFF_TOPIC';
+};
+
+const buildActivePlayerGroundingContext = (snapshot, tacticalState) => {
+  const telemetry = asRecord(snapshot.telemetry);
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const matchContext = asRecord(snapshot.matchContext);
+  const snapshotContext = asRecord(asRecord(snapshot.matchContextSnapshot).matchContext);
+
+  const activePlayerName = toText(
+    telemetry.playerName,
+    players.selectedBowler,
+    snapshotPlayers.selectedBowler,
+    players.selectedBatter,
+    snapshotPlayers.selectedBatter,
+    players.bowler,
+    snapshotPlayers.bowler
+  );
+  const activePlayerRole = toText(telemetry.role, 'unknown');
+  const activePlayerStatus = toText(
+    telemetry.availabilityStatus,
+    telemetry.markedFitStatus,
+    telemetry.status,
+    Boolean(telemetry.isUnfit) || normalizeRiskToken(telemetry.injuryRisk) === 'CRITICAL' ? 'UNFIT' : 'AVAILABLE'
+  );
+
+  const currentRecommendation = toText(
+    tacticalState.recommendedMove,
+    tacticalState.tacticalPlan,
+    tacticalState.reason,
+    'n/a'
+  );
+
+  const lines = [
+    `activePlayerName=${toText(activePlayerName, 'n/a')}`,
+    `activePlayerRole=${toText(activePlayerRole, 'n/a')}`,
+    `activePlayerStatus=${toText(activePlayerStatus, 'n/a')}`,
+    `oversBowled=${toText(telemetry.oversBowled, 'n/a')}`,
+    `fatigueIndex=${toText(telemetry.fatigueIndex, 'n/a')}`,
+    `injuryRisk=${toText(telemetry.injuryRisk, 'n/a')}`,
+    `recoveryStatus=${toText(telemetry.heartRateRecovery, 'n/a')}`,
+    `controlRisk=${toText(telemetry.noBallRisk, telemetry.controlRisk, 'n/a')}`,
+    `currentRecommendation=${currentRecommendation}`,
+    `score=${toText(matchContext.scoreRuns, matchContext.score, snapshotContext.scoreRuns, snapshotContext.score, 'n/a')}`,
+    `wickets=${toText(matchContext.wickets, snapshotContext.wickets, 'n/a')}`,
+    `target=${toText(matchContext.target, snapshotContext.target, 'n/a')}`,
+    `over=${toText(matchContext.overs, snapshotContext.overs, 'n/a')}`,
+    `phase=${toText(matchContext.phase, snapshotContext.phase, 'n/a')}`,
+    `mode=${toText(matchContext.matchMode, snapshotContext.matchMode, 'n/a')}`,
+    activePlayerName
+      ? `pronounRule=When the user says he/him/the player/this bowler, resolve to ${activePlayerName}.`
+      : 'pronounRule=No active player selected; ask for player selection if reference is ambiguous.',
+  ];
+
+  return lines.join('\n');
 };
 
 const toConfidenceLabel = (value) => {
@@ -1675,32 +2352,60 @@ module.exports = async function copilotChat(context, req) {
       tacticalRecommendationState: tacticalState,
     });
 
-    if (domain.handling === 'blocked') {
-      const alignedReply = isAlignmentSensitiveQuestion(message, tacticalState)
-        ? buildAlignedTacticalReply(tacticalState, message)
-        : '';
-      if (alignedReply) {
-        return respond(
-          jsonResponse(
-            200,
-            {
-              ok: true,
-              source: 'ai',
-              mode: 'aligned_tactical',
-              routeCalled,
-              analysisIdUsed,
-              reply: alignedReply,
-              answer: alignedReply,
-              messagesUsed: Math.min(10, countUserTurns(history) + 1),
-            },
-            {},
-            req
-          )
-        );
-      }
-      const redirectReply =
-        pickReplyVariant(OUT_OF_SCOPE_REPLIES, `${message}:${domain.reason}`) ||
-        OUT_OF_SCOPE_REPLIES[0];
+    const playerReferenceResolution = resolveAmbiguousPlayerReference(message, contextSnapshot, domain);
+    const bypassBlockedDomainGuard = domain.handling === 'blocked' && playerReferenceResolution.applies;
+    const intentBucket = classifyMessageIntentBucket(message, domain, playerReferenceResolution);
+    const effectiveMessage = playerReferenceResolution.resolvedPlayerName
+      ? buildResolvedPlayerPrompt(message, playerReferenceResolution.resolvedPlayerName)
+      : message;
+    context.log?.('[copilot-chat] intent', {
+      traceId,
+      routeCalled,
+      intentBucket,
+      handling: domain.handling,
+      bypassBlockedDomainGuard,
+    });
+    if (playerReferenceResolution.applies) {
+      context.log?.('[copilot-chat] player_reference_resolution', {
+        traceId,
+        routeCalled,
+        prompt: message,
+        resolutionSource: playerReferenceResolution.resolutionSource || 'resolved',
+        resolvedPlayerName: toText(playerReferenceResolution.resolvedPlayerName) || undefined,
+        needsClarification: Boolean(playerReferenceResolution.needsClarification),
+        selectedPlayerId: toText(asRecord(playerReferenceResolution.context).selectedPlayerId) || undefined,
+        activePlayer: toText(asRecord(asRecord(playerReferenceResolution.context).activePlayer).name) || undefined,
+        flaggedPlayers: asArray(asRecord(playerReferenceResolution.context).flaggedPlayers)
+          .map((entry) => `${toText(asRecord(entry).name)}:${toText(asRecord(entry).status)}`)
+          .filter(Boolean),
+      });
+    }
+
+    if (domain.handling === 'greeting') {
+      const greetingReply =
+        pickReplyVariant(GREETING_REPLIES, `${message}:${history.length}`) ||
+        GREETING_REPLIES[0];
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'ai',
+            mode: 'domain_greeting',
+            routeCalled,
+            analysisIdUsed,
+            reply: greetingReply,
+            answer: greetingReply,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+          },
+          {},
+          req
+        )
+      );
+    }
+
+    if (intentBucket === 'OFF_TOPIC' || (domain.handling === 'blocked' && !bypassBlockedDomainGuard)) {
+      const redirectReply = OFF_TOPIC_REDIRECT_REPLY;
       return respond(
         jsonResponse(
           200,
@@ -1721,21 +2426,19 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
-    if (domain.handling === 'greeting') {
-      const greetingReply =
-        pickReplyVariant(GREETING_REPLIES, `${message}:${history.length}`) ||
-        GREETING_REPLIES[0];
+    if (playerReferenceResolution.needsClarification) {
+      const clarificationReply = toText(playerReferenceResolution.clarificationReply, 'Which player do you mean?');
       return respond(
         jsonResponse(
           200,
           {
             ok: true,
             source: 'ai',
-            mode: 'domain_greeting',
+            mode: 'player_reference_clarify',
             routeCalled,
             analysisIdUsed,
-            reply: greetingReply,
-            answer: greetingReply,
+            reply: clarificationReply,
+            answer: clarificationReply,
             messagesUsed: Math.min(10, countUserTurns(history) + 1),
           },
           {},
@@ -1765,6 +2468,40 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
+    const playerValidation = validatePlayerReferencesForMatchContext(message, contextSnapshot, domain);
+    if (playerValidation.hasUnknownPlayers) {
+      const firstUnknown = asRecord(playerValidation.unknownPlayers[0]);
+      const unknownName = cleanPlayerName(firstUnknown.mention) || 'that player';
+      const suggestion = cleanPlayerName(firstUnknown.suggestion);
+      const validationReply = suggestion
+        ? `I can't evaluate ${unknownName} because that player is not in the current roster for this match. Please choose a player from the active squad or bench. Did you mean ${suggestion}?`
+        : `I can't evaluate ${unknownName} because that player is not in the current roster for this match. Please choose a player from the active squad or bench.`;
+      context.log?.('[copilot-chat] player_validation', {
+        traceId,
+        routeCalled,
+        prompt: message,
+        unknownPlayer: unknownName,
+        suggestedPlayer: suggestion || undefined,
+      });
+      return respond(
+        jsonResponse(
+          200,
+          {
+            ok: true,
+            source: 'ai',
+            mode: 'player_validation',
+            routeCalled,
+            analysisIdUsed,
+            reply: validationReply,
+            answer: validationReply,
+            messagesUsed: Math.min(10, countUserTurns(history) + 1),
+          },
+          {},
+          req
+        )
+      );
+    }
+
     const aoai = resolveAoaiRuntimeConfig();
     const aoaiRequestUrl = buildAoaiChatUrl(aoai);
     const aiPathSelected = Boolean(aoai.ok && aoaiRequestUrl);
@@ -1784,8 +2521,9 @@ module.exports = async function copilotChat(context, req) {
       const fallbackReason = aoai.missing && aoai.missing.length > 0
         ? `missing_config:${aoai.missing.join(',')}`
         : 'aoai_not_available';
-      const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
-      const reply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
+      const rawFallbackReply = buildFallbackReply(effectiveMessage, payload, fallbackReason);
+      const alignedReply = enforceAlignmentOnReply(effectiveMessage, rawFallbackReply, tacticalState);
+      const reply = applyResolutionAssumptionToReply(alignedReply, playerReferenceResolution);
       context.log?.('[copilot-chat] fallback', {
         traceId,
         routeCalled,
@@ -1816,10 +2554,12 @@ module.exports = async function copilotChat(context, req) {
     const systemPrompt = buildCopilotSystemPrompt();
     const signalSummary = buildCopilotSignalSummary(contextSnapshot);
     const structuredContext = buildCopilotContextBlock(contextSnapshot);
+    const activePlayerGroundingContext = buildActivePlayerGroundingContext(contextSnapshot, tacticalState);
     const tacticalStateJson = compactJson(tacticalState, 1200);
 
     const messages = [
       { role: 'system', content: systemPrompt },
+      { role: 'system', content: `Active live context (first-message grounding):\n${activePlayerGroundingContext}` },
       { role: 'system', content: `High-signal coaching context:\n${signalSummary}` },
       { role: 'system', content: `Structured live context:\n${structuredContext}` },
       {
@@ -1828,8 +2568,21 @@ module.exports = async function copilotChat(context, req) {
           `Tactical recommendation state (prioritize this for immediate move consistency):\n${tacticalStateJson}\n` +
           'Do not contradict this tactical recommendation when answering replacement/rotation questions.',
       },
+      ...(playerReferenceResolution.resolvedPlayerName
+        ? [
+            {
+              role: 'system',
+              content:
+                `Player reference resolution for the latest user message: treat ambiguous references like "the player", ` +
+                `"he", "him", or "this bowler" as "${playerReferenceResolution.resolvedPlayerName}". ` +
+                (playerReferenceResolution.assumptionPrefix
+                  ? `Signal this as a brief assumption once at the start (for example: "${playerReferenceResolution.assumptionPrefix} ...").`
+                  : 'Do not ask the user to repeat the player name.'),
+            },
+          ]
+        : []),
       ...history.map((turn) => ({ role: turn.role, content: turn.content })),
-      { role: 'user', content: message },
+      { role: 'user', content: effectiveMessage },
     ];
 
     try {
@@ -1861,8 +2614,9 @@ module.exports = async function copilotChat(context, req) {
           body,
         });
         const fallbackReason = `aoai_http_${String(status || 'error')}`;
-        const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
-        const reply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
+        const rawFallbackReply = buildFallbackReply(effectiveMessage, payload, fallbackReason);
+        const alignedReply = enforceAlignmentOnReply(effectiveMessage, rawFallbackReply, tacticalState);
+        const reply = applyResolutionAssumptionToReply(alignedReply, playerReferenceResolution);
         return respond(
           jsonResponse(
             200,
@@ -1895,7 +2649,8 @@ module.exports = async function copilotChat(context, req) {
         parsed = {};
       }
       const rawReply = extractCompletionText(parsed);
-      const reply = enforceAlignmentOnReply(message, rawReply, tacticalState);
+      const alignedReply = enforceAlignmentOnReply(effectiveMessage, rawReply, tacticalState);
+      const reply = applyResolutionAssumptionToReply(alignedReply, playerReferenceResolution);
       if (!reply) {
         const fallbackReason = 'aoai_empty_response';
         context.log?.('[copilot-chat] fallback', {
@@ -1904,8 +2659,9 @@ module.exports = async function copilotChat(context, req) {
           source: 'fallback',
           reason: fallbackReason,
         });
-        const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
-        const fallbackReply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
+        const rawFallbackReply = buildFallbackReply(effectiveMessage, payload, fallbackReason);
+        const alignedFallbackReply = enforceAlignmentOnReply(effectiveMessage, rawFallbackReply, tacticalState);
+        const fallbackReply = applyResolutionAssumptionToReply(alignedFallbackReply, playerReferenceResolution);
         return respond(
           jsonResponse(
             200,
@@ -1963,8 +2719,9 @@ module.exports = async function copilotChat(context, req) {
         reason: fallbackReason,
         ...(typeof status === 'number' ? { status } : {}),
       });
-      const rawFallbackReply = buildFallbackReply(message, payload, fallbackReason);
-      const reply = enforceAlignmentOnReply(message, rawFallbackReply, tacticalState);
+      const rawFallbackReply = buildFallbackReply(effectiveMessage, payload, fallbackReason);
+      const alignedReply = enforceAlignmentOnReply(effectiveMessage, rawFallbackReply, tacticalState);
+      const reply = applyResolutionAssumptionToReply(alignedReply, playerReferenceResolution);
       return respond(
         jsonResponse(
           200,

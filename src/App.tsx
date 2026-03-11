@@ -3060,6 +3060,75 @@ export default function App() {
     const baselineSummaryText = selectedPlayerBaseline
       ? `baseline sleep ${baselineSleepHours.toFixed(1)}h, recovery ${Math.round(baselineRecoveryMinutes)}m, fatigue limit ${baselineFatigueLimit.toFixed(1)}.`
       : 'baseline not available, using live telemetry only.';
+    const resolvePlayerType = (role: unknown): 'PACE' | 'SPIN' | 'ALL_ROUND' | 'BATTER' | 'BOWLER' => {
+      const token = String(role || '').trim().toLowerCase();
+      if (token.includes('spin')) return 'SPIN';
+      if (token.includes('fast') || token.includes('pace') || token.includes('seam')) return 'PACE';
+      if (token.includes('all-round')) return 'ALL_ROUND';
+      if (token.includes('bat')) return 'BATTER';
+      return 'BOWLER';
+    };
+    const normalizedInjuryRiskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' =
+      injuryLabelRaw === 'CRITICAL'
+        ? 'CRITICAL'
+        : injuryLabelRaw === 'HIGH'
+          ? 'HIGH'
+          : injuryLabelRaw === 'MED' || injuryLabelRaw === 'MEDIUM'
+            ? 'MEDIUM'
+            : 'LOW';
+    const normalizedNoBallRiskLevel: 'LOW' | 'MEDIUM' | 'HIGH' =
+      noBallRiskLabelRaw === 'HIGH'
+        ? 'HIGH'
+        : noBallRiskLabelRaw === 'MED' || noBallRiskLabelRaw === 'MEDIUM'
+          ? 'MEDIUM'
+          : 'LOW';
+    const markedFitStatus: 'FIT' | 'UNFIT' = isUnfit ? 'UNFIT' : 'FIT';
+    const availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE' =
+      normalizedInjuryRiskLevel === 'CRITICAL' || markedFitStatus === 'UNFIT'
+        ? 'UNAVAILABLE'
+        : fatigue > baselineFatigueLimit && strainIndex >= 4
+          ? 'LIMITED'
+          : normalizedNoBallRiskLevel === 'HIGH'
+            ? 'TACTICAL_RISK'
+            : 'AVAILABLE';
+    const substitutionRequired = availabilityStatus === 'UNAVAILABLE';
+    const heartRateRecoveryToken = String(currentTelemetry.heartRateRecovery || '').trim().toUpperCase();
+    const dominantRiskDriver: 'injury' | 'fatigue' | 'recovery' | 'control' | 'matchup' | 'pressure_phase' | 'mixed' =
+      availabilityStatus === 'UNAVAILABLE'
+        ? 'injury'
+        : fatigue > baselineFatigueLimit && strainIndex >= 4
+          ? 'fatigue'
+          : heartRateRecoveryToken === 'POOR' || baselineRecoveryMinutes < 35
+            ? 'recovery'
+            : normalizedNoBallRiskLevel === 'HIGH' || baselineControl < 70
+              ? 'control'
+              : normalizedPhase === 'death' || ballsRemaining <= 12
+                ? 'pressure_phase'
+                : 'mixed';
+    const defendingOrChasing =
+      teamMode === 'BOWLING'
+        ? typeof matchState.target === 'number' && matchState.target > 0
+          ? 'defending'
+          : 'bowling_first'
+        : typeof matchState.target === 'number' && matchState.target > 0
+          ? 'chasing'
+          : 'batting_first';
+    const scoreContext = `${Math.max(0, matchState.runs)}/${Math.max(0, matchState.wickets)} after ${formatOverStr(matchState.ballsBowled)} overs`;
+    const wicketContext = `${Math.max(0, 10 - matchState.wickets)} wickets in hand`;
+    const suggestedBenchOptions = players
+      .filter((p) => {
+        if (p.id === activePlayer?.id) return false;
+        if (p.inRoster === false || p.isSub || p.isUnfit || p.isInjured) return false;
+        if (resolveDismissalStatus(p) === 'OUT') return false;
+        return true;
+      })
+      .map((p) => ({
+        playerId: p.id,
+        name: p.name,
+        role: p.role,
+        playerType: resolvePlayerType(p.role),
+      }))
+      .slice(0, 5);
     const text = `${currentTelemetry.playerName} overs ${oversBowled}/${maxOvers} (remaining ${oversRemaining}), fatigue ${fatigue.toFixed(1)}/10, strain ${strainIndex.toFixed(1)}/10, injury risk ${injuryLabel}, no-ball risk ${noBallRiskLabel}, ${quotaComplete ? 'quota completed for format' : 'quota available'}, ${isUnfit ? 'marked unfit' : 'currently fit'}, ${baselineSummaryText}`;
     const baselinesForContext = (() => {
       if (!selectedPlayerBaseline) return workingBaselines;
@@ -3110,6 +3179,31 @@ export default function App() {
       matchState: teamMode,
       selectedPlayerRole: focusRole,
       userAction: 'RUN_COACH',
+      analysisState: {
+        playerName: currentTelemetry.playerName,
+        role: currentTelemetry.role,
+        bowlingStyle: resolvePlayerType(currentTelemetry.role),
+        playerType: resolvePlayerType(currentTelemetry.role),
+        oversBowled,
+        maxOvers,
+        strainIndex,
+        fatigueIndex: fatigue,
+        heartRateRecovery: currentTelemetry.heartRateRecovery,
+        injuryRiskLevel: normalizedInjuryRiskLevel,
+        controlRisk: normalizedNoBallRiskLevel,
+        noBallRisk: normalizedNoBallRiskLevel,
+        markedFitStatus,
+        availabilityStatus,
+        substitutionRequired,
+        dominantRiskDriver,
+        matchMode: teamMode,
+        defendingOrChasing,
+        phaseOfPlay: normalizedPhase,
+        scoreContext,
+        target: typeof matchState.target === 'number' ? matchState.target : undefined,
+        wicketContext,
+        suggestedBenchOptions,
+      },
       text,
       mode: requestMode,
       signals: {
@@ -3126,6 +3220,9 @@ export default function App() {
         baselineSleepHours: baselineSleepHours,
         baselineRecoveryMinutes: baselineRecoveryMinutes,
         baselineFatigueLimit: baselineFatigueLimit,
+        availabilityStatus,
+        substitutionRequired,
+        dominantRiskDriver,
         intensity: matchContext.pitch || 'Medium',
       },
       telemetry: {
@@ -3146,6 +3243,10 @@ export default function App() {
         sleepHours: baselineSleepHours,
         recoveryMinutes: baselineRecoveryMinutes,
         isUnfit,
+        markedFitStatus,
+        availabilityStatus,
+        substitutionRequired,
+        dominantRiskDriver,
       },
       baseline: selectedPlayerBaseline
         ? {
@@ -5298,6 +5399,7 @@ function FatigueForecastChart({
   oversBowled,
   currentInjuryRisk,
   currentNoBallRisk,
+  playerStatus,
   matchFormat,
   intensity,
   heartRateRecovery,
@@ -5307,17 +5409,33 @@ function FatigueForecastChart({
   oversBowled: number;
   currentInjuryRisk?: string;
   currentNoBallRisk?: string;
+  playerStatus?: string;
   matchFormat: string;
   intensity?: string;
   heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
 }) {
+  const normalizedInjuryRisk = React.useMemo(
+    () => String(currentInjuryRisk || '').trim().toUpperCase(),
+    [currentInjuryRisk]
+  );
+  const normalizedPlayerStatus = React.useMemo(
+    () => String(playerStatus || '').trim().toUpperCase(),
+    [playerStatus]
+  );
+  const isTerminalRiskState = React.useMemo(
+    () =>
+      normalizedInjuryRisk === 'CRITICAL' ||
+      normalizedPlayerStatus === 'UNFIT' ||
+      safeNum(currentFatigue, 0) >= 10,
+    [normalizedInjuryRisk, normalizedPlayerStatus, currentFatigue]
+  );
   const projectionHorizon = React.useMemo(
     () => getProjectionHorizon(matchFormat),
     [matchFormat]
   );
   const oversTicks = React.useMemo(
-    () => Array.from({ length: projectionHorizon + 1 }, (_, index) => index),
-    [projectionHorizon]
+    () => (isTerminalRiskState ? [0, 1] : Array.from({ length: projectionHorizon + 1 }, (_, index) => index)),
+    [isTerminalRiskState, projectionHorizon]
   );
   const currentRiskPct = React.useMemo(
     () =>
@@ -5331,6 +5449,24 @@ function FatigueForecastChart({
     [currentInjuryRisk, currentNoBallRisk, currentFatigue, strainIndex, heartRateRecovery]
   );
   const points: FatigueForecastPoint[] = React.useMemo(() => {
+    if (isTerminalRiskState) {
+      const saturatedFatigue = Number(clamp(currentFatigue, 0, 10).toFixed(1));
+      const saturatedRisk = Math.round(clamp(currentRiskPct, 0, 100));
+      return [
+        {
+          overAhead: 0,
+          fatigue: saturatedFatigue,
+          injuryRiskPct: saturatedRisk,
+          reason: 'Risk saturated. Player marked unfit for continued workload.',
+        },
+        {
+          overAhead: 1,
+          fatigue: saturatedFatigue,
+          injuryRiskPct: saturatedRisk,
+          reason: 'Risk saturated. Continue with substitution-only plan.',
+        },
+      ];
+    }
     return buildFatigueForecast({
       currentFatigue,
       currentRiskPct,
@@ -5340,7 +5476,16 @@ function FatigueForecastChart({
       intensity,
       heartRateRecovery,
     });
-  }, [currentFatigue, currentRiskPct, strainIndex, oversBowled, projectionHorizon, intensity, heartRateRecovery]);
+  }, [
+    isTerminalRiskState,
+    currentFatigue,
+    currentRiskPct,
+    strainIndex,
+    oversBowled,
+    projectionHorizon,
+    intensity,
+    heartRateRecovery,
+  ]);
   const riskAtTwo = points.find((point) => point.overAhead === 2)?.injuryRiskPct ?? points[Math.min(2, points.length - 1)]?.injuryRiskPct ?? currentRiskPct;
   const terminalOver = projectionHorizon >= 5 ? 5 : 4;
   const riskAtTerminal = points.find((point) => point.overAhead === terminalOver)?.injuryRiskPct ?? points[points.length - 1]?.injuryRiskPct ?? currentRiskPct;
@@ -5354,13 +5499,16 @@ function FatigueForecastChart({
   const forecastGridColsClass = points.length === 5 ? 'grid-cols-3 sm:grid-cols-5' : 'grid-cols-3 sm:grid-cols-6';
 
   return (
-    <div className="relative rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] p-4 overflow-hidden">
+    <div
+      className="relative rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] p-4 overflow-hidden"
+      style={{ position: 'relative' }}
+    >
       <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-emerald-500/10 via-cyan-500/5 to-transparent pointer-events-none" />
       <div className="relative z-10">
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
             <h3 className="text-sm font-bold text-white">Fatigue Forecast</h3>
-            <p className="text-xs text-slate-400">{`Next ${projectionHorizon} overs • AI projection`}</p>
+            <p className="text-xs text-slate-400">{`Next ${isTerminalRiskState ? 1 : projectionHorizon} overs • AI projection`}</p>
           </div>
           <div className="flex flex-col items-end gap-1.5">
             <span className="rounded-full border border-cyan-400/35 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-cyan-200">
@@ -5382,7 +5530,43 @@ function FatigueForecastChart({
             </div>
           </div>
         </div>
-        <div className="mt-4 h-[240px] w-full" style={{ height: 240 }}>
+        <div className="mt-4 h-[240px] w-full" style={{ height: 240, position: 'relative' }}>
+          {isTerminalRiskState && (
+            <>
+              <div
+                style={{
+                  position: 'absolute',
+                  left: 0,
+                  right: 0,
+                  top: '10%',
+                  height: '25%',
+                  background: 'linear-gradient(180deg, rgba(220,38,38,0.18), rgba(220,38,38,0.05))',
+                  pointerEvents: 'none',
+                  zIndex: 3,
+                }}
+              />
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '12px',
+                  right: '16px',
+                  background: 'rgba(220,38,38,0.18)',
+                  border: '1px solid rgba(220,38,38,0.45)',
+                  color: '#ff6b6b',
+                  padding: '6px 12px',
+                  borderRadius: '8px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  letterSpacing: '0.4px',
+                  backdropFilter: 'blur(4px)',
+                  pointerEvents: 'none',
+                  zIndex: 4,
+                }}
+              >
+                Risk Saturated • Player marked UNFIT
+              </div>
+            </>
+          )}
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={points} margin={{ top: 10, right: 90, bottom: 30, left: 48 }}>
               <defs>
@@ -5728,6 +5912,8 @@ interface CoachAnalysisInputSnapshot {
   heartRateRecovery: string;
   injuryRisk: string;
   noBallRisk: string;
+  markedFitStatus: 'FIT' | 'UNFIT';
+  availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE';
 }
 
 interface ConfirmSwitchOverlayProps {
@@ -6317,15 +6503,33 @@ function Dashboard({
         strainIndex: 0,
       };
   const analysisInputSnapshot = useMemo<CoachAnalysisInputSnapshot>(
-    () => ({
-      selectedPlayerId: String(activePlayer?.id || currentTelemetry.playerId || ''),
-      oversBowled: Number(safeNum(activePlayer?.overs, 0).toFixed(2)),
-      fatigueIndex: Number(safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex).toFixed(2)),
-      strainIndex: Number(safeNum(strainIndex, currentTelemetry.strainIndex).toFixed(2)),
-      heartRateRecovery: String(recoveryMode === 'manual' ? manualRecovery : activePlayer?.hrRecovery || 'Good').toUpperCase(),
-      injuryRisk: String(activePlayer?.injuryRisk || '').toUpperCase(),
-      noBallRisk: String(activePlayer?.noBallRisk || '').toUpperCase(),
-    }),
+    () => {
+      const fatigueValue = Number(safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex).toFixed(2));
+      const strainValue = Number(safeNum(strainIndex, currentTelemetry.strainIndex).toFixed(2));
+      const fatigueLimitValue = Math.max(1, safeNum(activePlayer?.baselineFatigue, safeNum(currentTelemetry.fatigueLimit, 6)));
+      const injuryToken = String(activePlayer?.injuryRisk || '').toUpperCase();
+      const noBallToken = String(activePlayer?.noBallRisk || '').toUpperCase();
+      const markedFitStatus: 'FIT' | 'UNFIT' = activePlayer?.isUnfit ? 'UNFIT' : 'FIT';
+      const availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE' =
+        markedFitStatus === 'UNFIT' || injuryToken === 'CRITICAL'
+          ? 'UNAVAILABLE'
+          : fatigueValue > fatigueLimitValue && strainValue >= 4
+            ? 'LIMITED'
+            : noBallToken === 'HIGH'
+              ? 'TACTICAL_RISK'
+              : 'AVAILABLE';
+      return {
+        selectedPlayerId: String(activePlayer?.id || currentTelemetry.playerId || ''),
+        oversBowled: Number(safeNum(activePlayer?.overs, 0).toFixed(2)),
+        fatigueIndex: fatigueValue,
+        strainIndex: strainValue,
+        heartRateRecovery: String(recoveryMode === 'manual' ? manualRecovery : activePlayer?.hrRecovery || 'Good').toUpperCase(),
+        injuryRisk: injuryToken,
+        noBallRisk: noBallToken,
+        markedFitStatus,
+        availabilityStatus,
+      };
+    },
     [
       activePlayer?.fatigue,
       activePlayer?.hrRecovery,
@@ -6333,7 +6537,10 @@ function Dashboard({
       activePlayer?.injuryRisk,
       activePlayer?.noBallRisk,
       activePlayer?.overs,
+      activePlayer?.baselineFatigue,
+      activePlayer?.isUnfit,
       currentTelemetry.fatigueIndex,
+      currentTelemetry.fatigueLimit,
       currentTelemetry.playerId,
       currentTelemetry.strainIndex,
       manualRecovery,
@@ -7930,10 +8137,31 @@ function Dashboard({
     whyThisIsSmart: string[];
     ifYouIgnore: string;
     confidence: 'Low' | 'Moderate' | 'High';
+    priority: 'Stable' | 'Monitor' | 'Immediate';
+    availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE';
+    dominantRiskDriver: 'injury' | 'fatigue' | 'recovery' | 'control' | 'matchup' | 'pressure_phase' | 'mixed';
+    decisionMode:
+      | 'IMMEDIATE_SUBSTITUTION'
+      | 'ROTATE_NEXT_OVER'
+      | 'SHORTEN_SPELL'
+      | 'KEEP_BOWLING_WITH_ADJUSTMENT'
+      | 'MATCHUP_CHANGE'
+      | 'RECOVERY_ONLY';
+    substitutionRequired: boolean;
     primaryPlayerName: string;
+    recommendedReplacement: string;
     swap: { out: string; in: string; reason: string };
+    suggestedBenchOptions: Array<{ name: string; roleTag: string; reason: string }>;
   } => {
     const roleToken = (value: unknown): string => String(value || '').trim().toLowerCase();
+    const resolvePlayerTypeTag = (role: unknown): 'PACE' | 'SPIN' | 'ALL_ROUND' | 'BATTER' | 'BOWLER' => {
+      const token = roleToken(role);
+      if (token.includes('spin')) return 'SPIN';
+      if (token.includes('fast') || token.includes('pace') || token.includes('seam')) return 'PACE';
+      if (token.includes('all-round')) return 'ALL_ROUND';
+      if (token.includes('bat')) return 'BATTER';
+      return 'BOWLER';
+    };
     const isBowlingCompatible = (role: unknown): boolean => {
       const token = roleToken(role);
       return token.includes('bowler') || token.includes('spinner') || token.includes('fast') || token.includes('all-rounder');
@@ -8026,6 +8254,7 @@ function Dashboard({
     const activeName = isInitialOnlyName(unresolvedActiveName)
       ? normalizeRecommendationText(activePlayer?.name || '') || 'Current bowler'
       : unresolvedActiveName;
+    const activeRoleTag = resolvePlayerTypeTag(activePlayer?.role || 'Bowler');
     const replacementPool = roster.filter(
       (player) =>
         player.inRoster !== false &&
@@ -8058,6 +8287,7 @@ function Dashboard({
       const injuryToken = normalizeRiskToken(player.injuryRisk);
       const noBallToken = normalizeRiskToken(player.noBallRisk);
       const role = roleToken(player.role);
+      const playerRoleTag = resolvePlayerTypeTag(player.role);
 
       let score = 0;
       score += Math.max(0, 10 - fatigueValue) * 3;
@@ -8083,6 +8313,7 @@ function Dashboard({
       if (phaseToken.includes('death')) score += controlValue >= 80 ? 2 : 0;
       if (phaseToken.includes('powerplay')) score += speedValue >= 11 ? 1.5 : 0;
       if (phaseToken.includes('middle') && role.includes('spinner')) score += 1.5;
+      if (playerRoleTag === activeRoleTag) score += 2.2;
 
       return {
         player,
@@ -8096,6 +8327,7 @@ function Dashboard({
         controlValue,
         injuryToken,
         noBallToken,
+        roleTag: playerRoleTag,
       };
     };
     const rankedBowlingCandidates = [...compatibleBowlers]
@@ -8146,7 +8378,7 @@ function Dashboard({
       }
       return `Tactical plan: ${nextOverPlan} ${followingOverPlan}`;
     };
-    const assessmentLine1 = safeContinue
+    const baseAssessmentLine1 = safeContinue
       ? `${activeName} can continue, but this over should be used as a control checkpoint.`
       : elevatedControlRisk && elevatedInjuryRisk
         ? `${activeName}'s spell is approaching a rhythm-drop window where pressure can release quickly.`
@@ -8155,7 +8387,7 @@ function Dashboard({
           : elevatedControlRisk
             ? `${activeName} is showing early control drift; proactive rotation is tactically cleaner than reactive change.`
             : `${activeName} is competing well, but the phase timing favors a proactive reset now.`;
-    const assessmentLine2 = safeContinue
+    const baseAssessmentLine2 = safeContinue
       ? hasFollowingOverPlan
         ? `${phaseLeverageLine} Keep a prepared change option for the following over.`
         : `${phaseLeverageLine} This is the closeout window, so keep execution control-first through the over.`
@@ -8203,7 +8435,7 @@ function Dashboard({
         180
       ),
     };
-    const recommendedMove = !hasNextOverAvailable
+    const baseRecommendedMove = !hasNextOverAvailable
       ? 'Innings complete — no next over remains for a bowling change.'
       : safeContinue
         ? hasFollowingOverPlan
@@ -8214,7 +8446,7 @@ function Dashboard({
             ? `No eligible replacement available — keep ${activeName} for one controlled over, then reassess.`
             : `No eligible replacement available — keep ${activeName} for the closeout over and reassess at over end.`
           : `Bring in ${swap.in} for ${swap.out} next over to reset control before pressure compounds.`;
-    const whyThisIsSmart = safeContinue
+    const baseWhyThisIsSmart = safeContinue
       ? dedupeBullets([
           `This avoids an unnecessary early change while preserving match rhythm.`,
           `You keep a prepared fallback so the next decision stays proactive, not reactive.`,
@@ -8257,7 +8489,7 @@ function Dashboard({
               ? 'Reassess execution quality immediately before committing the following over.'
               : 'Reassess execution quality ball-by-ball through this closeout over.',
           ], 3);
-    const ifYouIgnore = safeContinue
+    const baseIfYouIgnore = safeContinue
       ? hasFollowingOverPlan
         ? 'If control slips without a preplanned backup, the next over can force a rushed tactical change.'
         : 'If control slips now, the closeout over can leak pressure quickly.'
@@ -8273,6 +8505,183 @@ function Dashboard({
             : 'If the change is delayed, control drop and pressure release are more likely in the remaining deliveries.',
           110
         );
+    const fatigueLimit = Math.max(1, safeNum(baseline.fatigueLimit, safeNum(activePlayer?.baselineFatigue, 6)));
+    const heartRateRecoveryToken = String(activePlayer?.hrRecovery || 'MODERATE').trim().toUpperCase();
+    const injuryRiskNormalized: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' =
+      injuryRiskToken === 'CRITICAL'
+        ? 'CRITICAL'
+        : injuryRiskToken === 'HIGH'
+          ? 'HIGH'
+          : injuryRiskToken === 'MED' || injuryRiskToken === 'MEDIUM'
+            ? 'MEDIUM'
+            : 'LOW';
+    const noBallRiskNormalized: 'LOW' | 'MEDIUM' | 'HIGH' =
+      noBallRiskToken === 'HIGH'
+        ? 'HIGH'
+        : noBallRiskToken === 'MED' || noBallRiskToken === 'MEDIUM'
+          ? 'MEDIUM'
+          : 'LOW';
+    const markedFitStatus: 'FIT' | 'UNFIT' = activePlayer?.isUnfit ? 'UNFIT' : 'FIT';
+    const availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE' =
+      markedFitStatus === 'UNFIT' || injuryRiskNormalized === 'CRITICAL'
+        ? 'UNAVAILABLE'
+        : fatigue > fatigueLimit && strain >= 4
+          ? 'LIMITED'
+          : noBallRiskNormalized === 'HIGH'
+            ? 'TACTICAL_RISK'
+            : 'AVAILABLE';
+    const substitutionRequired = availabilityStatus === 'UNAVAILABLE';
+    const dominantRiskDriver: 'injury' | 'fatigue' | 'recovery' | 'control' | 'matchup' | 'pressure_phase' | 'mixed' =
+      availabilityStatus === 'UNAVAILABLE'
+        ? 'injury'
+        : availabilityStatus === 'LIMITED'
+          ? 'fatigue'
+          : constrainedRecoveryProfile || heartRateRecoveryToken === 'POOR'
+            ? 'recovery'
+            : availabilityStatus === 'TACTICAL_RISK'
+              ? 'control'
+              : hasReplacementOption && selectedCandidateSummary && phaseToken !== 'powerplay'
+                ? 'matchup'
+                : phaseToken === 'death' || isFinalOverWindow
+                  ? 'pressure_phase'
+                  : 'mixed';
+    const replacementRoleTag = selectedCandidateSummary?.roleTag || resolvePlayerTypeTag(selectedReplacementPlayer?.role || '');
+    const roleTagText =
+      replacementRoleTag === 'SPIN'
+        ? 'spin control option'
+        : replacementRoleTag === 'PACE'
+          ? 'pace control option'
+          : replacementRoleTag === 'ALL_ROUND'
+            ? 'all-round balance option'
+            : 'control-first option';
+    const replacementPlanReason = hasReplacementOption
+      ? `${replacementName} offers the safest ${roleTagText} for the ${phaseLabel.toLowerCase()} phase.`
+      : 'No role-compatible replacement is currently available from the active roster.';
+    const replacementContrastLine =
+      backupCandidateSummary && selectedCandidateSummary && backupCandidateSummary.controlValue + 6 < selectedCandidateSummary.controlValue
+        ? `${backupCandidateName || resolveRosterName(backupCandidateSummary.player.id || backupCandidateSummary.player.name, backupCandidateSummary.player.name)} is less suitable here because the immediate need is control stability, not extra pace.`
+        : '';
+    const suggestedBenchOptions = rankedBowlingCandidates.slice(0, 3).map((entry) => ({
+      name: resolveRosterName(entry.player.id || entry.player.name, entry.player.name) || entry.player.name,
+      roleTag: entry.roleTag,
+      reason:
+        entry.roleTag === 'SPIN'
+          ? 'Offers control-focused spin variation for pressure containment.'
+          : entry.roleTag === 'PACE'
+            ? 'Provides pace threat while maintaining line discipline.'
+            : 'Provides balanced control and adaptability.',
+    }));
+    let decisionMode:
+      | 'IMMEDIATE_SUBSTITUTION'
+      | 'ROTATE_NEXT_OVER'
+      | 'SHORTEN_SPELL'
+      | 'KEEP_BOWLING_WITH_ADJUSTMENT'
+      | 'MATCHUP_CHANGE'
+      | 'RECOVERY_ONLY' = 'KEEP_BOWLING_WITH_ADJUSTMENT';
+    if (!hasNextOverAvailable) {
+      decisionMode = 'RECOVERY_ONLY';
+    } else if (availabilityStatus === 'UNAVAILABLE') {
+      decisionMode = 'IMMEDIATE_SUBSTITUTION';
+    } else if (availabilityStatus === 'LIMITED') {
+      decisionMode = hasReplacementOption ? 'ROTATE_NEXT_OVER' : 'SHORTEN_SPELL';
+    } else if (availabilityStatus === 'TACTICAL_RISK') {
+      decisionMode = hasReplacementOption ? 'MATCHUP_CHANGE' : 'KEEP_BOWLING_WITH_ADJUSTMENT';
+    } else if (hasReplacementOption && selectedCandidateSummary && phaseToken !== 'powerplay' && !safeContinue) {
+      decisionMode = 'MATCHUP_CHANGE';
+    }
+    const priority: 'Stable' | 'Monitor' | 'Immediate' =
+      decisionMode === 'IMMEDIATE_SUBSTITUTION'
+        ? 'Immediate'
+        : decisionMode === 'ROTATE_NEXT_OVER' || decisionMode === 'SHORTEN_SPELL' || decisionMode === 'MATCHUP_CHANGE'
+          ? 'Monitor'
+          : 'Stable';
+    let assessmentLine1 = baseAssessmentLine1;
+    let assessmentLine2 = baseAssessmentLine2;
+    let recommendedMove = baseRecommendedMove;
+    let swapReason = swap.reason;
+    let whyThisIsSmart = [...(baseWhyThisIsSmart || [])];
+    let ifYouIgnore = baseIfYouIgnore;
+
+    if (decisionMode === 'IMMEDIATE_SUBSTITUTION') {
+      assessmentLine1 = `${activeName} is not fit to continue. Risk state exceeds continuation threshold.`;
+      assessmentLine2 = 'Immediate substitution is required to prevent avoidable exposure in this phase.';
+      recommendedMove = hasReplacementOption
+        ? `Immediate substitution required: replace ${activeName} with ${replacementName} now.`
+        : `Immediate substitution required: ${activeName} should not continue current spell, and no eligible replacement is available.`;
+      swapReason = hasReplacementOption
+        ? `Tactical plan: Immediate substitution required. Next over: ${replacementName}.`
+        : 'Tactical plan: Stop current spell immediately and trigger emergency roster substitution support.';
+      whyThisIsSmart = dedupeBullets(
+        [
+          'Player should not continue current spell under a critical/unfit state.',
+          replacementPlanReason,
+          replacementContrastLine || 'Early substitution protects both player safety and control integrity for remaining overs.',
+        ],
+        3
+      );
+      ifYouIgnore = 'If this is ignored, injury exposure and execution instability can escalate immediately.';
+    } else if (decisionMode === 'ROTATE_NEXT_OVER' || decisionMode === 'SHORTEN_SPELL') {
+      assessmentLine1 = `${activeName} is in a limited workload state driven by fatigue accumulation.`;
+      assessmentLine2 = 'The risk is not this ball; it is the next over where control quality can decay.';
+      recommendedMove = decisionMode === 'ROTATE_NEXT_OVER' && hasReplacementOption
+        ? `Rotate ${activeName} next over and bring in ${replacementName} to protect control quality.`
+        : `Shorten ${activeName}'s spell now and enforce a one-over leash before reassessment.`;
+      swapReason = decisionMode === 'ROTATE_NEXT_OVER' && hasReplacementOption
+        ? composeTacticalPlan(`Next over: ${replacementName} to reset pressure.`, hasFollowingOverPlan ? `Following over: reassess ${activeName} only if control signals stabilize.` : '')
+        : composeTacticalPlan(`Next over: keep ${activeName} with strict control-first execution.`, 'Following over: mandatory reassessment before extension.');
+      whyThisIsSmart = dedupeBullets(
+        [
+          'This prevents cumulative fatigue from turning into late-spell execution loss.',
+          replacementPlanReason,
+          'It keeps the rotation proactive instead of waiting for a forced reactive switch.',
+        ],
+        3
+      );
+      ifYouIgnore = 'If ignored, workload compounding is likely to reduce control consistency over the next over.';
+    } else if (decisionMode === 'MATCHUP_CHANGE') {
+      assessmentLine1 = `${activeName} is available, but the current phase demands a sharper matchup profile.`;
+      assessmentLine2 = phaseToken === 'death'
+        ? 'Death-over run control is the dominant priority right now.'
+        : 'Current pressure profile favors control-first matchup timing over continuity.';
+      recommendedMove = hasReplacementOption
+        ? `Matchup change: bring in ${replacementName} for ${activeName} next over.`
+        : `Matchup adjustment needed, but no eligible replacement is available — keep ${activeName} with strict control settings.`;
+      swapReason = hasReplacementOption
+        ? composeTacticalPlan(`Next over: ${replacementName} as the matchup change.`, hasFollowingOverPlan ? `Following over: ${backupCandidateName || activeName} if pressure pattern shifts.` : '')
+        : composeTacticalPlan(`Next over: ${activeName} with field + length adjustment only.`, '');
+      whyThisIsSmart = dedupeBullets(
+        [
+          replacementPlanReason,
+          replacementContrastLine || 'This matchup improves phase-specific control without overexposing the current bowler.',
+          'The change targets pressure containment rather than generic rotation.',
+        ],
+        3
+      );
+      ifYouIgnore = 'If ignored, matchup inefficiency can leak pressure and reduce tactical flexibility in the following over.';
+    } else if (decisionMode === 'KEEP_BOWLING_WITH_ADJUSTMENT') {
+      assessmentLine1 = `${activeName} remains available, but execution adjustments are required this over.`;
+      assessmentLine2 = noBallRiskNormalized === 'HIGH'
+        ? 'Primary issue is control drift, not raw workload capacity.'
+        : 'Keep the spell short and control-first to maintain phase stability.';
+      recommendedMove = `Keep ${activeName} for this over with a control-first adjustment plan.`;
+      swapReason = composeTacticalPlan(
+        `Next over: ${activeName} with simplified run-up and tighter line discipline.`,
+        hasFollowingOverPlan ? `Following over: reassess between ${activeName} and ${replacementName}.` : ''
+      );
+      whyThisIsSmart = dedupeBullets(
+        [
+          'You preserve continuity while actively reducing execution variance.',
+          hasReplacementOption ? `Replacement option ${replacementName} remains ready if control slips.` : 'No stronger replacement signal is currently available.',
+          'This avoids premature change while keeping risk triggers explicit.',
+        ],
+        3
+      );
+      ifYouIgnore = 'If ignored, small control errors can compound into wides/no-balls and momentum release.';
+    }
+    const resolvedSwap = {
+      ...swap,
+      reason: sanitizeCoachLine(swapReason, swapReason, 180),
+    };
     const hasShortOrInitialSection = (value: string): boolean => {
       const normalized = normalizeRecommendationText(value);
       return normalized.length < 8 || isInitialOnlyName(normalized);
@@ -8336,8 +8745,15 @@ function Dashboard({
             ? 'If the change is delayed, control drop and pressure release are more likely over the next one to two overs.'
             : 'If the change is delayed, control drop and pressure release are more likely in the remaining deliveries.',
         confidence,
+        priority,
+        availabilityStatus,
+        dominantRiskDriver,
+        decisionMode,
+        substitutionRequired,
         primaryPlayerName: activeName,
+        recommendedReplacement: fallbackSwap.in,
         swap: fallbackSwap,
+        suggestedBenchOptions,
       };
     })();
     const candidate = {
@@ -8347,8 +8763,15 @@ function Dashboard({
       whyThisIsSmart: whyThisIsSmart.length > 0 ? whyThisIsSmart : deterministicFallback.whyThisIsSmart,
       ifYouIgnore: ifYouIgnore || deterministicFallback.ifYouIgnore,
       confidence,
+      priority,
+      availabilityStatus,
+      dominantRiskDriver,
+      decisionMode,
+      substitutionRequired,
       primaryPlayerName: activeName,
-      swap,
+      recommendedReplacement: replacementName,
+      swap: resolvedSwap,
+      suggestedBenchOptions,
     };
     const hasInvalidSections =
       hasShortOrInitialSection(candidate.matchSituation[0]) ||
@@ -8419,19 +8842,39 @@ function Dashboard({
     'Continuing the current spell may increase fatigue-related performance drop.',
     160
   );
-  const tacticalRiskToken = String(
-    riskAnalysis?.severity ||
-    riskAnalysis?.injuryRisk ||
-    activePlayer?.injuryRisk ||
-    ''
-  ).toUpperCase();
-  const tacticalNoBallToken = String(activePlayer?.noBallRisk || riskAnalysis?.noBallRisk || '').toUpperCase();
   const tacticalPriority: 'Stable' | 'Monitor' | 'Immediate' =
-    tacticalRiskToken === 'HIGH' || tacticalRiskToken === 'CRITICAL' || tacticalNoBallToken === 'HIGH'
-      ? 'Immediate'
-      : tacticalRiskToken === 'MED' || tacticalRiskToken === 'MEDIUM' || tacticalNoBallToken === 'MED' || tacticalNoBallToken === 'MEDIUM'
-        ? 'Monitor'
-        : 'Stable';
+    tacticalRecommendation.priority || 'Monitor';
+  const tacticalAvailabilityStatus:
+    | 'AVAILABLE'
+    | 'LIMITED'
+    | 'TACTICAL_RISK'
+    | 'UNAVAILABLE' = tacticalRecommendation.availabilityStatus || 'AVAILABLE';
+  const tacticalDominantDriver:
+    | 'injury'
+    | 'fatigue'
+    | 'recovery'
+    | 'control'
+    | 'matchup'
+    | 'pressure_phase'
+    | 'mixed' = tacticalRecommendation.dominantRiskDriver || 'mixed';
+  const tacticalDecisionMode:
+    | 'IMMEDIATE_SUBSTITUTION'
+    | 'ROTATE_NEXT_OVER'
+    | 'SHORTEN_SPELL'
+    | 'KEEP_BOWLING_WITH_ADJUSTMENT'
+    | 'MATCHUP_CHANGE'
+    | 'RECOVERY_ONLY' = tacticalRecommendation.decisionMode || 'KEEP_BOWLING_WITH_ADJUSTMENT';
+  const tacticalRecommendedReplacement = finalizeCoachSentence(
+    tacticalRecommendation.recommendedReplacement,
+    tacticalRecommendation.swap?.in || 'No eligible replacement',
+    120
+  );
+  const tacticalNotFitToContinue = tacticalAvailabilityStatus === 'UNAVAILABLE';
+  const tacticalSuggestedBenchOptions = Array.isArray(tacticalRecommendation.suggestedBenchOptions)
+    ? tacticalRecommendation.suggestedBenchOptions.slice(0, 3)
+    : [];
+  const tacticalDecisionLabel = tacticalDecisionMode.replace(/_/g, ' ');
+  const tacticalDominantDriverLabel = tacticalDominantDriver.replace(/_/g, ' ');
   const copilotTacticalRecommendationState = useMemo(() => {
     const outgoing = String(tacticalRecommendation.swap?.out || activePlayer?.name || currentTelemetry.playerName || '').trim();
     const incoming = String(tacticalRecommendation.swap?.in || '').trim();
@@ -8447,6 +8890,12 @@ function Dashboard({
       confidence: tacticalRecommendation.confidence,
       matchSituation: tacticalMatchSituationLines.join(' '),
       priority: tacticalPriority,
+      availabilityStatus: tacticalAvailabilityStatus,
+      dominantRiskDriver: tacticalDominantDriver,
+      decisionMode: tacticalDecisionMode,
+      substitutionRequired: tacticalRecommendation.substitutionRequired === true,
+      recommendedReplacement: tacticalRecommendedReplacement,
+      suggestedBenchOptions: tacticalSuggestedBenchOptions,
       reason: tacticalWhyLines[0] || tacticalAssessmentLines[0] || tacticalRecommendedMove,
       fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
       riskLevel:
@@ -8465,8 +8914,14 @@ function Dashboard({
     tacticalAssessmentLines,
     tacticalIfIgnored,
     tacticalMatchSituationLines,
+    tacticalAvailabilityStatus,
+    tacticalDecisionMode,
+    tacticalDominantDriver,
     tacticalPriority,
+    tacticalSuggestedBenchOptions,
     tacticalRecommendation.confidence,
+    tacticalRecommendation.substitutionRequired,
+    tacticalRecommendedReplacement,
     tacticalRecommendation.swap?.in,
     tacticalRecommendation.swap?.out,
     tacticalRecommendedMove,
@@ -9509,6 +9964,42 @@ function Dashboard({
     scrollCoachOutputToBottom('smooth');
   }, [agentState, aiAnalysis, riskAnalysis, tacticalAnalysis, strategicAnalysis, combinedAnalysis, combinedDecision, finalRecommendation, orchestrateMeta, agentWarning, substitutionRecommendation, isCoachOutputState]);
 
+  // CTA state machine: run -> current -> stale refresh.
+  const fullAnalysisIsRunning = agentState === 'thinking' || fullAnalysisRunPending;
+  const fullAnalysisNeedsRefresh = analysisExecuted && analysisStale;
+  const fullAnalysisUpToDate = analysisExecuted && !analysisStale && !fullAnalysisIsRunning;
+  const fullAnalysisCtaLabel = fullAnalysisIsRunning
+    ? 'Refreshing Analysis...'
+    : !analysisExecuted
+      ? 'Run Full Combined Analysis'
+      : fullAnalysisNeedsRefresh
+        ? 'Refresh Combined Analysis'
+        : 'Analysis Up to Date';
+  const fullAnalysisCtaDisabled = fullAnalysisIsRunning || fullAnalysisUpToDate;
+  const fullAnalysisCtaStyle: React.CSSProperties = fullAnalysisIsRunning
+    ? {
+        background: 'rgba(15, 23, 42, 0.7)',
+        border: '1px solid rgba(100, 116, 139, 0.55)',
+        color: 'rgba(148, 163, 184, 0.9)',
+        boxShadow: 'none',
+        backdropFilter: 'blur(6px)',
+      }
+    : fullAnalysisUpToDate
+      ? {
+          background: 'rgba(30, 41, 59, 0.6)',
+          border: '1px solid rgba(100, 116, 139, 0.45)',
+          color: 'rgba(203, 213, 225, 0.9)',
+          boxShadow: 'none',
+          backdropFilter: 'blur(6px)',
+        }
+      : {
+          background: 'linear-gradient(135deg, rgba(160,60,72,0.42), rgba(138,48,66,0.48))',
+          border: '1px solid rgba(220,120,140,0.38)',
+          color: '#ffffff',
+          boxShadow: '0 8px 20px rgba(120,40,60,0.18)',
+          backdropFilter: 'blur(6px)',
+        };
+
   return (
     <motion.div 
       initial={{ opacity: 0 }} 
@@ -10335,6 +10826,7 @@ function Dashboard({
                         oversBowled={safeNum(activePlayer.overs, 0)}
                         currentInjuryRisk={activePlayer.injuryRisk}
                         currentNoBallRisk={activePlayer.noBallRisk}
+                        playerStatus={activePlayer.isUnfit ? 'UNFIT' : activePlayer.status}
                         matchFormat={matchContext.format}
                         intensity={matchContext.pitch || matchContext.phase || 'Medium'}
                         heartRateRecovery={activePlayer.hrRecovery ?? 'Good'}
@@ -10817,13 +11309,38 @@ function Dashboard({
                                     <h2 className="text-[11px] font-bold uppercase tracking-wide leading-tight text-indigo-100">
                                       TACTICAL RECOMMENDATION
                                     </h2>
-                                    <span
-                                      className={`inline-flex w-fit text-[10px] px-2 py-0.5 rounded border font-semibold uppercase tracking-wide ${tacticalPriorityBadgeClass}`}
-                                    >
-                                      Priority: {tacticalPriority}
-                                    </span>
+                                    <div className="flex items-center gap-2">
+                                      <span
+                                        className={`inline-flex w-fit text-[10px] px-2 py-0.5 rounded border font-semibold uppercase tracking-wide ${tacticalPriorityBadgeClass}`}
+                                      >
+                                        Priority: {tacticalPriority}
+                                      </span>
+                                      {tacticalNotFitToContinue && (
+                                        <span className="inline-flex w-fit text-[10px] px-2 py-0.5 rounded border font-semibold uppercase tracking-wide border-rose-400/50 bg-rose-500/20 text-rose-100">
+                                          NOT FIT TO CONTINUE
+                                        </span>
+                                      )}
+                                    </div>
                                   </div>
                                   <div className="space-y-3">
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                      <div className="rounded-lg border border-slate-700 bg-slate-900/30 px-2.5 py-2">
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Availability Status</p>
+                                        <p className="text-xs text-slate-100 mt-1">{tacticalAvailabilityStatus}</p>
+                                      </div>
+                                      <div className="rounded-lg border border-slate-700 bg-slate-900/30 px-2.5 py-2">
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Dominant Driver</p>
+                                        <p className="text-xs text-slate-100 mt-1">{tacticalDominantDriverLabel}</p>
+                                      </div>
+                                      <div className="rounded-lg border border-slate-700 bg-slate-900/30 px-2.5 py-2">
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Decision</p>
+                                        <p className="text-xs text-slate-100 mt-1">{tacticalDecisionLabel}</p>
+                                      </div>
+                                      <div className="rounded-lg border border-slate-700 bg-slate-900/30 px-2.5 py-2">
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Recommended Replacement</p>
+                                        <p className="text-xs text-slate-100 mt-1">{tacticalRecommendedReplacement}</p>
+                                      </div>
+                                    </div>
                                     {tacticalMatchSituationLines.length > 0 && (
                                       <div>
                                         <p className="text-[10px] uppercase tracking-wide text-slate-400">Match Situation</p>
@@ -10850,6 +11367,11 @@ function Dashboard({
                                         )}
                                         {tacticalSwapReason && (
                                           <p className="text-[11px] text-slate-400 mt-1 leading-relaxed break-words whitespace-normal">{tacticalSwapReason}</p>
+                                        )}
+                                        {tacticalSuggestedBenchOptions.length > 0 && (
+                                          <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                                            Bench options: {tacticalSuggestedBenchOptions.map((option) => `${option.name} (${option.roleTag})`).join(', ')}.
+                                          </p>
                                         )}
                                       </div>
                                     )}
@@ -11117,25 +11639,11 @@ function Dashboard({
                       <div className="min-h-[48px] flex items-center">
                         <button type="button"
                           onClick={(event) => handleRunCoachFull(event)}
-                          disabled={agentState === 'thinking'}
-                          className={`w-full py-3 rounded-2xl border text-sm font-semibold transition-all duration-200 relative text-center ${agentState === 'thinking' ? 'cursor-not-allowed' : ''}`}
-                          style={agentState === 'thinking'
-                            ? {
-                                background: 'rgba(15, 23, 42, 0.7)',
-                                border: '1px solid rgba(100, 116, 139, 0.55)',
-                                color: 'rgba(148, 163, 184, 0.9)',
-                                boxShadow: 'none',
-                                backdropFilter: 'blur(6px)',
-                              }
-                            : {
-                                background: 'linear-gradient(135deg, rgba(160,60,72,0.42), rgba(138,48,66,0.48))',
-                                border: '1px solid rgba(220,120,140,0.38)',
-                                color: '#ffffff',
-                                boxShadow: '0 8px 20px rgba(120,40,60,0.18)',
-                                backdropFilter: 'blur(6px)',
-                              }}
+                          disabled={fullAnalysisCtaDisabled}
+                          className={`w-full py-3 rounded-2xl border text-sm font-semibold transition-all duration-200 relative text-center ${fullAnalysisCtaDisabled ? 'cursor-not-allowed' : ''}`}
+                          style={fullAnalysisCtaStyle}
                         >
-                          <span className="block w-full whitespace-nowrap">{agentState === 'thinking' ? 'Running Full Combined Analysis...' : 'Run Full Combined Analysis'}</span>
+                          <span className="block w-full whitespace-nowrap">{fullAnalysisCtaLabel}</span>
                           <span
                             className="absolute inline-flex items-center justify-center rounded-full p-0.5 text-sky-100/60 transition-colors duration-150 hover:text-sky-100/90 focus-visible:text-sky-100/90"
                             style={{ right: 14, top: '50%', transform: 'translateY(-50%)' }}
@@ -11397,6 +11905,7 @@ function Baselines({
   const [rosterToastMessage, setRosterToastMessage] = useState<string | null>(null);
   const [runtimeSource, setRuntimeSource] = useState<'cosmos' | 'fallback'>(baselineSource);
   const [runtimeWarning, setRuntimeWarning] = useState<string | null>(baselineWarning);
+  const [hasRosterHintBeenUsed, setHasRosterHintBeenUsed] = useState(false);
 
   const sortedSignature = (rows: BaselineDraftRow[]): string =>
     JSON.stringify(
@@ -11495,6 +12004,9 @@ function Baselines({
   };
 
   const handleRosterToggle = (row: BaselineDraftRow, checked: boolean) => {
+    if (!hasRosterHintBeenUsed) {
+      setHasRosterHintBeenUsed(true);
+    }
     if (row._isDraft) {
       showRosterToast('Save changes first to add this player to roster.');
       return;
@@ -11908,6 +12420,25 @@ function Baselines({
 
   const draftValidationError = validateDraftBaselines(draftBaselines);
   const disableSave = !isDirty || isSaving || isLoadingBaselines || Boolean(draftValidationError);
+  const hasBaselineRows = draftBaselines.length > 0;
+  const shouldShowRosterHintGlow = hasBaselineRows && !hasRosterHintBeenUsed;
+  const emptyStatePanelStyle: React.CSSProperties = {
+    border: '1px solid rgba(34,211,238,0.22)',
+    background: 'linear-gradient(135deg, rgba(8,20,40,0.92), rgba(6,14,28,0.96))',
+    borderRadius: '18px',
+    padding: '22px 24px',
+    color: '#dbeafe',
+    boxShadow: '0 0 0 1px rgba(16,185,129,0.06), 0 12px 40px rgba(0,0,0,0.22)',
+  };
+  const helperStripStyle: React.CSSProperties = {
+    marginBottom: '14px',
+    padding: '12px 16px',
+    borderRadius: '12px',
+    border: '1px solid rgba(45,212,191,0.18)',
+    background: 'rgba(15,23,42,0.72)',
+    color: '#cbd5e1',
+    fontSize: '14px',
+  };
 
   return (
     <motion.div 
@@ -11979,17 +12510,62 @@ function Baselines({
         </div>
       )}
 
-      <div className="flex-1 bg-[#0F172A] border border-white/5 rounded-2xl overflow-hidden shadow-2xl flex flex-col">
-        {isLoadingBaselines ? (
-          <div className="flex-1 min-h-[460px] flex items-center justify-center px-6">
-            <div className="flex flex-col items-center justify-center text-center">
-              <div className="h-12 w-12 rounded-full border-2 border-slate-500/35 border-t-emerald-400 animate-spin" />
-              <p className="mt-4 text-sm text-slate-400">Loading players...</p>
-            </div>
-          </div>
-        ) : (
-         <div className="overflow-auto flex-1">
-           <table className="w-full text-left border-collapse min-w-[1300px]">
+	      <div className="flex-1 bg-[#0F172A] border border-white/5 rounded-2xl overflow-hidden shadow-2xl flex flex-col">
+	        {!isLoadingBaselines && hasBaselineRows && (
+	          <div className="px-4 pt-4">
+	            <div style={helperStripStyle}>
+	              <div>
+	                Tip: Check the{' '}
+	                <span style={{ color: '#ffffff', fontWeight: 700 }}>
+	                  Roster
+	                </span>{' '}
+	                box to add a player into the current match squad.
+	              </div>
+	              <div style={{ marginTop: '4px', fontSize: '12.5px', color: 'rgba(203,213,225,0.82)' }}>
+	                Baseline stores reusable player profiles. Roster selects who is active for this match.
+	              </div>
+	            </div>
+	          </div>
+	        )}
+	        {isLoadingBaselines ? (
+	          <div className="flex-1 min-h-[460px] flex items-center justify-center px-6">
+	            <div className="flex flex-col items-center justify-center text-center">
+	              <div className="h-12 w-12 rounded-full border-2 border-slate-500/35 border-t-emerald-400 animate-spin" />
+	              <p className="mt-4 text-sm text-slate-400">Loading players...</p>
+	            </div>
+	          </div>
+	        ) : !hasBaselineRows ? (
+	          <div className="flex-1 min-h-[460px] flex items-center justify-center px-6 py-10">
+	            <div style={{ ...emptyStatePanelStyle, width: '100%', maxWidth: '980px' }}>
+	              <h3 style={{ fontSize: '28px', fontWeight: 700, color: '#f8fafc' }}>
+	                Build Your Team Baseline
+	              </h3>
+	              <p
+	                style={{
+	                  marginTop: '10px',
+	                  fontSize: '15px',
+	                  lineHeight: 1.6,
+	                  color: 'rgba(226,232,240,0.78)',
+	                  maxWidth: '700px',
+	                }}
+	              >
+	                Create player profiles once and reuse them across every match. Keep your squad data saved and ready for fast match setup.
+	              </p>
+	              <div style={{ marginTop: '16px' }}>
+	                <button
+	                  type="button"
+	                  onClick={addDraftPlayer}
+	                  className="inline-flex items-center gap-2 rounded-lg px-5 py-2.5 font-bold transition-all bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/40"
+	                >
+	                  <Plus className="w-4 h-4" />
+	                  Create First Player
+	                </button>
+	              </div>
+	            </div>
+	          </div>
+	        ) : (
+	         <div className="overflow-auto flex-1">
+	           <table className="w-full text-left border-collapse min-w-[1300px]">
              <thead>
                <tr className="bg-slate-900/80 border-b border-white/5 text-xs font-bold text-slate-400 uppercase tracking-wider sticky top-0 z-10 backdrop-blur-md">
                  <th className="px-4 py-5 w-[8%]">ID</th>
@@ -12046,27 +12622,14 @@ function Baselines({
                </tr>
              </thead>
 	             <tbody className="divide-y divide-white/5 text-sm">
-		               {draftBaselines.length === 0 ? (
-                 <tr>
-                   <td colSpan={12} className="px-6 py-16">
-                     <div className="flex flex-col items-center justify-center text-center">
-                       <p className="text-lg font-semibold text-slate-200">No baseline players yet</p>
-                       <p className="mt-2 text-sm text-slate-400">
-                         {demoMode
-                           ? 'Add a baseline player or Reset Database to restore demo defaults.'
-                           : 'No player baselines yet. Add a player baseline to begin.'}
-                       </p>
-                     </div>
-                   </td>
-                 </tr>
-	               ) : (
-                draftBaselines.map((p) => {
-                  const isActive = p.inRoster === true;
-                  const trimmedName = p.name.trim();
-                  const idDisplay = p.id || trimmedName || '—';
-                  const rosterStatus = isActive
-                    ? { label: 'In roster', color: 'text-indigo-200 bg-indigo-500/15 border-indigo-400/35' }
-                    : { label: 'Not in roster', color: 'text-slate-300 bg-slate-700/30 border-slate-600/40' };
+	                {draftBaselines.map((p, index) => {
+	                  const isActive = p.inRoster === true;
+	                  const trimmedName = p.name.trim();
+	                  const idDisplay = p.id || trimmedName || '—';
+	                  const glowRosterCheckbox = shouldShowRosterHintGlow && index === 0;
+	                  const rosterStatus = isActive
+	                    ? { label: 'In roster', color: 'text-indigo-200 bg-indigo-500/15 border-indigo-400/35' }
+	                    : { label: 'Not in roster', color: 'text-slate-300 bg-slate-700/30 border-slate-600/40' };
 
                   return (
                  <tr key={p._localId} className="group hover:bg-white/[0.02] transition-colors">
@@ -12094,16 +12657,33 @@ function Baselines({
                         <option value="BAT">BAT</option>
                         <option value="AR">AR</option>
                       </select>
-                   </td>
-                   <td className="px-4 py-4 text-center">
-                     <input
-                       type="checkbox"
-                       checked={isActive}
-                       onChange={(e) => handleRosterToggle(p, e.target.checked)}
-                       title="Toggle roster membership for this match."
-                       className="w-4 h-4 accent-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed"
-                     />
-                   </td>
+	                   </td>
+	                   <td className="px-4 py-4 text-center">
+	                     <div
+	                       style={
+	                         glowRosterCheckbox
+	                           ? {
+	                               display: 'inline-flex',
+	                               alignItems: 'center',
+	                               justifyContent: 'center',
+	                               padding: '4px',
+	                               boxShadow:
+	                                 '0 0 0 2px rgba(34,211,238,0.22), 0 0 18px rgba(45,212,191,0.28), 0 0 28px rgba(59,130,246,0.18)',
+	                               borderRadius: '8px',
+	                               transition: 'box-shadow 0.25s ease',
+	                             }
+	                           : undefined
+	                       }
+	                     >
+	                       <input
+	                         type="checkbox"
+	                         checked={isActive}
+	                         onChange={(e) => handleRosterToggle(p, e.target.checked)}
+	                         title="Toggle roster membership for this match."
+	                         className="w-4 h-4 accent-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed"
+	                       />
+	                     </div>
+	                   </td>
                    <td className="px-4 py-4 text-center bg-indigo-500/5">
                      <div className="flex items-center justify-center gap-2">
                        <input 
@@ -12184,10 +12764,9 @@ function Baselines({
                        <Trash2 className="w-4 h-4" />
                      </button>
                    </td>
-                 </tr>
-               );
-                 })
-               )}
+	                 </tr>
+	               );
+	                 })}
                
                {/* Add Player Row */}
                <tr>
