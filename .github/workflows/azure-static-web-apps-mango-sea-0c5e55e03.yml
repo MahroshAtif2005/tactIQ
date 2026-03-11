@@ -61,9 +61,10 @@ jobs:
           ###### End of Repository/Build Configurations ######
 
   close_pull_request_job:
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    if: false
     runs-on: ubuntu-latest
     name: Close Pull Request Job
+    permissions: {}
     steps:
       - name: Close Pull Request
         id: closepullrequest
@@ -71,4 +72,3 @@ jobs:
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_MANGO_SEA_0C5E55E03 }}
           action: "close"
-          skip_deploy_on_missing_secrets: true
