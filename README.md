@@ -730,7 +730,26 @@ tactIQ supports two execution strategies depending on the depth of analysis requ
 
 - Executes **Fatigue, Injury Risk, and Tactical agents together**  
 - Produces a comprehensive coaching briefing  
-- Designed for deeper evaluation during critical match moments  
+- Designed for deeper evaluation during critical match moments
+
+----
+## Real-Time Data Pipeline Readiness
+
+tactIQ is designed with a modular ingestion architecture so live match and player health data can be integrated without modifying the tactical decision engine.
+
+Planned real-time connectors include:
+	•	Ball-by-ball scoring APIs
+	•	Wearable / GPS telemetry feeds
+	•	Biometric and workload monitoring systems
+	•	Analyst event tagging streams
+
+Intended pipeline
+	1.	Ingest external match and sensor events
+	2.	Normalize them into a unified match-state model
+	3.	Evaluate tactical pressure, fatigue, and injury-risk signals
+	4.	Trigger agent recommendations and dashboard updates in near real time
+
+The platform prioritizes decision intelligence and multi-agent orchestration, while keeping the data ingestion layer modular. This design allows leagues, clubs, and wearable technology providers to integrate live scoring feeds and player telemetry without modifying the tactical AI engine.
 
 ---
 
