@@ -34,15 +34,21 @@ const parseRosterIds = (raw: string): string[] | null => {
   }
 };
 
-const seedDemoRosterIds = (): string[] => {
-  const seeded = dedupeIds([...DEFAULT_DEMO_ROSTER_IDS]);
+export const getDefaultDemoRosterIds = (): string[] => dedupeIds([...DEFAULT_DEMO_ROSTER_IDS]);
+
+const persistDemoRosterIds = (ids: string[]): void => {
   if (typeof window !== 'undefined') {
     try {
-      window.localStorage.setItem(DEMO_ROSTER_STORAGE_KEY, JSON.stringify(seeded));
+      window.localStorage.setItem(DEMO_ROSTER_STORAGE_KEY, JSON.stringify(dedupeIds(ids)));
     } catch {
       // Ignore storage write failures.
     }
   }
+};
+
+const seedDemoRosterIds = (): string[] => {
+  const seeded = getDefaultDemoRosterIds();
+  persistDemoRosterIds(seeded);
   return seeded;
 };
 
@@ -94,17 +100,7 @@ const updateBaselineDraftRosterState = (playerId: string, inRoster: boolean): vo
 export const getRosterIds = (): string[] => {
   if (typeof window === 'undefined') return [];
   if (isDemoModeEnabled()) {
-    try {
-      const raw = window.localStorage.getItem(DEMO_ROSTER_STORAGE_KEY);
-      if (!raw) {
-        return seedDemoRosterIds();
-      }
-      const parsed = parseRosterIds(raw);
-      if (parsed) return parsed;
-      return seedDemoRosterIds();
-    } catch {
-      return seedDemoRosterIds();
-    }
+    return ensureDemoRoster();
   }
   try {
     const activeKey = getActiveRosterStorageKey();
@@ -167,8 +163,7 @@ export const clearRoster = (): void => {
 };
 
 export const ensureDemoRosterSeeded = (): string[] => {
-  if (!isDemoModeEnabled()) return getRosterIds();
-  return getRosterIds();
+  return ensureDemoRoster();
 };
 
 export const resetDemoRosterToDefaults = (): string[] => {
@@ -179,6 +174,24 @@ export const resetDemoRosterToDefaults = (): string[] => {
     // Ignore storage failures.
   }
   return seedDemoRosterIds();
+};
+
+export const ensureDemoRoster = (): string[] => {
+  if (typeof window === 'undefined') return getDefaultDemoRosterIds();
+  if (!isDemoModeEnabled()) return getRosterIds();
+  try {
+    const raw = window.localStorage.getItem(DEMO_ROSTER_STORAGE_KEY);
+    if (!raw) return seedDemoRosterIds();
+    const parsed = parseRosterIds(raw);
+    if (parsed && parsed.length > 0) {
+      // Normalize persisted IDs to keep deterministic order and dedupe behavior.
+      persistDemoRosterIds(parsed);
+      return parsed;
+    }
+    return seedDemoRosterIds();
+  } catch {
+    return seedDemoRosterIds();
+  }
 };
 
 export { ROSTER_STORAGE_KEY, DEMO_ROSTER_STORAGE_KEY };

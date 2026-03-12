@@ -52,7 +52,7 @@ import {
   apiOrchestrateUrl,
   checkHealth,
   deleteBaseline,
-  ensureDemoBaselinesSeeded,
+  ensureDemoSeedData,
   ensureCoachUserProfile,
   getAiStatus,
   getBaselineByPlayerId,
@@ -67,6 +67,8 @@ import {
 import CopilotChatPanel from './components/CopilotChatPanel';
 import {
   DEMO_ROSTER_STORAGE_KEY,
+  ensureDemoRoster,
+  getDefaultDemoRosterIds,
   getRosterIds,
   removeFromRosterSession,
   ROSTER_STORAGE_KEY,
@@ -1352,6 +1354,37 @@ const resolveRosterIdsFromBaselines = (candidateIds: string[], baselines: Baseli
   return resolved.slice(0, MAX_ROSTER);
 };
 
+const idsFromRosterMarkedBaselines = (baselines: Baseline[]): string[] =>
+  orderBaselinesForDisplay(baselines)
+    .map((row) => normalizeBaselineRecord(row))
+    .filter((row) => row.inRoster === true)
+    .map((row) => normalizeBaselineId(row.id || row.playerId || row.name))
+    .filter((id) => id.length > 0);
+
+const idsFromAllBaselines = (baselines: Baseline[]): string[] =>
+  orderBaselinesForDisplay(baselines)
+    .map((row) => normalizeBaselineRecord(row))
+    .map((row) => normalizeBaselineId(row.id || row.playerId || row.name))
+    .filter((id) => id.length > 0);
+
+const resolveDemoRosterIdsWithRepair = (
+  candidateIds: string[],
+  baselines: Baseline[]
+): string[] => {
+  const attempts = [
+    candidateIds,
+    getDefaultDemoRosterIds(),
+    idsFromRosterMarkedBaselines(baselines),
+    idsFromAllBaselines(baselines),
+  ];
+
+  for (const attempt of attempts) {
+    const resolved = resolveRosterIdsFromBaselines(attempt, baselines);
+    if (resolved.length > 0) return resolved;
+  }
+  return [];
+};
+
 const baselineFromPlayer = (player: Player): Baseline =>
   normalizeBaselineRecord({
     id: normalizeBaselineId(player.id),
@@ -1569,24 +1602,7 @@ const readDemoSessionFlag = (): boolean => {
 
 const readDemoRosterIdsForBootstrap = (): string[] => {
   if (typeof window === 'undefined') return [];
-  try {
-    const raw = window.localStorage.getItem(DEMO_ROSTER_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    const seen = new Set<string>();
-    const resolved: string[] = [];
-    parsed.forEach((entry) => {
-      const normalized = normalizeBaselineId(entry);
-      const key = baselineKey(normalized);
-      if (!key || seen.has(key)) return;
-      seen.add(key);
-      resolved.push(normalized);
-    });
-    return resolved;
-  } catch {
-    return [];
-  }
+  return ensureDemoRoster();
 };
 
 const persistDemoSessionFlag = (enabled: boolean): void => {
@@ -1618,16 +1634,15 @@ export default function App() {
       };
     }
 
-    const seededBaselines = orderBaselinesForDisplay(ensureDemoBaselinesSeeded());
-    const rosterFromBaselines = seededBaselines
-      .map((row) => normalizeBaselineRecord(row))
-      .filter((row) => row.inRoster === true)
-      .map((row) => normalizeBaselineId(row.id || row.playerId || row.name));
-    const persistedRosterIds = readDemoRosterIdsForBootstrap();
-    const resolvedRosterIds = resolveRosterIdsFromBaselines(
-      persistedRosterIds.length > 0 ? persistedRosterIds : rosterFromBaselines,
-      seededBaselines
-    );
+    const seededData = ensureDemoSeedData();
+    const seededBaselines = orderBaselinesForDisplay(seededData.baselines);
+    const persistedRosterIds = seededData.rosterIds.length > 0
+      ? seededData.rosterIds
+      : readDemoRosterIdsForBootstrap();
+    const resolvedRosterIds = resolveDemoRosterIdsWithRepair(persistedRosterIds, seededBaselines);
+    if (resolvedRosterIds.length > 0) {
+      setRosterIds(resolvedRosterIds);
+    }
     const seededPlayers = hydrateDismissalStateFromSession(
       buildRosterPlayersFromBaselines([], seededBaselines, resolvedRosterIds)
     );
@@ -1900,7 +1915,7 @@ export default function App() {
     if (sessionMode === 'demo') {
       setDemoModeEnabled(true);
       persistDemoSessionFlag(true);
-      ensureDemoBaselinesSeeded();
+      ensureDemoSeedData();
       if (!onDemoPath) {
         window.history.replaceState(null, '', '/demo');
         logSessionDebug('route_redirect:force_demo_path', { path });
@@ -2140,7 +2155,9 @@ export default function App() {
       const baseRosterIds = rosterInitializedRef.current
         ? previousRosterIds
         : getRosterIds();
-      const resolvedIds = resolveRosterIdsFromBaselines(baseRosterIds, orderedRows);
+      const resolvedIds = isDemoSession
+        ? resolveDemoRosterIdsWithRepair(baseRosterIds, orderedRows)
+        : resolveRosterIdsFromBaselines(baseRosterIds, orderedRows);
       const rosterIdSet = new Set(resolvedIds.map((id) => baselineKey(id)));
       const syncedBaselines = orderedRows.map((row) => {
         const normalized = normalizeBaselineRecord(row);
@@ -4481,7 +4498,9 @@ export default function App() {
         seen.add(key);
         return true;
       });
-    const resolvedRosterIds = resolveRosterIdsFromBaselines([...baseRosterIds, ...additions], orderedBaselines);
+    const resolvedRosterIds = isDemoSession
+      ? resolveDemoRosterIdsWithRepair([...baseRosterIds, ...additions], orderedBaselines)
+      : resolveRosterIdsFromBaselines([...baseRosterIds, ...additions], orderedBaselines);
     const rosterKeySet = new Set(resolvedRosterIds.map((id) => baselineKey(id)));
     const syncedBaselines = orderedBaselines.map((row) => {
       const normalized = normalizeBaselineRecord(row);

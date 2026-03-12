@@ -2,7 +2,7 @@ import { FatigueAgentResponse, OrchestrateResponse, RiskAgentResponse, TacticalA
 import { Baseline, PlayerBaseline } from '../types/baseline';
 import { isDemoModeEnabled } from '../auth/swaAuth';
 import { cloneDemoBaselineSeed } from '../data/demoRoster';
-import { ensureDemoRosterSeeded, resetDemoRosterToDefaults } from './rosterStorage';
+import { ensureDemoRoster, resetDemoRosterToDefaults } from './rosterStorage';
 
 export type ApiClientErrorKind = 'network' | 'timeout' | 'cors' | 'http' | 'parse';
 export type AgentFrameworkMode = 'route' | 'all';
@@ -883,7 +883,7 @@ const writeDemoBaselines = (rows: Baseline[]): void => {
 
 export const ensureDemoBaselinesSeeded = (): Baseline[] => {
   const rows = readDemoBaselines();
-  ensureDemoRosterSeeded();
+  ensureDemoRoster();
   if (typeof window !== 'undefined') {
     try {
       window.localStorage.setItem(DEMO_SEEDED_STORAGE_KEY, 'true');
@@ -892,6 +892,12 @@ export const ensureDemoBaselinesSeeded = (): Baseline[] => {
     }
   }
   return rows;
+};
+
+export const ensureDemoSeedData = (): { baselines: Baseline[]; rosterIds: string[] } => {
+  const baselines = ensureDemoBaselinesSeeded();
+  const rosterIds = ensureDemoRoster();
+  return { baselines, rosterIds };
 };
 
 export async function getBaselinesWithMeta(signal?: AbortSignal): Promise<BaselinesResponse> {
