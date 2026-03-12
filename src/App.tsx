@@ -5247,6 +5247,7 @@ interface PressureForecastPoint {
 const FORECAST_OVERS = [0, 1, 2, 3, 4, 5];
 const FORECAST_Y_TICKS = [0, 2.5, 5, 7.5, 10];
 const FORECAST_RISK_TICKS = [0, 20, 40, 60, 80, 100];
+const LOW_RISK_THRESHOLD_PCT = 35;
 const HIGH_RISK_THRESHOLD_PCT = 65;
 const RISK_ACCELERATION_THRESHOLD = 12;
 
@@ -5258,14 +5259,6 @@ const fatigueIntensityMultiplier = (intensity?: string): number => {
   return 1.0;
 };
 
-const fatigueRecoveryDelta = (heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok'): number => {
-  const normalized = String(heartRateRecovery || '').trim().toUpperCase();
-  if (normalized === 'GOOD') return -0.2;
-  if (normalized === 'OK' || normalized === 'MODERATE') return -0.1;
-  if (normalized === 'POOR') return 0.0;
-  return -0.1;
-};
-
 const normalizeRiskToken = (value: unknown): 'LOW' | 'MEDIUM' | 'HIGH' => {
   const token = String(value || '').trim().toUpperCase();
   if (token === 'HIGH' || token === 'CRITICAL') return 'HIGH';
@@ -5273,11 +5266,78 @@ const normalizeRiskToken = (value: unknown): 'LOW' | 'MEDIUM' | 'HIGH' => {
   return 'LOW';
 };
 
-const toRecoveryScore = (heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok'): number => {
+const toRecoveryNormalized = (heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok'): number => {
   const normalized = String(heartRateRecovery || '').trim().toUpperCase();
-  if (normalized === 'GOOD') return 2;
-  if (normalized === 'OK' || normalized === 'MODERATE') return 1;
-  return 0;
+  if (normalized === 'GOOD') return 0.95;
+  if (normalized === 'OK' || normalized === 'MODERATE') return 0.62;
+  if (normalized === 'POOR') return 0.28;
+  return 0.62;
+};
+
+const riskTierFromPct = (riskPct: number): 'Low' | 'Medium' | 'High' => {
+  if (riskPct >= HIGH_RISK_THRESHOLD_PCT) return 'High';
+  if (riskPct >= LOW_RISK_THRESHOLD_PCT) return 'Medium';
+  return 'Low';
+};
+
+const riskContextWeight = (
+  risk: unknown,
+  weights: { low: number; medium: number; high: number }
+): number => {
+  const token = normalizeRiskToken(risk);
+  if (token === 'HIGH') return weights.high;
+  if (token === 'MEDIUM') return weights.medium;
+  return weights.low;
+};
+
+const computeOverloadIndex = ({
+  currentFatigue,
+  strainIndex,
+  oversBowled,
+  recoveryNormalized,
+}: {
+  currentFatigue: number;
+  strainIndex: number;
+  oversBowled: number;
+  recoveryNormalized: number;
+}): number => {
+  const fatigueLoad = clamp(currentFatigue, 0, 10) / 10;
+  const strainLoad = clamp(strainIndex, 0, 10) / 10;
+  const spellLoad = clamp(oversBowled, 0, 6) / 6;
+  return clamp(
+    fatigueLoad * 0.35 +
+      strainLoad * 0.30 +
+      spellLoad * 0.20 +
+      (1 - clamp(recoveryNormalized, 0, 1)) * 0.15,
+    0,
+    1.2
+  );
+};
+
+const isSevereRiskEdge = ({
+  fatigue,
+  strainIndex,
+  oversBowled,
+  recoveryNormalized,
+  injuryRisk,
+  noBallRisk,
+}: {
+  fatigue: number;
+  strainIndex: number;
+  oversBowled: number;
+  recoveryNormalized: number;
+  injuryRisk?: string;
+  noBallRisk?: string;
+}): boolean => {
+  const injuryToken = normalizeRiskToken(injuryRisk);
+  const noBallToken = normalizeRiskToken(noBallRisk);
+  return (
+    fatigue >= 9.6 &&
+    strainIndex >= 8 &&
+    oversBowled >= 4 &&
+    recoveryNormalized <= 0.35 &&
+    (injuryToken === 'HIGH' || noBallToken === 'HIGH')
+  );
 };
 
 const baselineInjuryRiskPct = ({
@@ -5285,54 +5345,89 @@ const baselineInjuryRiskPct = ({
   noBallRisk,
   currentFatigue,
   strainIndex,
+  oversBowled,
   heartRateRecovery,
 }: {
   injuryRisk?: string;
   noBallRisk?: string;
   currentFatigue: number;
   strainIndex: number;
+  oversBowled: number;
   heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
 }): number => {
-  const injuryToken = normalizeRiskToken(injuryRisk);
-  const noBallToken = normalizeRiskToken(noBallRisk);
-  const injuryBase = injuryToken === 'HIGH' ? 72 : injuryToken === 'MEDIUM' ? 50 : 20;
-  const noBallBump = noBallToken === 'HIGH' ? 10 : noBallToken === 'MEDIUM' ? 5 : 0;
-  const fatigueBump = Math.max(0, (clamp(currentFatigue, 0, 10) - 4) * 4);
-  const strainBump = Math.max(0, clamp(strainIndex, 0, 10) * 4.5);
-  const recoveryAdjustment = toRecoveryScore(heartRateRecovery) === 2 ? -6 : toRecoveryScore(heartRateRecovery) === 1 ? 0 : 6;
-  return Math.round(clamp(injuryBase + noBallBump + fatigueBump + strainBump + recoveryAdjustment, 0, 100));
+  const safeFatigue = clamp(currentFatigue, 0, 10);
+  const safeStrain = clamp(strainIndex, 0, 10);
+  const safeOvers = Math.max(0, oversBowled);
+  const recoveryNormalized = toRecoveryNormalized(heartRateRecovery);
+  const fatigueComponent = Math.pow(safeFatigue / 10, 1.25) * 38;
+  const strainComponent = Math.pow(safeStrain / 10, 1.15) * 18;
+  const workloadComponent = Math.min(1.5, safeOvers / 4) * 10.5;
+  const recoveryComponent = (1 - recoveryNormalized) * 12;
+  const injuryContextComponent = riskContextWeight(injuryRisk, { low: 2, medium: 8, high: 15 });
+  const noBallContextComponent = riskContextWeight(noBallRisk, { low: 0, medium: 3, high: 6 });
+  const lateFatigueBump = Math.max(0, safeFatigue - 6.5) * 1.6;
+  const severeEdge = isSevereRiskEdge({
+    fatigue: safeFatigue,
+    strainIndex: safeStrain,
+    oversBowled: safeOvers,
+    recoveryNormalized,
+    injuryRisk,
+    noBallRisk,
+  });
+  const riskCap = severeEdge ? 100 : 99;
+  return Math.round(
+    clamp(
+      fatigueComponent +
+        strainComponent +
+        workloadComponent +
+        recoveryComponent +
+        injuryContextComponent +
+        noBallContextComponent +
+        lateFatigueBump,
+      0,
+      riskCap
+    )
+  );
 };
 
 const buildRiskReason = ({
   fatigue,
+  injuryRiskPct,
   strainIndex,
   overAhead,
   heartRateRecovery,
 }: {
   fatigue: number;
+  injuryRiskPct: number;
   strainIndex: number;
   overAhead: number;
   heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
 }): string => {
+  const tier = riskTierFromPct(injuryRiskPct);
+  const recoveryNormalized = toRecoveryNormalized(heartRateRecovery);
   const reasons: string[] = [];
-  if (strainIndex >= 2.5 || overAhead >= 3) {
-    reasons.push('acute load is rising');
+  if (strainIndex >= 6 || overAhead >= 3) {
+    reasons.push('workload pressure is compounding');
   }
-  if (toRecoveryScore(heartRateRecovery) < 2) {
-    reasons.push('recovery is low');
+  if (recoveryNormalized < 0.45) {
+    reasons.push('recovery is lagging');
   }
-  if (fatigue >= 6) {
-    reasons.push('fatigue is above threshold');
+  if (fatigue >= 8.5) {
+    reasons.push('fatigue is nearing max');
+  } else if (fatigue >= 6.5) {
+    reasons.push('fatigue is building');
   }
   if (reasons.length === 0) {
-    return 'Risk remains controlled under current workload.';
+    return `${tier} risk. Workload trend remains manageable.`;
   }
-  return `Risk ↑ because ${reasons.join(' + ')}.`;
+  return `${tier} risk because ${reasons.join(' + ')}.`;
 };
 
 const buildFatigueForecast = ({
   currentFatigue,
   currentRiskPct,
+  injuryRisk,
+  noBallRisk,
   strainIndex,
   oversBowled,
   projectionHorizon,
@@ -5341,43 +5436,100 @@ const buildFatigueForecast = ({
 }: {
   currentFatigue: number;
   currentRiskPct: number;
+  injuryRisk?: string;
+  noBallRisk?: string;
   strainIndex: number;
   oversBowled: number;
   projectionHorizon: number;
   intensity?: string;
   heartRateRecovery?: Player['hrRecovery'] | 'OK' | 'Ok';
 }): FatigueForecastPoint[] => {
+  // Deterministic weighted projection so fatigue/risk trends are smooth and reproducible.
   const startFatigue = clamp(currentFatigue, 0, 10);
-  const safeStrain = Math.max(0, strainIndex);
+  const safeStrain = clamp(strainIndex, 0, 10);
   const safeOvers = Math.max(0, oversBowled);
-  const incrementPerOver =
-    0.55 * fatigueIntensityMultiplier(intensity) +
-    0.08 * safeStrain +
-    0.04 * Math.max(0, safeOvers - 1) +
-    fatigueRecoveryDelta(heartRateRecovery);
-  const recoveryScore = toRecoveryScore(heartRateRecovery);
+  const recoveryNormalized = toRecoveryNormalized(heartRateRecovery);
+  const overloadIndex = computeOverloadIndex({
+    currentFatigue: startFatigue,
+    strainIndex: safeStrain,
+    oversBowled: safeOvers,
+    recoveryNormalized,
+  });
+  const baseIncrementPerOver =
+    0.14 +
+    0.19 * fatigueIntensityMultiplier(intensity) +
+    0.16 * overloadIndex +
+    0.03 * Math.max(0, Math.min(6, safeOvers) - 1);
   const oversAhead = Array.from({ length: projectionHorizon + 1 }, (_, index) => index);
+  let previousFatigue = startFatigue;
   let previousRisk = clamp(currentRiskPct, 0, 100);
 
   return oversAhead.map((overAhead) => {
-    const linearFatigue = startFatigue + incrementPerOver * overAhead;
-    const nonLinearFatigue = linearFatigue >= 6 ? (linearFatigue - 6) * 0.12 * Math.max(0, overAhead - 1) : 0;
-    const fatigue = Number(clamp(linearFatigue + nonLinearFatigue, 0, 10).toFixed(1));
-    const rawRisk = clamp(
-      currentRiskPct +
-        fatigue * 6 +
-        safeStrain * 8 -
-        recoveryScore * 5 +
-        overAhead * 3 +
-        (fatigue >= 6 ? (fatigue - 6) * (5 + overAhead * 1.2) : 0),
-      0,
-      100
-    );
-    const smoothingFactor = overAhead <= 2 ? 0.30 : 0.45;
-    const injuryRiskPct =
+    const fatigue =
       overAhead === 0
-        ? Math.round(clamp(currentRiskPct, 0, 100))
-        : Math.round(clamp(previousRisk + (rawRisk - previousRisk) * smoothingFactor, 0, 100));
+        ? Number(startFatigue.toFixed(1))
+        : (() => {
+            const progressionFactor = 1 + (overAhead - 1) * (0.05 + overloadIndex * 0.05);
+            const capDamping =
+              previousFatigue >= 9.6
+                ? 0.40
+                : previousFatigue >= 8.8
+                  ? 0.55
+                  : previousFatigue >= 8
+                    ? 0.78
+                    : 1.0;
+            const fatigueStep = baseIncrementPerOver * progressionFactor * capDamping;
+            previousFatigue = Number(clamp(previousFatigue + fatigueStep, 0, 10).toFixed(1));
+            return previousFatigue;
+          })();
+
+    const projectedOvers = safeOvers + overAhead;
+    const fatigueComponent = Math.pow(fatigue / 10, 1.25) * 38;
+    const strainComponent = Math.pow(safeStrain / 10, 1.15) * 18;
+    const workloadComponent = Math.min(1.7, projectedOvers / 4) * 10.5;
+    const recoveryComponent = (1 - recoveryNormalized) * 12;
+    const injuryContextComponent = riskContextWeight(injuryRisk, { low: 2, medium: 8, high: 15 });
+    const noBallContextComponent = riskContextWeight(noBallRisk, { low: 0, medium: 3, high: 6 });
+    const progressiveLoad = overAhead * (0.8 + overloadIndex * 1.5);
+    const lateFatigueBump = Math.max(0, fatigue - 6.5) * (1.6 + overloadIndex * 0.5);
+    const severeEdge = isSevereRiskEdge({
+      fatigue,
+      strainIndex: safeStrain,
+      oversBowled: projectedOvers,
+      recoveryNormalized,
+      injuryRisk,
+      noBallRisk,
+    });
+    const riskCap = severeEdge ? 100 : 99;
+    const riskTarget = clamp(
+      fatigueComponent +
+        strainComponent +
+        workloadComponent +
+        recoveryComponent +
+        injuryContextComponent +
+        noBallContextComponent +
+        progressiveLoad +
+        lateFatigueBump,
+      0,
+      riskCap
+    );
+    let injuryRiskPct =
+      overAhead === 0
+        ? Math.round(clamp(currentRiskPct, 0, riskCap))
+        : (() => {
+            const smoothingFactor = clamp(0.44 + overloadIndex * 0.08, 0.42, 0.56);
+            const blendedRisk = previousRisk + (riskTarget - previousRisk) * smoothingFactor;
+            const maxRiskStep = severeEdge ? 10 : overloadIndex >= 0.85 ? 8 : overloadIndex >= 0.60 ? 7 : 6;
+            // Cap per-over jumps so high-risk states climb progressively instead of instant flatline.
+            const boundedRisk = clamp(blendedRisk, previousRisk - 2, previousRisk + maxRiskStep);
+            const minStepIfRising = overloadIndex >= 0.75 ? 2 : overloadIndex >= 0.45 ? 1 : 0;
+            let nextRisk = Math.round(clamp(boundedRisk, 0, riskCap));
+            if (riskTarget > previousRisk && minStepIfRising > 0) {
+              nextRisk = Math.max(nextRisk, Math.round(previousRisk + minStepIfRising));
+            }
+            return nextRisk;
+          })();
+    injuryRiskPct = Math.round(clamp(injuryRiskPct, 0, riskCap));
     previousRisk = injuryRiskPct;
     return {
       overAhead,
@@ -5385,6 +5537,7 @@ const buildFatigueForecast = ({
       injuryRiskPct,
       reason: buildRiskReason({
         fatigue,
+        injuryRiskPct,
         strainIndex: safeStrain,
         overAhead,
         heartRateRecovery,
@@ -5444,9 +5597,10 @@ function FatigueForecastChart({
         noBallRisk: currentNoBallRisk,
         currentFatigue,
         strainIndex,
+        oversBowled,
         heartRateRecovery,
       }),
-    [currentInjuryRisk, currentNoBallRisk, currentFatigue, strainIndex, heartRateRecovery]
+    [currentInjuryRisk, currentNoBallRisk, currentFatigue, strainIndex, oversBowled, heartRateRecovery]
   );
   const points: FatigueForecastPoint[] = React.useMemo(() => {
     if (isTerminalRiskState) {
@@ -5470,6 +5624,8 @@ function FatigueForecastChart({
     return buildFatigueForecast({
       currentFatigue,
       currentRiskPct,
+      injuryRisk: currentInjuryRisk,
+      noBallRisk: currentNoBallRisk,
       strainIndex,
       oversBowled,
       projectionHorizon,
@@ -5480,6 +5636,8 @@ function FatigueForecastChart({
     isTerminalRiskState,
     currentFatigue,
     currentRiskPct,
+    currentInjuryRisk,
+    currentNoBallRisk,
     strainIndex,
     oversBowled,
     projectionHorizon,
@@ -5579,9 +5737,9 @@ function FatigueForecastChart({
                   <stop offset="100%" stopColor="rgba(244,114,182,0.92)" />
                 </linearGradient>
               </defs>
-              <ReferenceArea yAxisId="risk" y1={0} y2={35} fill="rgba(16,185,129,0.08)" strokeOpacity={0} />
-              <ReferenceArea yAxisId="risk" y1={35} y2={65} fill="rgba(245,158,11,0.08)" strokeOpacity={0} />
-              <ReferenceArea yAxisId="risk" y1={65} y2={100} fill="rgba(244,63,94,0.08)" strokeOpacity={0} />
+              <ReferenceArea yAxisId="risk" y1={0} y2={LOW_RISK_THRESHOLD_PCT} fill="rgba(16,185,129,0.08)" strokeOpacity={0} />
+              <ReferenceArea yAxisId="risk" y1={LOW_RISK_THRESHOLD_PCT} y2={HIGH_RISK_THRESHOLD_PCT} fill="rgba(245,158,11,0.08)" strokeOpacity={0} />
+              <ReferenceArea yAxisId="risk" y1={HIGH_RISK_THRESHOLD_PCT} y2={100} fill="rgba(244,63,94,0.08)" strokeOpacity={0} />
               <CartesianGrid strokeDasharray="4 6" vertical={false} stroke="rgba(255,255,255,0.08)" />
               <XAxis
                 dataKey="overAhead"
