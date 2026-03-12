@@ -7756,6 +7756,25 @@ function Dashboard({
     tacticalAnalysis?.immediateAction ||
     combinedDecision?.immediateAction
   );
+  const hasUsableAgentOutput: Record<AgentKey, boolean> = {
+    fatigue: Boolean(aiAnalysis),
+    risk: Boolean(riskAnalysis),
+    tactical: Boolean(
+      tacticalAnalysis ||
+      combinedDecision?.immediateAction ||
+      activeStrategicAnalysis?.tacticalRecommendation?.nextAction ||
+      activeStrategicAnalysis?.tacticalRecommendation?.why
+    ),
+  };
+  const isAgentCompleteForCoverage = (agent: AgentKey): boolean => {
+    const status = agentFeedStatus[agent];
+    const completedStatus = status === 'SUCCESS' || status === 'FALLBACK';
+    if (!completedStatus) return false;
+    return hasUsableAgentOutput[agent];
+  };
+  const completedRequiredAgents = AGENT_KEYS.filter((agent) => isAgentCompleteForCoverage(agent));
+  const hasCompleteAnalysis = completedRequiredAgents.length === AGENT_KEYS.length;
+  const hasPartialAnalysis = hasAnyAnalysis && completedRequiredAgents.length > 0 && !hasCompleteAnalysis;
   const hasCoachOutputText = Boolean(
     (typeof coachOutput?.summary === 'string' && coachOutput.summary.trim().length > 0) ||
     (typeof coachOutput?.tacticalRecommendation === 'string' && coachOutput.tacticalRecommendation.trim().length > 0) ||
@@ -10124,11 +10143,12 @@ function Dashboard({
 
   // CTA state machine: run -> current -> stale refresh.
   const fullAnalysisIsRunning = agentState === 'thinking' || fullAnalysisRunPending;
-  const fullAnalysisNeedsRefresh = analysisExecuted && analysisStale;
-  const fullAnalysisUpToDate = analysisExecuted && !analysisStale && !fullAnalysisIsRunning;
+  const shouldShowRunFullAnalysis = !fullAnalysisIsRunning && (!analysisExecuted || !hasCompleteAnalysis);
+  const fullAnalysisNeedsRefresh = analysisExecuted && analysisStale && hasCompleteAnalysis;
+  const fullAnalysisUpToDate = analysisExecuted && !analysisStale && !fullAnalysisIsRunning && hasCompleteAnalysis;
   const fullAnalysisCtaLabel = fullAnalysisIsRunning
     ? 'Refreshing Analysis...'
-    : !analysisExecuted
+    : shouldShowRunFullAnalysis
       ? 'Run Full Combined Analysis'
       : fullAnalysisNeedsRefresh
         ? 'Refresh Combined Analysis'
@@ -11792,6 +11812,23 @@ function Dashboard({
                           }}
                         >
                           ⚠️ Inputs changed — dismiss or rerun AI analysis for updated guidance.
+                        </p>
+                      )}
+                      {analysisExecuted && !fullAnalysisIsRunning && hasPartialAnalysis && (
+                        <p
+                          style={{
+                            marginTop: '12px',
+                            marginBottom: '12px',
+                            padding: '10px 12px',
+                            borderRadius: '12px',
+                            background: 'rgba(56, 189, 248, 0.10)',
+                            border: '1px solid rgba(56, 189, 248, 0.28)',
+                            color: '#bae6fd',
+                            fontSize: '13px',
+                            lineHeight: '1.4',
+                          }}
+                        >
+                          Partial analysis available — run full combined analysis to include all required agents.
                         </p>
                       )}
                       <div className="min-h-[48px] flex items-center">
