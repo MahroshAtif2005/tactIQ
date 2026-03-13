@@ -91,10 +91,30 @@ const capAutoSelectedAgents = (selected: LegacyAgentId[]): LegacyAgentId[] => {
 const isCriticalRouterDecision = (decision: RouterDecision): boolean => {
   const intentToken = String(decision.intent || '').trim().toUpperCase();
   if (intentToken === 'SUBSTITUTION' || intentToken === 'SAFETY_ALERT') return true;
+  const activeSignals = (decision.inputsUsed?.active || {}) as Record<string, unknown>;
   const injuryRisk = normalizeRisk(decision.signals?.injuryRisk ?? decision.inputsUsed?.active?.injuryRisk);
   const noBallRisk = normalizeRisk(decision.signals?.noBallRisk ?? decision.inputsUsed?.active?.noBallRisk);
   const fatigueIndex = safeNumber(decision.signals?.fatigueIndex ?? decision.inputsUsed?.active?.fatigueIndex, 0);
-  return injuryRisk === 'HIGH' || noBallRisk === 'HIGH' || fatigueIndex >= 7.5;
+  const strainIndex = safeNumber(decision.signals?.strainIndex, 0);
+  const recoveryToken = String(decision.signals?.heartRateRecovery ?? decision.signals?.recovery ?? '').trim().toUpperCase();
+  const availabilityToken = String(decision.signals?.availabilityStatus ?? activeSignals.availabilityStatus ?? '').trim().toUpperCase();
+  const substitutionRequired =
+    decision.signals?.substitutionRequired === true ||
+    String(decision.signals?.substitutionRequired || '').trim().toLowerCase() === 'true';
+  const decisionSignalToken = String(decision.signals?.decisionSignal ?? decision.signals?.decisionMode ?? '').trim().toUpperCase();
+  const recoveryPoor = recoveryToken === 'POOR' || recoveryToken === 'VERY POOR';
+  const availabilityEscalated = availabilityToken === 'LIMITED' || availabilityToken === 'UNAVAILABLE';
+  const severeDecisionSignal = /IMMEDIATE_SUBSTITUTION|REMOVE_FROM_ACTIVE|MARK_UNFIT|UNSAFE_TO_CONTINUE/.test(decisionSignalToken);
+  return (
+    injuryRisk === 'HIGH' ||
+    noBallRisk === 'HIGH' ||
+    fatigueIndex >= 7.5 ||
+    strainIndex >= 7 ||
+    recoveryPoor ||
+    availabilityEscalated ||
+    substitutionRequired ||
+    severeDecisionSignal
+  );
 };
 const toAgentStatus = (status: string | undefined, didRun: boolean): AgentStatus => {
   if (!didRun) return 'SKIPPED';
@@ -466,6 +486,14 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
     .trim()
     .toUpperCase();
   const recoveryNotGood = recoveryToken.length > 0 && recoveryToken !== 'GOOD';
+  const recoveryPoor = recoveryToken === 'POOR' || recoveryToken === 'VERY POOR';
+  const availabilityToken = String(signalRecord.availabilityStatus ?? signalRecord.availability ?? '').trim().toUpperCase();
+  const availabilityEscalated = availabilityToken === 'LIMITED' || availabilityToken === 'UNAVAILABLE';
+  const substitutionRequiredSignal =
+    signalRecord.substitutionRequired === true ||
+    String(signalRecord.substitutionRequired || '').trim().toLowerCase() === 'true';
+  const decisionSignalToken = String(signalRecord.decisionMode ?? signalRecord.decision ?? '').trim().toUpperCase();
+  const severeDecisionSignal = /IMMEDIATE_SUBSTITUTION|REMOVE_FROM_ACTIVE|MARK_UNFIT|UNSAFE_TO_CONTINUE/.test(decisionSignalToken);
   const fatigueTrendToken = String(
     signalRecord.fatigueTrend ??
       signalRecord.fatigueTrendDirection ??
@@ -497,15 +525,36 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
     recoveryNotGood ||
     fatigueTrendRising;
   const riskTriggered =
-    injuryRisk === 'MEDIUM' ||
     injuryRisk === 'HIGH' ||
-    noBallRisk === 'MEDIUM' ||
     noBallRisk === 'HIGH' ||
-    strainIndex >= 2;
+    fatigueIndex >= 7.5 ||
+    projectedFatigueNextOver >= 8 ||
+    strainIndex >= 7 ||
+    recoveryPoor ||
+    availabilityEscalated ||
+    substitutionRequiredSignal ||
+    severeDecisionSignal ||
+    (fatigueIndex >= 6 && strainIndex >= 6 && recoveryPoor);
+  const routineFatigueScore =
+    (fatigueIndex >= 5.5 ? 2 : fatigueIndex >= 4 ? 1 : 0) +
+    (projectedFatigueNextOver >= 6 ? 1 : 0) +
+    (oversBowled >= 2 ? 1 : 0) +
+    (strainIndex >= 3 ? 1 : 0) +
+    (fatigueTrendRising ? 1 : 0);
+  const routineRiskScore =
+    (injuryRisk === 'MEDIUM' ? 2 : 0) +
+    (noBallRisk === 'MEDIUM' ? 2 : 0) +
+    (recoveryNotGood ? 1 : 0) +
+    (projectedFatigueNextOver >= 6.5 && (injuryRisk === 'MEDIUM' || noBallRisk === 'MEDIUM') ? 1 : 0);
+  const preferRiskSupport =
+    routineRiskScore > routineFatigueScore ||
+    (routineRiskScore === routineFatigueScore &&
+      (injuryRisk === 'MEDIUM' || noBallRisk === 'MEDIUM' || recoveryNotGood));
+  const routineSupportAgent: 'FATIGUE' | 'RISK' = preferRiskSupport ? 'RISK' : 'FATIGUE';
 
   const rulesFired: string[] = [];
   let intent: RouterDecision['intent'] = 'GENERAL';
-  let agentsToRun: AgentCode[] = ['TACTICAL'];
+  let agentsToRun: AgentCode[] = ['FATIGUE', 'TACTICAL'];
 
   if (mode === 'full') {
     rulesFired.push('mode=full');
@@ -513,9 +562,13 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
   rulesFired.push(`matchMode=${matchMode}`);
   rulesFired.push('tactical_always_on');
   if (fatigueTriggered) rulesFired.push('fatigue_triggered');
-  if (riskTriggered) rulesFired.push('risk_triggered');
+  if (riskTriggered) rulesFired.push('critical_risk_triggered');
   if (recoveryNotGood) rulesFired.push('recovery_not_good');
+  if (recoveryPoor) rulesFired.push('recovery_poor');
   if (fatigueTrendRising) rulesFired.push('fatigue_trend_rising');
+  if (availabilityEscalated) rulesFired.push(`availability_${availabilityToken.toLowerCase()}`);
+  if (substitutionRequiredSignal) rulesFired.push('substitution_required_signal');
+  if (severeDecisionSignal) rulesFired.push('severe_decision_signal');
 
   if (mode === 'full') {
     intent = 'BOTH_NEXT';
@@ -524,10 +577,15 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
   } else {
     if (matchMode === 'BAT') intent = 'BATTING_NEXT';
     else if (riskTriggered) intent = 'SAFETY_ALERT';
-    else if (fatigueTriggered) intent = 'GENERAL';
-
-    if (fatigueTriggered) agentsToRun.push('FATIGUE');
-    if (riskTriggered) agentsToRun.push('RISK');
+    else intent = 'GENERAL';
+    if (riskTriggered) {
+      agentsToRun = ['FATIGUE', 'RISK', 'TACTICAL'];
+      rulesFired.push('critical_escalation_all_agents');
+    } else {
+      agentsToRun = routineSupportAgent === 'RISK' ? ['RISK', 'TACTICAL'] : ['FATIGUE', 'TACTICAL'];
+      rulesFired.push(`routine_support_${routineSupportAgent.toLowerCase()}`);
+      rulesFired.push('routine_two_agent_mode');
+    }
   }
 
   const resolvedAgentSet = new Set<AgentCode>(agentsToRun);
@@ -551,6 +609,11 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
       noBallRisk,
       oversBowled,
       recovery: recoveryToken || 'UNKNOWN',
+      heartRateRecovery: recoveryToken || 'UNKNOWN',
+      availabilityStatus: availabilityToken || 'UNKNOWN',
+      substitutionRequired: substitutionRequiredSignal,
+      decisionSignal: decisionSignalToken || 'NONE',
+      dominantSupportAgent: routineSupportAgent,
       fatigueTrend: fatigueTrendToken || 'unknown',
     },
     match: {
@@ -583,6 +646,11 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
       fatigueLimit,
       oversBowled,
       recovery: recoveryToken || 'UNKNOWN',
+      heartRateRecovery: recoveryToken || 'UNKNOWN',
+      availabilityStatus: availabilityToken || 'UNKNOWN',
+      substitutionRequired: substitutionRequiredSignal,
+      decisionSignal: decisionSignalToken || 'NONE',
+      dominantSupportAgent: routineSupportAgent,
       fatigueTrendRising,
     },
   };
@@ -956,21 +1024,33 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
 
   const routerDecisionRaw = runModelRouter(inputWithContext.context as FullMatchContext, inputWithContext, mode, requestId);
   const forceAllAgents = mode === 'full';
+  const criticalEscalation = !forceAllAgents && isCriticalRouterDecision(routerDecisionRaw);
   const routerSelectedAgents = normalizeSelectedLegacyAgents(
     Array.isArray(routerDecisionRaw.selectedAgents) && routerDecisionRaw.selectedAgents.length > 0
       ? routerDecisionRaw.selectedAgents
       : toLegacyAgents(routerDecisionRaw.agentsToRun)
   );
-  const selectedAgentsBase = forceAllAgents
+  const cappedRoutineAgents = capAutoSelectedAgents(normalizeSelectedLegacyAgents([...routerSelectedAgents, 'tactical']));
+  const routineSelectedAgents =
+    cappedRoutineAgents.some((agent) => agent !== 'tactical')
+      ? cappedRoutineAgents
+      : (['fatigue', 'tactical'] as LegacyAgentId[]);
+  const selectedAgentsBase = forceAllAgents || criticalEscalation
     ? (['fatigue', 'risk', 'tactical'] as LegacyAgentId[])
-    : (routerSelectedAgents.length > 0 ? routerSelectedAgents : (['tactical'] as LegacyAgentId[]));
-  const selectedAgents = normalizeSelectedLegacyAgents([...selectedAgentsBase, 'tactical']);
+    : routineSelectedAgents;
+  const selectedAgents = normalizeSelectedLegacyAgents(selectedAgentsBase);
+  const orchestrationRule = forceAllAgents
+    ? 'full_mode_all_agents'
+    : criticalEscalation
+      ? 'critical_escalation_all_agents'
+      : 'routine_two_agent_mode';
   const routerDecision: RouterDecision = {
     ...routerDecisionRaw,
     mode,
     agentsToRun: selectedAgents.map((agent) => toAgentCode(agent)),
     selectedAgents,
-    reason: routerDecisionRaw.reason,
+    rulesFired: Array.from(new Set([...(routerDecisionRaw.rulesFired || []), orchestrationRule])),
+    reason: `${routerDecisionRaw.reason} | ${orchestrationRule}`,
   };
   const selectedSet = new Set<LegacyAgentId>(routerDecision.selectedAgents);
   const enabledFlags = {
@@ -993,6 +1073,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     llmMode: String(inputWithContext.llmMode || '').trim().toLowerCase() || undefined,
     intent: routerDecision.intent,
     forceAllAgents,
+    criticalEscalation,
     agentsToRun: routerDecision.selectedAgents,
     executedAgents,
   });

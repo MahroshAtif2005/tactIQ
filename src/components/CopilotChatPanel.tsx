@@ -55,6 +55,14 @@ const readText = (value: unknown, fallback = ''): string => {
   return text || fallback;
 };
 
+const readTextChain = (...values: unknown[]): string => {
+  for (const value of values) {
+    const text = String(value ?? '').trim();
+    if (text) return text;
+  }
+  return '';
+};
+
 const normalizeRisk = (value: unknown): 'LOW' | 'MED' | 'HIGH' => {
   const token = String(value || '').trim().toUpperCase();
   if (token === 'HIGH' || token === 'CRITICAL') return 'HIGH';
@@ -291,6 +299,203 @@ const buildTacticalRecommendationState = (
   return Object.keys(state).length > 0 ? state : undefined;
 };
 
+interface CopilotFollowUpResolution {
+  resolvedPrompt: string;
+  resolvedPlayer: string;
+  selectedPlayer: string;
+  lastDiscussedPlayer: string;
+  recommendedOutgoing: string;
+  recommendedReplacement: string;
+  lastRecommendation: string;
+  isFollowUp: boolean;
+  isReplacementIntent: boolean;
+  isWhyIntent: boolean;
+  mentionsOversLeft: boolean;
+}
+
+const FOLLOW_UP_PRONOUN_PATTERN = /\b(he|him|his)\b/i;
+const IMPLICIT_FOLLOW_UP_PATTERN =
+  /\b(best option|best replacement|replacement|who instead|backup|next over|next bowler|who should bowl|who bowls next|continue|keep him|why him|one over left|over left)\b/i;
+const REPLACEMENT_FOLLOW_UP_PATTERN =
+  /\b(best option|best replacement|replacement|who instead|backup|next bowler|who should bowl|who bowls next)\b/i;
+const WHY_FOLLOW_UP_PATTERN = /\b(why|reason|because)\b/i;
+const WHY_REPLACEMENT_FOLLOW_UP_PATTERN = /\bwhy\s+(him|her|them)\b/i;
+const OVERS_LEFT_FOLLOW_UP_PATTERN = /\b(one|1)\s+over\s+left\b|\bover\s+left\b/i;
+const LOCAL_SOCIAL_INTENT_TOKENS = new Set([
+  'ok',
+  'okay',
+  'alright',
+  'all',
+  'right',
+  'cool',
+  'perfect',
+  'got',
+  'it',
+  'thanks',
+  'thank',
+  'you',
+  'understood',
+  'makes',
+  'sense',
+  'bye',
+  'goodbye',
+  'see',
+  'ya',
+  'cya',
+  'later',
+  'talk',
+  'catch',
+  'soon',
+  'for',
+  'now',
+]);
+
+const classifyLocalSocialIntent = (message: string): 'ack' | 'close' | '' => {
+  const normalized = normalizeForCopilotMatch(message);
+  if (!normalized || normalized.length > 64) return '';
+  const tokens = normalized.split(' ').filter(Boolean);
+  if (tokens.length === 0) return '';
+  const nonSocialTokens = tokens.filter((token) => !LOCAL_SOCIAL_INTENT_TOKENS.has(token));
+  if (nonSocialTokens.length > 1) return '';
+  const hasClosingSignal = /\b(?:bye|goodbye|see you|see ya|cya|later)\b/.test(normalized);
+  const hasAcknowledgementSignal = /\b(?:thanks|thank you|got it|understood|makes sense|ok|okay|alright|cool|perfect)\b/.test(normalized);
+  if (hasClosingSignal) return 'close';
+  if (hasAcknowledgementSignal) return 'ack';
+  return '';
+};
+
+const buildLocalSocialIntentReply = (intent: 'ack' | 'close'): string =>
+  intent === 'close'
+    ? 'Bye. I’ll be here when you want to revisit the match plan.'
+    : "You're welcome.";
+
+const collectCopilotCandidatePlayerNames = (
+  context?: CopilotChatPanelProps['fallbackContext'],
+  tacticalState?: Record<string, unknown>
+): string[] => {
+  const snapshot = (context?.matchContextSnapshot || {}) as Record<string, unknown>;
+  const telemetry = ((context?.telemetry || snapshot.telemetry || {}) as Record<string, unknown>);
+  const players = ((context?.players || snapshot.players || {}) as Record<string, unknown>);
+  const rosterMetrics = Array.isArray(players.rosterMetrics)
+    ? players.rosterMetrics
+        .map((entry) => (entry && typeof entry === 'object' ? entry as Record<string, unknown> : null))
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+    : [];
+  const names = new Set<string>();
+  const registerName = (value: unknown) => {
+    const normalized = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (normalized.length > 1) names.add(normalized);
+  };
+  registerName(telemetry.playerName);
+  registerName(players.bowler);
+  registerName(tacticalState?.recommendedOutgoingPlayer);
+  registerName(tacticalState?.recommendedReplacementPlayer);
+  registerName(tacticalState?.recommendedIncomingPlayer);
+  registerName(tacticalState?.recommendedReplacement);
+  rosterMetrics.forEach((row) => {
+    registerName(row.name);
+    registerName(row.playerName);
+  });
+  return Array.from(names);
+};
+
+const resolveLastDiscussedPlayerFromTurns = (turns: CopilotTurn[], candidateNames: string[]): string => {
+  if (!Array.isArray(turns) || turns.length === 0 || candidateNames.length === 0) return '';
+  const immediatePreviousTurn = turns[turns.length - 1];
+  const immediateMatch = resolveMentionedRosterName(readText(immediatePreviousTurn?.content), candidateNames);
+  if (immediateMatch) return immediateMatch;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const match = resolveMentionedRosterName(readText(turns[index]?.content), candidateNames);
+    if (match) return match;
+  }
+  return '';
+};
+
+const resolveCopilotFollowUpContext = (
+  prompt: string,
+  turns: CopilotTurn[],
+  context?: CopilotChatPanelProps['fallbackContext'],
+  tacticalState?: Record<string, unknown>
+): CopilotFollowUpResolution => {
+  const normalizedPrompt = normalizeForCopilotMatch(prompt);
+  const snapshot = (context?.matchContextSnapshot || {}) as Record<string, unknown>;
+  const telemetry = ((context?.telemetry || snapshot.telemetry || {}) as Record<string, unknown>);
+  const players = ((context?.players || snapshot.players || {}) as Record<string, unknown>);
+  const match = ((context?.matchContext || snapshot.matchContext || {}) as Record<string, unknown>);
+  const candidateNames = collectCopilotCandidatePlayerNames(context, tacticalState);
+  const explicitlyNamedPlayer = resolveMentionedRosterName(prompt, candidateNames);
+  const selectedPlayer = readTextChain(telemetry.playerName, players.bowler);
+  const lastDiscussedPlayer = resolveLastDiscussedPlayerFromTurns(turns, candidateNames);
+  const recommendedOutgoing = readTextChain(
+    tacticalState?.recommendedOutgoingPlayer,
+    tacticalState?.recommendedReplacementPlayer,
+    selectedPlayer
+  );
+  const recommendedReplacement = readTextChain(
+    tacticalState?.recommendedIncomingPlayer,
+    tacticalState?.recommendedReplacement
+  );
+  const lastRecommendation = readTextChain(
+    tacticalState?.recommendedMove,
+    tacticalState?.tacticalPlan,
+    tacticalState?.reason,
+    tacticalState?.assessment
+  );
+  const resolvedPlayer = readTextChain(
+    explicitlyNamedPlayer,
+    lastDiscussedPlayer,
+    selectedPlayer,
+    recommendedOutgoing
+  );
+  const isWhyReplacementFollowUp = WHY_REPLACEMENT_FOLLOW_UP_PATTERN.test(normalizedPrompt);
+  const isReplacementIntent =
+    REPLACEMENT_PROMPT_PATTERNS.some((pattern) => pattern.test(normalizedPrompt)) ||
+    REPLACEMENT_FOLLOW_UP_PATTERN.test(normalizedPrompt) ||
+    (isWhyReplacementFollowUp && Boolean(recommendedReplacement));
+  const hasPronounFollowUp = FOLLOW_UP_PRONOUN_PATTERN.test(normalizedPrompt);
+  const hasImplicitFollowUp = IMPLICIT_FOLLOW_UP_PATTERN.test(normalizedPrompt);
+  const isFollowUp = !explicitlyNamedPlayer && (hasPronounFollowUp || hasImplicitFollowUp);
+  const isWhyIntent = WHY_FOLLOW_UP_PATTERN.test(normalizedPrompt);
+  const mentionsOversLeft = OVERS_LEFT_FOLLOW_UP_PATTERN.test(normalizedPrompt);
+  const phase = readText(match.phase);
+
+  const contextHints: string[] = [];
+  if (isFollowUp && resolvedPlayer) {
+    contextHints.push(`Current player in discussion: ${resolvedPlayer}.`);
+  }
+  if (isFollowUp && phase) {
+    contextHints.push(`Current match phase: ${phase}.`);
+  }
+  if (isFollowUp && isReplacementIntent && recommendedReplacement) {
+    const replacementHint = recommendedOutgoing
+      ? `${recommendedReplacement} in for ${recommendedOutgoing}`
+      : recommendedReplacement;
+    contextHints.push(`Current replacement recommendation: ${replacementHint}.`);
+  }
+  if (isFollowUp && lastRecommendation) {
+    contextHints.push(`Current tactical recommendation: ${lastRecommendation}.`);
+  }
+
+  const resolvedPrompt =
+    contextHints.length > 0
+      ? `${prompt}\n\nContext:\n- ${contextHints.join('\n- ')}`
+      : prompt;
+
+  return {
+    resolvedPrompt,
+    resolvedPlayer,
+    selectedPlayer,
+    lastDiscussedPlayer,
+    recommendedOutgoing,
+    recommendedReplacement,
+    lastRecommendation,
+    isFollowUp,
+    isReplacementIntent,
+    isWhyIntent,
+    mentionsOversLeft,
+  };
+};
+
 const isAlignmentSensitivePrompt = (prompt: string, tacticalState?: Record<string, unknown>): boolean => {
   const normalizedPrompt = normalizeForCopilotMatch(prompt);
   if (!normalizedPrompt) return false;
@@ -316,15 +521,21 @@ const isDetailedTacticalPrompt = (prompt: string): boolean => {
 const buildGroundedCoachReplyFromState = (
   prompt: string,
   tacticalState: Record<string, unknown>,
-  fallbackPlayerName: string
+  fallbackPlayerName: string,
+  conversationContext?: CopilotFollowUpResolution
 ): string => {
-  const outgoing = readText(
+  const outgoing = readTextChain(
+    conversationContext?.resolvedPlayer,
     tacticalState.recommendedOutgoingPlayer,
     tacticalState.recommendedReplacementPlayer,
     fallbackPlayerName
   );
-  const incoming = readText(tacticalState.recommendedIncomingPlayer);
-  if (!outgoing || !incoming) return '';
+  const incoming = readTextChain(
+    conversationContext?.recommendedReplacement,
+    tacticalState.recommendedIncomingPlayer,
+    tacticalState.recommendedReplacement
+  );
+  if (!outgoing) return '';
 
   const normalizedPrompt = normalizeForCopilotMatch(prompt);
   const reason = readText(
@@ -335,7 +546,7 @@ const buildGroundedCoachReplyFromState = (
   );
   const recommendedMove = readText(
     tacticalState.recommendedMove,
-    `Bring in ${incoming} for ${outgoing} next over.`
+    incoming ? `Bring in ${incoming} for ${outgoing} next over.` : `Rotate ${outgoing} next over.`
   );
   const confidence = readText(tacticalState.confidence, 'Moderate');
   const tacticalPlan = readText(tacticalState.tacticalPlan);
@@ -347,10 +558,16 @@ const buildGroundedCoachReplyFromState = (
   const isReplacementQuestion = REPLACEMENT_PROMPT_PATTERNS.some((pattern) => pattern.test(normalizedPrompt));
   const isNextBowlerQuestion = /\b(best next bowler|who bowls next|who should bowl next|next bowler)\b/.test(normalizedPrompt);
   const isContinueQuestion = /\b(continue|keep|stay|still okay|ok to continue)\b/.test(normalizedPrompt);
+  const isOversLeftQuestion =
+    conversationContext?.mentionsOversLeft === true || /\b(one|1)\s+over\s+left\b|\bover\s+left\b/.test(normalizedPrompt);
   const detailed = isDetailedTacticalPrompt(normalizedPrompt);
 
   let response = '';
-  if (isReplacementQuestion || isNextBowlerQuestion) {
+  if (isOversLeftQuestion) {
+    response = incoming
+      ? `Yes, ${outgoing} may still have an over left, but rotating before that over is safer. ${recommendedMove}`
+      : `Yes, ${outgoing} may still have overs available, but rotating now is safer because ${reason}`;
+  } else if (isReplacementQuestion || isNextBowlerQuestion) {
     response = `${recommendedMove} ${reason}`;
   } else if (isWhyQuestion) {
     response = `${outgoing} is still effective, but rotating now is safer because ${reason}`;
@@ -378,7 +595,8 @@ const buildGroundedCoachReplyFromState = (
 const buildDemoCopilotReply = (
   prompt: string,
   context?: CopilotChatPanelProps['fallbackContext'],
-  tacticalStateOverride?: Record<string, unknown>
+  tacticalStateOverride?: Record<string, unknown>,
+  conversationContext?: CopilotFollowUpResolution
 ): string => {
   const snapshot = (context?.matchContextSnapshot || {}) as Record<string, unknown>;
   const telemetry = ((context?.telemetry || snapshot.telemetry || {}) as Record<string, unknown>);
@@ -388,11 +606,14 @@ const buildDemoCopilotReply = (
   const tacticalRecommendation = (coachOutput.tacticalRecommendation || {}) as Record<string, unknown>;
   const combinedDecision = (coachOutput.combinedDecision || {}) as Record<string, unknown>;
   const tacticalState = buildTacticalRecommendationState(context, tacticalStateOverride);
+  const resolvedConversation =
+    conversationContext || resolveCopilotFollowUpContext(prompt, [], context, tacticalState);
 
-  const playerName =
+  const selectedPlayerName =
     readText(telemetry.playerName)
     || readText(players.bowler)
     || 'the current bowler';
+  const playerName = readTextChain(resolvedConversation.resolvedPlayer, selectedPlayerName);
   const fatigueIndex = readNumber(telemetry.fatigueIndex, 0);
   const strainIndex = readNumber(telemetry.strainIndex, 0);
   const oversBowled = readNumber(telemetry.oversBowled, 0);
@@ -409,6 +630,10 @@ const buildDemoCopilotReply = (
   const benchHint = benchList.length > 0 ? ` Keep ${benchList.join(', ')} ready as rotation options.` : '';
 
   const promptLower = prompt.toLowerCase();
+  const socialIntent = classifyLocalSocialIntent(promptLower);
+  if (socialIntent) {
+    return buildLocalSocialIntentReply(socialIntent);
+  }
   const isReplacementPrompt = REPLACEMENT_PROMPT_PATTERNS.some((pattern) => pattern.test(promptLower));
   const isReliabilityPrompt = /(reliable|reliability|lowest fatigue|fatigue risk|safest (bowler|batter|player)|best condition|ready to bowl|ready to bat|in best condition|lowest injury risk|workload risk|who should bowl|who should bat)/.test(
     promptLower
@@ -421,8 +646,44 @@ const buildDemoCopilotReply = (
         .map((entry) => (entry && typeof entry === 'object' ? entry as Record<string, unknown> : null))
         .filter((entry): entry is Record<string, unknown> => Boolean(entry))
     : [];
+  const replacementReason = readTextChain(
+    tacticalRecommendation.reason,
+    tacticalRecommendation.why,
+    combinedDecision.rationale,
+    coachOutput.summary,
+    'This is the safest pressure reset based on current workload and control signals.'
+  );
+  const replacementInFromContext = readTextChain(
+    resolvedConversation.recommendedReplacement,
+    tacticalState?.recommendedIncomingPlayer
+  );
+  const replacementOutFromContext = readTextChain(
+    resolvedConversation.recommendedOutgoing,
+    tacticalState?.recommendedOutgoingPlayer,
+    tacticalState?.recommendedReplacementPlayer,
+    playerName
+  );
+  if (resolvedConversation.isReplacementIntent && replacementInFromContext) {
+    if (resolvedConversation.isWhyIntent) {
+      return `${replacementInFromContext} is preferred now because ${replacementReason}`;
+    }
+    return `The best replacement right now is ${replacementInFromContext}. ${replacementReason}`;
+  }
+
+  if (resolvedConversation.mentionsOversLeft && replacementOutFromContext) {
+    if (replacementInFromContext) {
+      return `Yes, ${replacementOutFromContext} may still have an over left, but rotating now is safer. Bring in ${replacementInFromContext} next over.`;
+    }
+    return `Yes, ${replacementOutFromContext} may still have overs available, but rotating now is safer because ${replacementReason}`;
+  }
+
   if (tacticalState && isAlignmentSensitivePrompt(promptLower, tacticalState)) {
-    const groundedReply = buildGroundedCoachReplyFromState(promptLower, tacticalState, playerName);
+    const groundedReply = buildGroundedCoachReplyFromState(
+      promptLower,
+      tacticalState,
+      playerName,
+      resolvedConversation
+    );
     if (groundedReply) {
       return groundedReply;
     }
@@ -443,14 +704,7 @@ const buildDemoCopilotReply = (
       coachOutput.summary
     );
     const replacementIn = readText(swap.in);
-    const replacementOut = readText(swap.out, mentionedPlayer, playerName);
-    const replacementReason = readText(
-      tacticalRecommendation.reason,
-      tacticalRecommendation.why,
-      combinedDecision.rationale,
-      coachOutput.summary,
-      'This is the safest pressure reset based on current workload and control signals.'
-    );
+    const replacementOut = readTextChain(swap.out, replacementOutFromContext, mentionedPlayer, playerName);
 
     if (replacementIn) {
       return `Replace ${replacementOut || playerName} with ${replacementIn} next over. ${replacementReason}`;
@@ -664,6 +918,17 @@ export default function CopilotChatPanel({
       return;
     }
     const resolvedAnalysisId = String(analysisId || '').trim() || `local-copilot-${Date.now()}`;
+    const tacticalRecommendationState = buildTacticalRecommendationState(
+      fallbackContext,
+      tacticalRecommendationStateProp
+    );
+    const followUpResolution = resolveCopilotFollowUpContext(
+      prompt,
+      messages,
+      fallbackContext,
+      tacticalRecommendationState
+    );
+    const promptForRequest = followUpResolution.resolvedPrompt;
 
     const userTurn: CopilotTurn = {
       id: nextTurnId(),
@@ -678,26 +943,31 @@ export default function CopilotChatPanel({
     setIsSending(true);
 
     try {
-      const history = [...messages.slice(-7), userTurn].map((turn) => ({
+      const history = messages.slice(-7).map((turn) => ({
         role: turn.role,
         content: turn.content,
       }));
+      history.push({
+        role: 'user',
+        content: promptForRequest,
+      });
       if (import.meta.env.DEV) {
         console.log('[copilot] submit', {
           prompt,
+          promptForRequest,
+          resolvedPlayer: followUpResolution.resolvedPlayer || null,
+          lastDiscussedPlayer: followUpResolution.lastDiscussedPlayer || null,
+          recommendedReplacement: followUpResolution.recommendedReplacement || null,
+          followUpResolved: followUpResolution.isFollowUp,
           analysisId: resolvedAnalysisId,
           routeCalled: localRulesMode ? 'local-fallback(no request)' : copilotChatUrl,
           localRulesMode,
           historyTurns: history.length,
         });
       }
-      const tacticalRecommendationState = buildTacticalRecommendationState(
-        fallbackContext,
-        tacticalRecommendationStateProp
-      );
       const basePayload = {
         analysisId: resolvedAnalysisId,
-        message: prompt,
+        message: promptForRequest,
         history,
         ...(fallbackContext?.matchContextSnapshot ? { matchContextSnapshot: fallbackContext.matchContextSnapshot } : {}),
         ...(fallbackContext?.telemetry ? { telemetry: fallbackContext.telemetry } : {}),
@@ -720,7 +990,12 @@ export default function CopilotChatPanel({
         const assistantTurn: CopilotTurn = {
           id: nextTurnId(),
           role: 'assistant',
-          content: buildDemoCopilotReply(prompt, fallbackContext, tacticalRecommendationState),
+          content: buildDemoCopilotReply(
+            prompt,
+            fallbackContext,
+            tacticalRecommendationState,
+            followUpResolution
+          ),
         };
         setMessages((prev) => [...prev, assistantTurn]);
         setMessagesUsed((prev) => Math.min(promptLimit, prev + 1));
@@ -776,7 +1051,8 @@ export default function CopilotChatPanel({
       const fallbackReply = buildDemoCopilotReply(
         prompt,
         fallbackContext,
-        buildTacticalRecommendationState(fallbackContext, tacticalRecommendationStateProp)
+        tacticalRecommendationState,
+        followUpResolution
       );
       const assistantTurn: CopilotTurn = {
         id: nextTurnId(),

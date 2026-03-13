@@ -3008,6 +3008,7 @@ export default function App() {
     const oversBowled = clampOversBowled(safeNum(currentTelemetry.oversBowled, 0), maxOvers);
     const oversRemaining = computeOversRemaining(oversBowled, maxOvers);
     const quotaComplete = Boolean(currentTelemetry.quotaComplete) || oversBowled >= maxOvers;
+    const oversQuotaReached = oversBowled >= maxOvers;
     const fatigue = Math.max(0, Math.min(10, safeNum(currentTelemetry.fatigueIndex, 0)));
     const injuryLabelRaw = String(currentTelemetry.injuryRisk || 'LOW').toUpperCase();
     const noBallRiskLabelRaw = String(currentTelemetry.noBallRisk || 'LOW').toUpperCase();
@@ -3100,8 +3101,11 @@ export default function App() {
           ? 'MEDIUM'
           : 'LOW';
     const markedFitStatus: 'FIT' | 'UNFIT' = isUnfit ? 'UNFIT' : 'FIT';
+    // Match-law constraint has highest priority: quota reached means bowler is unavailable.
     const availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE' =
-      normalizedInjuryRiskLevel === 'CRITICAL' || markedFitStatus === 'UNFIT'
+      oversQuotaReached
+        ? 'UNAVAILABLE'
+        : normalizedInjuryRiskLevel === 'CRITICAL' || markedFitStatus === 'UNFIT'
         ? 'UNAVAILABLE'
         : fatigue > baselineFatigueLimit && strainIndex >= 4
           ? 'LIMITED'
@@ -3110,8 +3114,18 @@ export default function App() {
             : 'AVAILABLE';
     const substitutionRequired = availabilityStatus === 'UNAVAILABLE';
     const heartRateRecoveryToken = String(currentTelemetry.heartRateRecovery || '').trim().toUpperCase();
-    const dominantRiskDriver: 'injury' | 'fatigue' | 'recovery' | 'control' | 'matchup' | 'pressure_phase' | 'mixed' =
-      availabilityStatus === 'UNAVAILABLE'
+    const dominantRiskDriver:
+      | 'overs_quota_reached'
+      | 'injury'
+      | 'fatigue'
+      | 'recovery'
+      | 'control'
+      | 'matchup'
+      | 'pressure_phase'
+      | 'mixed' =
+      oversQuotaReached
+        ? 'overs_quota_reached'
+        : availabilityStatus === 'UNAVAILABLE'
         ? 'injury'
         : fatigue > baselineFatigueLimit && strainIndex >= 4
           ? 'fatigue'
@@ -3406,6 +3420,13 @@ export default function App() {
           ? 'full'
           : 'auto';
       const metaExecutedAgents = normalizeAgentList(resultMetaRecord.executedAgents);
+      const routerSelectedAgentsFromResult = normalizeAgentList(
+        Array.isArray(result.routerDecision?.selectedAgents) && result.routerDecision.selectedAgents.length > 0
+          ? result.routerDecision.selectedAgents
+          : result.routerDecision?.agentsToRun
+      );
+      const hasOrchestratorAgentSelectionData =
+        routerSelectedAgentsFromResult.length > 0 || metaExecutedAgents.length > 0;
       const metaUsedFallbackAgents = normalizeAgentList(resultMetaRecord.usedFallbackAgents);
       const metaRouterFallbackMessage =
         typeof resultMetaRecord.routerFallbackMessage === 'string'
@@ -3551,6 +3572,37 @@ export default function App() {
         metaRouterFallbackMessage ||
         ''
       ).trim() || undefined;
+      const finalRiskSummaryText = String(result.finalRecommendation?.ifContinues?.riskSummary || '').trim();
+      const strategicRiskSummaryText = String(result.strategicAnalysis?.injuryRiskAnalysis || '').trim();
+      const likelyInjuries = Array.isArray(result.finalRecommendation?.ifContinues?.likelyInjuries)
+        ? result.finalRecommendation.ifContinues.likelyInjuries
+        : [];
+      const severeLikelyInjury = likelyInjuries.some((entry) => String(entry?.severity || '').trim().toUpperCase() === 'HIGH');
+      const telemetryInjuryRiskToken = String(payload.telemetry?.injuryRisk || '').trim().toUpperCase();
+      const telemetryNoBallRiskToken = String(payload.telemetry?.noBallRisk || '').trim().toUpperCase();
+      const elevatedTelemetryRisk =
+        telemetryInjuryRiskToken === 'HIGH' ||
+        telemetryInjuryRiskToken === 'CRITICAL' ||
+        telemetryNoBallRiskToken === 'HIGH';
+      const severeRiskNarrativeText = [
+        finalRiskSummaryText,
+        strategicRiskSummaryText,
+        String(result.finalRecommendation?.title || ''),
+        String(result.finalRecommendation?.statement || ''),
+        String(result.tactical?.immediateAction || ''),
+      ].join(' ');
+      const severeRiskNarrative = /(?:\bhigh\b|\bcritical\b|unsafe|immediate substitution|remove from active|mark unfit|not fit to continue|safety thresholds exceeded|unavailable)/i.test(
+        severeRiskNarrativeText
+      );
+      const riskReasoningSurfaced = Boolean(
+        result.risk ||
+        severeLikelyInjury ||
+        elevatedTelemetryRisk ||
+        severeRiskNarrative
+      );
+      if (!hasOrchestratorAgentSelectionData && riskReasoningSurfaced && !metaExecutedAgents.includes('risk')) {
+        metaExecutedAgents.push('risk');
+      }
       setOrchestrateMeta({
         analysisId: resolvedAnalysisId || undefined,
         mode: metaMode,
@@ -3639,7 +3691,13 @@ export default function App() {
           metaFallbacksUsed.length > 0 ||
           fallbackReasonRegex.test(routeReason) ||
           fallbackReasonRegex.test(routerReason);
+        const thresholdRiskCoverage =
+          !hasOrchestratorAgentSelectionData &&
+          agent === 'risk' &&
+          riskReasoningSurfaced &&
+          !hasAgentOutput('risk');
         if (routeReason.includes('not_selected_by_auto_router') || routeReason.includes('disabled_by_request')) {
+          if (thresholdRiskCoverage) return 'SUCCESS';
           return 'SKIPPED';
         }
         if (serverStatus === 'FALLBACK' || routeStatus === 'fallback') return 'FALLBACK';
@@ -3647,7 +3705,10 @@ export default function App() {
         if (hasAgentOutput(agent) || serverStatus === 'OK' || serverStatus === 'SUCCESS' || routeStatus === 'success') {
           return 'SUCCESS';
         }
-        if (!selectedAgentSet.has(agent)) return 'SKIPPED';
+        if (!selectedAgentSet.has(agent)) {
+          if (thresholdRiskCoverage) return 'SUCCESS';
+          return 'SKIPPED';
+        }
         if (errored || serverStatus === 'ERROR' || routeStatus === 'error') {
           if (fallbackRoutingActive && hasFallbackPayload) return 'FALLBACK';
           return 'ERROR';
@@ -3730,8 +3791,24 @@ export default function App() {
       const strainIndex = safeNum(payload.telemetry?.strainIndex, 0);
       const injuryRisk = normalizeRiskToken(payload.telemetry?.injuryRisk);
       const noBallRisk = normalizeRiskToken(payload.telemetry?.noBallRisk);
+      const heartRateRecoveryToken = String(payload.telemetry?.heartRateRecovery || '').trim().toUpperCase();
+      const availabilityToken = String(payload.telemetry?.availabilityStatus || payload.analysisState?.availabilityStatus || '').trim().toUpperCase();
+      const substitutionRequiredSignal = Boolean(payload.telemetry?.substitutionRequired) || Boolean(payload.analysisState?.substitutionRequired);
+      const decisionToken = String(payload.analysisState?.decisionMode || payload.analysisState?.decision || '').trim().toUpperCase();
+      const recoveryPoor = heartRateRecoveryToken === 'POOR' || heartRateRecoveryToken === 'VERY POOR';
+      const fatigueCritical = fatigueIndex >= 7.5;
+      const strainCritical = strainIndex >= 7;
+      const availabilityEscalated = availabilityToken === 'LIMITED' || availabilityToken === 'UNAVAILABLE';
+      const severeDecisionSignal = /IMMEDIATE_SUBSTITUTION|REMOVE_FROM_ACTIVE|MARK_UNFIT|UNSAFE_TO_CONTINUE/.test(decisionToken);
       const critical =
-        injuryRisk === 'HIGH' || noBallRisk === 'HIGH' || fatigueIndex >= 7.5 || strainIndex >= 7.5;
+        injuryRisk === 'HIGH' ||
+        noBallRisk === 'HIGH' ||
+        fatigueCritical ||
+        strainCritical ||
+        recoveryPoor ||
+        availabilityEscalated ||
+        substitutionRequiredSignal ||
+        severeDecisionSignal;
       if (critical) {
         return {
           selectedAgents: ['fatigue', 'risk', 'tactical'],
@@ -3740,11 +3817,22 @@ export default function App() {
         };
       }
 
-      const preferRisk = injuryRisk === 'HIGH' || noBallRisk !== 'LOW' || strainIndex >= 5.5 || fatigueIndex >= 6;
+      const routineFatigueScore =
+        (fatigueIndex >= 5.5 ? 2 : fatigueIndex >= 4 ? 1 : 0) +
+        (strainIndex >= 3 ? 1 : 0) +
+        (safeNum(payload.telemetry?.oversBowled, 0) >= 2 ? 1 : 0);
+      const routineRiskScore =
+        (injuryRisk === 'MEDIUM' ? 2 : 0) +
+        (noBallRisk === 'MEDIUM' ? 2 : 0) +
+        (heartRateRecoveryToken === 'MODERATE' ? 1 : 0);
+      const preferRiskSupport =
+        routineRiskScore > routineFatigueScore ||
+        (routineRiskScore === routineFatigueScore && (injuryRisk === 'MEDIUM' || noBallRisk === 'MEDIUM'));
+
       return {
-        selectedAgents: preferRisk ? ['risk', 'tactical'] : ['fatigue', 'tactical'],
+        selectedAgents: preferRiskSupport ? ['risk', 'tactical'] : ['fatigue', 'tactical'],
         critical: false,
-        reason: preferRisk ? 'risk_guardrail' : 'fatigue_guardrail',
+        reason: preferRiskSupport ? 'routine_risk_dominant' : 'routine_fatigue_dominant',
       };
     };
 
@@ -6087,11 +6175,44 @@ interface CoachAnalysisInputSnapshot {
   fatigueIndex: number;
   strainIndex: number;
   heartRateRecovery: string;
-  injuryRisk: string;
-  noBallRisk: string;
-  markedFitStatus: 'FIT' | 'UNFIT';
-  availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE';
+  matchMode: string;
+  phase: string;
+  intensity: string;
+  format: string;
 }
+
+const normalizeAnalysisInputToken = (value: unknown, fallback: string): string => {
+  const token = String(value || '').trim().toUpperCase();
+  return token || fallback;
+};
+
+const normalizeAnalysisInputValue = (value: unknown, fallback = 0, precision = 2): number =>
+  Number(safeNum(value, fallback).toFixed(precision));
+
+// Dirty-state must only track normalized analysis-driving inputs (not transient UI/runtime metadata).
+const normalizeAnalysisInputs = (
+  snapshot: Partial<CoachAnalysisInputSnapshot>
+): CoachAnalysisInputSnapshot => ({
+  selectedPlayerId: String(snapshot.selectedPlayerId || '').trim(),
+  oversBowled: normalizeAnalysisInputValue(snapshot.oversBowled, 0),
+  fatigueIndex: normalizeAnalysisInputValue(snapshot.fatigueIndex, 0),
+  strainIndex: normalizeAnalysisInputValue(snapshot.strainIndex, 0),
+  heartRateRecovery: normalizeAnalysisInputToken(snapshot.heartRateRecovery, 'GOOD'),
+  matchMode: normalizeAnalysisInputToken(snapshot.matchMode, 'BOWLING'),
+  phase: normalizeAnalysisInputToken(snapshot.phase, 'MIDDLE'),
+  intensity: normalizeAnalysisInputToken(snapshot.intensity, 'MEDIUM'),
+  format: normalizeAnalysisInputToken(snapshot.format, 'T20'),
+});
+
+const haveAnalysisInputsChanged = (
+  current: CoachAnalysisInputSnapshot,
+  baseline: CoachAnalysisInputSnapshot
+): { changed: boolean; changedFields: Array<keyof CoachAnalysisInputSnapshot> } => {
+  const changedFields = (Object.keys(current) as Array<keyof CoachAnalysisInputSnapshot>).filter(
+    (field) => baseline[field] !== current[field]
+  );
+  return { changed: changedFields.length > 0, changedFields };
+};
 
 interface ConfirmSwitchOverlayProps {
   open: boolean;
@@ -6485,6 +6606,7 @@ function Dashboard({
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const pendingMatchModeActionRef = useRef<(() => void) | null>(null);
+  const pendingMatchModeRequiredRef = useRef<TeamMode>('BATTING');
   const pendingBowlingCoachActionRef = useRef<(() => void) | null>(null);
   const pressureDebugRef = useRef<{
     playerId: string;
@@ -6681,46 +6803,32 @@ function Dashboard({
       };
   const analysisInputSnapshot = useMemo<CoachAnalysisInputSnapshot>(
     () => {
-      const fatigueValue = Number(safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex).toFixed(2));
-      const strainValue = Number(safeNum(strainIndex, currentTelemetry.strainIndex).toFixed(2));
-      const fatigueLimitValue = Math.max(1, safeNum(activePlayer?.baselineFatigue, safeNum(currentTelemetry.fatigueLimit, 6)));
-      const injuryToken = String(activePlayer?.injuryRisk || '').toUpperCase();
-      const noBallToken = String(activePlayer?.noBallRisk || '').toUpperCase();
-      const markedFitStatus: 'FIT' | 'UNFIT' = activePlayer?.isUnfit ? 'UNFIT' : 'FIT';
-      const availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE' =
-        markedFitStatus === 'UNFIT' || injuryToken === 'CRITICAL'
-          ? 'UNAVAILABLE'
-          : fatigueValue > fatigueLimitValue && strainValue >= 4
-            ? 'LIMITED'
-            : noBallToken === 'HIGH'
-              ? 'TACTICAL_RISK'
-              : 'AVAILABLE';
-      return {
+      const normalized = normalizeAnalysisInputs({
         selectedPlayerId: String(activePlayer?.id || currentTelemetry.playerId || ''),
-        oversBowled: Number(safeNum(activePlayer?.overs, 0).toFixed(2)),
-        fatigueIndex: fatigueValue,
-        strainIndex: strainValue,
-        heartRateRecovery: String(recoveryMode === 'manual' ? manualRecovery : activePlayer?.hrRecovery || 'Good').toUpperCase(),
-        injuryRisk: injuryToken,
-        noBallRisk: noBallToken,
-        markedFitStatus,
-        availabilityStatus,
-      };
+        oversBowled: safeNum(activePlayer?.overs, 0),
+        fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
+        strainIndex: safeNum(strainIndex, currentTelemetry.strainIndex),
+        heartRateRecovery: recoveryMode === 'manual' ? manualRecovery : activePlayer?.hrRecovery || 'Good',
+        matchMode: matchContext.matchMode,
+        phase: matchContext.phase,
+        intensity: matchContext.pitch,
+        format: matchContext.format,
+      });
+      return normalized;
     },
     [
       activePlayer?.fatigue,
       activePlayer?.hrRecovery,
       activePlayer?.id,
-      activePlayer?.injuryRisk,
-      activePlayer?.noBallRisk,
       activePlayer?.overs,
-      activePlayer?.baselineFatigue,
-      activePlayer?.isUnfit,
       currentTelemetry.fatigueIndex,
-      currentTelemetry.fatigueLimit,
       currentTelemetry.playerId,
       currentTelemetry.strainIndex,
       manualRecovery,
+      matchContext.format,
+      matchContext.matchMode,
+      matchContext.phase,
+      matchContext.pitch,
       recoveryMode,
       strainIndex,
     ]
@@ -6739,15 +6847,16 @@ function Dashboard({
           selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
         });
       }
+      const normalizedAnalysisSnapshot = normalizeAnalysisInputs(analysisInputSnapshot);
       setFullAnalysisExecuted(true);
       setAnalysisExecuted(true);
       setAnalysisStale(false);
-      setAnalysisSnapshot(analysisInputSnapshot);
+      setAnalysisSnapshot(normalizedAnalysisSnapshot);
       setShowFullAnalysisInfo(false);
       setShowDismissAnalysisInfo(false);
       lastCapturedAnalysisBundleIdRef.current = String(analysisBundleId || '').trim();
       if (import.meta.env.DEV) {
-        console.log('[dashboard] analysis_snapshot_stored', analysisInputSnapshot);
+        console.log('[dashboard] analysis_snapshot_stored', normalizedAnalysisSnapshot);
       }
     }
     setFullAnalysisRunPending(false);
@@ -6760,15 +6869,16 @@ function Dashboard({
     if (!completedBundleId) return;
     if (lastCapturedAnalysisBundleIdRef.current === completedBundleId) return;
     lastCapturedAnalysisBundleIdRef.current = completedBundleId;
+    const normalizedAnalysisSnapshot = normalizeAnalysisInputs(analysisInputSnapshot);
     setAnalysisExecuted(true);
     setAnalysisStale(false);
-    setAnalysisSnapshot(analysisInputSnapshot);
+    setAnalysisSnapshot(normalizedAnalysisSnapshot);
     if (import.meta.env.DEV) {
       console.log('[dashboard] analysis_executed', {
         selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
         analysisBundleId: completedBundleId,
       });
-      console.log('[dashboard] analysis_snapshot_stored', analysisInputSnapshot);
+      console.log('[dashboard] analysis_snapshot_stored', normalizedAnalysisSnapshot);
     }
   }, [agentState, analysisActive, analysisBundleId, analysisInputSnapshot]);
 
@@ -6785,21 +6895,29 @@ function Dashboard({
     ) {
       return;
     }
-    const changedFields = (Object.keys(analysisInputSnapshot) as Array<keyof CoachAnalysisInputSnapshot>).filter(
-      (field) => baseline[field] !== analysisInputSnapshot[field]
-    );
-    if (changedFields.length === 0) return;
+    const normalizedCurrentInputs = normalizeAnalysisInputs(analysisInputSnapshot);
+    const normalizedLastAnalyzedInputs = normalizeAnalysisInputs(baseline);
+    const { changed, changedFields } = haveAnalysisInputsChanged(normalizedCurrentInputs, normalizedLastAnalyzedInputs);
+    if (import.meta.env.DEV) {
+      console.log('[dashboard] analysis_dirty_check', {
+        currentNormalizedInputs: normalizedCurrentInputs,
+        lastAnalyzedNormalizedInputs: normalizedLastAnalyzedInputs,
+        dirty: changed,
+        changedFields,
+      });
+    }
+    if (!changed) return;
     if (import.meta.env.DEV) {
       console.log('[dashboard] analysis_input_changed', {
         changedFields,
-        before: baseline,
-        after: analysisInputSnapshot,
+        before: normalizedLastAnalyzedInputs,
+        after: normalizedCurrentInputs,
       });
     }
     if (analysisStale) return;
     if (import.meta.env.DEV) {
       console.log('[dashboard] analysis_stale_true', {
-        selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
+        selectedPlayerId: normalizedCurrentInputs.selectedPlayerId || null,
         changedFields,
       });
     }
@@ -7542,26 +7660,47 @@ function Dashboard({
       .trim();
     return withoutJson.length > 88 ? `${withoutJson.slice(0, 87).trim()}…` : withoutJson;
   };
-  const routerSelectedAgents =
-    (routerDecisionForView?.selectedAgents && routerDecisionForView.selectedAgents.length > 0
-      ? routerDecisionForView.selectedAgents
-      : (routerDecisionForView?.agentsToRun || []).map((agent) => {
-          if (agent === 'RISK') return 'risk';
-          if (agent === 'FATIGUE') return 'fatigue';
-          return 'tactical';
-        })) as Array<'fatigue' | 'risk' | 'tactical'>;
+  const routerSelectedAgents = (() => {
+    const rawAgents =
+      routerDecisionForView?.selectedAgents && routerDecisionForView.selectedAgents.length > 0
+        ? routerDecisionForView.selectedAgents
+        : (routerDecisionForView?.agentsToRun || []);
+    const normalized: Array<'fatigue' | 'risk' | 'tactical'> = [];
+    rawAgents.forEach((agent) => {
+      const key = toAgentKey(agent);
+      if (!key || normalized.includes(key)) return;
+      normalized.push(key);
+    });
+    return normalized;
+  })();
+  const orchestratorExecutedAgents = (() => {
+    const source = Array.isArray(orchestrateMeta?.executedAgents) ? orchestrateMeta.executedAgents : [];
+    const normalized: Array<'fatigue' | 'risk' | 'tactical'> = [];
+    source.forEach((agent) => {
+      const key = toAgentKey(agent);
+      if (!key || normalized.includes(key)) return;
+      normalized.push(key);
+    });
+    return normalized;
+  })();
   const statusSelectedAgents = AGENT_KEYS.filter((agent) => {
     const status = agentFeedStatus[agent];
     return status !== 'IDLE' && status !== 'SKIPPED';
   });
-  const selectedAgents = Array.from(
+  const fallbackSelectedAgents = Array.from(
     new Set<('fatigue' | 'risk' | 'tactical')>([
       ...(runMode === 'full' ? AGENT_KEYS : []),
-      ...routerSelectedAgents,
-      ...(orchestrateMeta?.executedAgents || []),
       ...statusSelectedAgents,
     ])
   );
+  const selectedAgents: Array<'fatigue' | 'risk' | 'tactical'> =
+    routerSelectedAgents.length > 0
+      ? routerSelectedAgents
+      : orchestratorExecutedAgents.length > 0
+        ? orchestratorExecutedAgents
+        : fallbackSelectedAgents.length > 0
+          ? fallbackSelectedAgents
+          : ['tactical'];
   const selectedAgentSet = new Set(selectedAgents);
   const formatAgentList = (agents: AgentKey[]): string => {
     const labels = agents.map((agent) => {
@@ -7826,6 +7965,12 @@ function Dashboard({
       setShowCopilotChat(true);
     }
   }, [hasCopilotActivationSignal]);
+  // Keep Copilot visible whenever the analysis/forecast section is visible.
+  // This avoids transient refresh states unmounting chat while the forecast remains rendered.
+  useEffect(() => {
+    if (!shouldShowTelemetryGraph) return;
+    setShowCopilotChat(true);
+  }, [shouldShowTelemetryGraph]);
   useEffect(() => {
     if (!hasCopilotActivationSignal) return;
     if (effectiveCopilotAnalysisId.length > 0) return;
@@ -7840,7 +7985,7 @@ function Dashboard({
     setCopilotSessionAnalysisId((prev) => prev || generatedId);
     setCopilotVerifiedAnalysisId((prev) => prev || generatedId);
   }, [hasCopilotActivationSignal, effectiveCopilotAnalysisId, activePlayer?.id, activePlayer?.name]);
-  const shouldRenderCopilotUnderGraph = shouldShowTelemetryGraph && showCopilotChat;
+  const shouldRenderCopilotUnderGraph = shouldShowTelemetryGraph;
   useEffect(() => {
     if (!hasCopilotActivationSignal || !showCopilotChat) return;
     if (shouldRenderCopilotUnderGraph) return;
@@ -7861,6 +8006,9 @@ function Dashboard({
     if (entry.state === 'FALLBACK') detail = 'Fallback output ready';
     if (entry.state === 'SKIPPED') detail = 'Skipped by router';
     if (entry.state === 'ERROR') detail = 'No output';
+    if (entry.agent === 'risk' && entry.state === 'SUCCESS' && !riskAnalysis) {
+      detail = 'Threshold-based output ready';
+    }
     return { ...entry, detail };
   });
   const copilotRoutingHints = `${orchestrateMeta?.routerFallbackMessage || ''} ${routerDecisionForView?.reason || ''} ${orchestrateMeta?.responseMode || ''} ${orchestrateMeta?.llmMode || ''}`;
@@ -7885,6 +8033,24 @@ function Dashboard({
       routerReason: routerDecisionForView?.reason || null,
     });
   }, [aiEnabled, copilotConfigFallback, copilotFallbackMode, copilotUpstreamFailure, orchestrateMeta?.llmMode, orchestrateMeta?.responseMode, routerDecisionForView?.reason]);
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const analysisPayloadPresent = Boolean(hasAnyAnalysis || routerDecisionForView || orchestrateMeta);
+    if (!analysisPayloadPresent) return;
+    console.log('[agent-routing][ui-sync]', {
+      analysisPayloadPresent,
+      orchestratorSelectedAgents: routerSelectedAgents,
+      orchestratorExecutedAgents,
+      frontendDisplayedAgents: selectedAgents,
+    });
+  }, [
+    hasAnyAnalysis,
+    routerDecisionForView,
+    orchestrateMeta,
+    routerSelectedAgents.join('|'),
+    orchestratorExecutedAgents.join('|'),
+    selectedAgents.join('|'),
+  ]);
   const advancedSignalRecord = routerDecisionForView?.signals || {};
   const advancedFatigueSignal = safeNum(advancedSignalRecord.fatigueIndex ?? aiAnalysis?.fatigueIndex ?? activePlayer?.fatigue, Number.NaN);
   const advancedStrainSignal = safeNum(advancedSignalRecord.strainIndex ?? activePlayer?.strainIndex, Number.NaN);
@@ -8335,7 +8501,15 @@ function Dashboard({
     confidence: 'Low' | 'Moderate' | 'High';
     priority: 'Stable' | 'Monitor' | 'Immediate';
     availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' | 'UNAVAILABLE';
-    dominantRiskDriver: 'injury' | 'fatigue' | 'recovery' | 'control' | 'matchup' | 'pressure_phase' | 'mixed';
+    dominantRiskDriver:
+      | 'overs_quota_reached'
+      | 'injury'
+      | 'fatigue'
+      | 'recovery'
+      | 'control'
+      | 'matchup'
+      | 'pressure_phase'
+      | 'mixed';
     decisionMode:
       | 'IMMEDIATE_SUBSTITUTION'
       | 'ROTATE_NEXT_OVER'
@@ -8552,6 +8726,57 @@ function Dashboard({
     const strain = Math.max(0, safeNum(telemetry.strainIndex, 0));
     const oversBowled = Math.max(0, safeNum(telemetry.oversBowled, safeNum(activePlayer?.overs, 0)));
     const maxOvers = Math.max(1, safeNum(activePlayer?.maxOvers, getMaxOvers(inputMatchContext.format)));
+    const oversQuotaReached = oversBowled >= maxOvers;
+    const suggestedBenchOptions = rankedBowlingCandidates.slice(0, 3).map((entry) => ({
+      name: resolveRosterName(entry.player.id || entry.player.name, entry.player.name) || entry.player.name,
+      roleTag: entry.roleTag,
+      reason:
+        entry.roleTag === 'SPIN'
+          ? 'Offers control-focused spin variation for pressure containment.'
+          : entry.roleTag === 'PACE'
+            ? 'Provides pace threat while maintaining line discipline.'
+            : 'Provides balanced control and adaptability.',
+    }));
+    if (oversQuotaReached) {
+      const replacementOrFallback = hasReplacementOption ? replacementName : 'No eligible replacement';
+      return {
+        matchSituation: [matchSituationLine, scoreLine] as [string, string],
+        assessment: [
+          `${activeName} has reached the overs quota (${oversBowled}/${maxOvers}) and cannot bowl again in this format.`,
+          'Match rule constraint overrides fatigue and tactical continuation logic.',
+        ] as [string, string],
+        recommendedMove: hasReplacementOption
+          ? `Select replacement bowler: bring in ${replacementName} next over.`
+          : 'Select replacement bowler: no eligible replacement is currently available from the active roster.',
+        whyThisIsSmart: dedupeBullets(
+          [
+            'It keeps the bowling decision legally valid for the format.',
+            hasReplacementOption
+              ? `${replacementName} is the best available replacement option for immediate rotation.`
+              : 'Current roster has no eligible replacement, so bench substitution support is required.',
+            'This avoids avoidable penalties and keeps the phase plan executable.',
+          ],
+          3
+        ),
+        ifYouIgnore: 'If ignored, the bowling plan breaches overs quota rules and cannot continue as-is.',
+        confidence: 'High',
+        priority: 'Immediate',
+        availabilityStatus: 'UNAVAILABLE',
+        dominantRiskDriver: 'overs_quota_reached',
+        decisionMode: 'IMMEDIATE_SUBSTITUTION',
+        substitutionRequired: true,
+        primaryPlayerName: activeName,
+        recommendedReplacement: replacementOrFallback,
+        swap: {
+          out: activeName,
+          in: replacementOrFallback,
+          reason: hasReplacementOption
+            ? `Tactical plan: Overs quota reached. Next over: ${replacementName}.`
+            : 'Tactical plan: Overs quota reached. Trigger replacement workflow before the next over.',
+        },
+        suggestedBenchOptions,
+      };
+    }
     const injuryRiskToken = String(telemetry.injuryRisk || 'LOW').toUpperCase();
     const noBallRiskToken = String(telemetry.noBallRisk || 'LOW').toUpperCase();
     const elevatedControlRisk = noBallRiskToken === 'HIGH' || noBallRiskToken === 'MED' || noBallRiskToken === 'MEDIUM';
@@ -8757,16 +8982,6 @@ function Dashboard({
       backupCandidateSummary && selectedCandidateSummary && backupCandidateSummary.controlValue + 6 < selectedCandidateSummary.controlValue
         ? `${backupCandidateName || resolveRosterName(backupCandidateSummary.player.id || backupCandidateSummary.player.name, backupCandidateSummary.player.name)} is less suitable here because the immediate need is control stability, not extra pace.`
         : '';
-    const suggestedBenchOptions = rankedBowlingCandidates.slice(0, 3).map((entry) => ({
-      name: resolveRosterName(entry.player.id || entry.player.name, entry.player.name) || entry.player.name,
-      roleTag: entry.roleTag,
-      reason:
-        entry.roleTag === 'SPIN'
-          ? 'Offers control-focused spin variation for pressure containment.'
-          : entry.roleTag === 'PACE'
-            ? 'Provides pace threat while maintaining line discipline.'
-            : 'Provides balanced control and adaptability.',
-    }));
     let decisionMode:
       | 'IMMEDIATE_SUBSTITUTION'
       | 'ROTATE_NEXT_OVER'
@@ -9046,6 +9261,7 @@ function Dashboard({
     | 'TACTICAL_RISK'
     | 'UNAVAILABLE' = tacticalRecommendation.availabilityStatus || 'AVAILABLE';
   const tacticalDominantDriver:
+    | 'overs_quota_reached'
     | 'injury'
     | 'fatigue'
     | 'recovery'
@@ -9069,8 +9285,12 @@ function Dashboard({
   const tacticalSuggestedBenchOptions = Array.isArray(tacticalRecommendation.suggestedBenchOptions)
     ? tacticalRecommendation.suggestedBenchOptions.slice(0, 3)
     : [];
-  const tacticalDecisionLabel = tacticalDecisionMode.replace(/_/g, ' ');
-  const tacticalDominantDriverLabel = tacticalDominantDriver.replace(/_/g, ' ');
+  const tacticalDecisionLabel = tacticalDominantDriver === 'overs_quota_reached'
+    ? 'Select replacement bowler'
+    : tacticalDecisionMode.replace(/_/g, ' ');
+  const tacticalDominantDriverLabel = tacticalDominantDriver === 'overs_quota_reached'
+    ? 'Overs quota reached'
+    : tacticalDominantDriver.replace(/_/g, ' ');
   const copilotTacticalRecommendationState = useMemo(() => {
     const outgoing = String(tacticalRecommendation.swap?.out || activePlayer?.name || currentTelemetry.playerName || '').trim();
     const incoming = String(tacticalRecommendation.swap?.in || '').trim();
@@ -9618,7 +9838,7 @@ function Dashboard({
           <div className="mt-3 grid w-full grid-cols-3 gap-4">
             <button
               type="button"
-              onClick={() => applyStrainDelta(1, 0.3)}
+              onClick={() => runBowlingGuardedAction(() => applyStrainDelta(1, 0.3))}
               disabled={isStrainMax}
               className={`${strainButtonBase} bg-emerald-500/10 border border-emerald-400/30 text-emerald-200 hover:bg-emerald-500/20 hover:border-emerald-400/60 hover:shadow-[0_0_18px_rgba(16,185,129,0.25)] focus-visible:ring-emerald-400/45`}
             >
@@ -9626,7 +9846,7 @@ function Dashboard({
             </button>
             <button
               type="button"
-              onClick={() => applyStrainDelta(2, 0.8)}
+              onClick={() => runBowlingGuardedAction(() => applyStrainDelta(2, 0.8))}
               disabled={isStrainMax}
               className={`${strainButtonBase} bg-emerald-500/15 border border-emerald-400/40 text-white hover:bg-emerald-500/25 hover:shadow-[0_0_22px_rgba(16,185,129,0.35)] focus-visible:ring-emerald-400/45`}
             >
@@ -9634,7 +9854,7 @@ function Dashboard({
             </button>
             <button
               type="button"
-              onClick={handleResetStrain}
+              onClick={() => runBowlingGuardedAction(handleResetStrain)}
               className={`${strainButtonBase} bg-rose-500/10 border border-rose-400/30 text-rose-200 hover:bg-rose-500/20 hover:border-rose-400/60 hover:shadow-[0_0_18px_rgba(244,63,94,0.25)] focus-visible:ring-rose-400/35`}
             >
               Reset
@@ -9670,6 +9890,7 @@ function Dashboard({
 
   const closeMatchModeGuard = useCallback(() => {
     pendingMatchModeActionRef.current = null;
+    pendingMatchModeRequiredRef.current = 'BATTING';
     setMatchModeGuardContent(null);
     setShowMatchModeGuard(false);
   }, []);
@@ -9687,6 +9908,20 @@ function Dashboard({
         return true;
       }
       pendingMatchModeActionRef.current = onAllowed;
+      pendingMatchModeRequiredRef.current = requiredMode;
+      if (requiredMode === 'BOWLING') {
+        setMatchModeGuardContent({
+          title: 'Bowling actions locked',
+          message: 'Bowling actions are locked while match state is Batting. Switch match state to Bowling to continue.',
+          confirmLabel: 'Switch to Bowling',
+        });
+      } else {
+        setMatchModeGuardContent({
+          title: 'Batting actions locked',
+          message: 'Batting actions are locked while match state is Bowling. Switch match state to Batting to continue.',
+          confirmLabel: 'Switch to Batting',
+        });
+      }
       setShowMatchModeGuard(true);
       return false;
     },
@@ -9700,12 +9935,21 @@ function Dashboard({
     [requireMatchMode]
   );
 
+  const runBowlingGuardedAction = useCallback(
+    (onAllowed: () => void) => {
+      requireMatchMode('BOWLING', onAllowed);
+    },
+    [requireMatchMode]
+  );
+
   const handleSwitchToBattingAndContinue = useCallback(() => {
     const pendingAction = pendingMatchModeActionRef.current;
+    const requiredMode = pendingMatchModeRequiredRef.current;
     pendingMatchModeActionRef.current = null;
+    pendingMatchModeRequiredRef.current = 'BATTING';
     setMatchModeGuardContent(null);
     setShowMatchModeGuard(false);
-    setTeamMode('BATTING');
+    setTeamMode(requiredMode);
     if (pendingAction) {
       requestAnimationFrame(() => pendingAction());
     }
@@ -10849,14 +11093,14 @@ function Dashboard({
                         )}
                         <div className="flex items-center justify-center gap-6 mt-4">
                           <button type="button"
-                            onClick={handleDecreaseOver}
+                            onClick={() => runBowlingGuardedAction(handleDecreaseOver)}
                             disabled={activePlayer.isSub || activePlayer.isUnfit}
                             className={`w-12 h-12 rounded-full flex items-center justify-center border transition-all ${activePlayer.isSub || activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : 'cursor-pointer bg-slate-800 hover:bg-slate-700 text-white border-slate-600'}`}
                           >
                             <Minus className="w-6 h-6" />
                           </button>
                           <button type="button"
-                            onClick={handleAddOver}
+                            onClick={() => runBowlingGuardedAction(handleAddOver)}
                             disabled={isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap || isInningsFinished}
                             className={`w-12 h-12 rounded-full flex items-center justify-center shadow-lg transition-all ${isMedicalCritical || activePlayer.isSub || activePlayer.isUnfit || atOversCap || isInningsFinished ? 'bg-slate-800/50 text-slate-600 cursor-not-allowed shadow-none opacity-40' : 'cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}
                           >
@@ -10937,14 +11181,14 @@ function Dashboard({
                         <div className="inline-flex items-center rounded-md border border-slate-700 bg-[#162032] p-0.5">
                           <button
                             type="button"
-                            onClick={() => setRecoveryMode('auto')}
+                            onClick={() => runBowlingGuardedAction(() => setRecoveryMode('auto'))}
                             className={`px-2 py-1 text-xs font-bold rounded ${recoveryMode === 'auto' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
                           >
                             Auto
                           </button>
                           <button
                             type="button"
-                            onClick={() => setRecoveryMode('manual')}
+                            onClick={() => runBowlingGuardedAction(() => setRecoveryMode('manual'))}
                             className={`px-2 py-1 text-xs font-bold rounded ${recoveryMode === 'manual' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
                           >
                             Manual
@@ -10953,7 +11197,7 @@ function Dashboard({
                       </div>
                       <select
                         value={recoveryMode === 'manual' ? manualRecovery : activePlayer.hrRecovery}
-                        onChange={(e) => setManualRecovery(e.target.value as RecoveryLevel)}
+                        onChange={(e) => runBowlingGuardedAction(() => setManualRecovery(e.target.value as RecoveryLevel))}
                         disabled={recoveryMode === 'auto'}
                         className={`w-full bg-[#162032] text-sm rounded-lg px-3 py-2.5 border focus:outline-none ${(activePlayer.injuryRisk === 'High' || activePlayer.injuryRisk === 'Critical') ? 'text-rose-500 border-rose-500/50 bg-rose-500/5' : 'text-white border-slate-700'} ${recoveryMode === 'auto' ? 'opacity-80 cursor-not-allowed' : ''}`}
                       >
@@ -10981,14 +11225,16 @@ function Dashboard({
                   <div className="mt-6">
                     <p className="text-xs font-bold text-slate-500 uppercase mb-2">Quick Actions</p>
                     <div className="grid grid-cols-3 gap-3">
-                      <button type="button" onClick={handleMarkUnfit} className={`border p-4 rounded-lg transition-all flex flex-col items-center group shadow-lg ${activePlayer.isUnfit ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-emerald-900/10' : 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/30 shadow-rose-900/10'}`}>
+                      <button type="button" onClick={() => runBowlingGuardedAction(handleMarkUnfit)} className={`border p-4 rounded-lg transition-all flex flex-col items-center group shadow-lg ${activePlayer.isUnfit ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-emerald-900/10' : 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/30 shadow-rose-900/10'}`}>
                         <Zap className="w-5 h-5 mb-0.5" />
                         <span className="text-sm font-bold">{activePlayer.isUnfit ? 'Mark Fit' : 'Mark Unfit'}</span>
                         <span className="text-[10px] opacity-70">{activePlayer.isUnfit ? 'Restore player state' : 'Force critical state'}</span>
                       </button>
                       <button
                         type="button"
-                        onClick={handleRotateBowler}
+                        onClick={() => runBowlingGuardedAction(() => {
+                          void handleRotateBowler();
+                        })}
                         disabled={activePlayer.isUnfit || agentState === 'thinking'}
                         className={`p-4 rounded-lg transition-colors flex flex-col items-center border ${
                           activePlayer.isUnfit || agentState === 'thinking'
@@ -11001,7 +11247,7 @@ function Dashboard({
                         <span className="text-[10px] opacity-70">Coach suggestion</span>
                       </button>
                       <button type="button"
-                        onClick={handleRest}
+                        onClick={() => runBowlingGuardedAction(handleRest)}
                         disabled={activePlayer.isUnfit}
                         className={`p-4 rounded-lg transition-all flex flex-col items-center border ${activePlayer.isUnfit ? 'bg-slate-800/50 text-slate-600 border-slate-800 cursor-not-allowed' : activePlayer.isResting ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
                       >

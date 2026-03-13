@@ -164,7 +164,7 @@ const parseUpstreamCode = (rawBody) => {
 };
 
 const OFF_TOPIC_REDIRECT_REPLY =
-  "I'm focused on the current match state, player risk, substitutions, and tactical decisions. Ask me about the selected player or next-over plan.";
+  "That's outside this match copilot's scope. I can help with player risk, substitutions, and next-over tactics.";
 
 const NO_ACTIVE_PLAYER_REPLY =
   "I need a selected player to assess that. Choose a player from the roster and I'll evaluate their workload, risk, and next-over decision.";
@@ -176,15 +176,23 @@ const GREETING_REPLIES = [
 ];
 
 const ACKNOWLEDGEMENT_REPLIES = [
-  "Glad to help. Let me know if you'd like to evaluate another bowler or plan the next over.",
-  'Anytime. You can also ask about another player or simulate the next-over strategy.',
-  "Great, happy to help. If you want, I can quickly compare your next two tactical options.",
+  'Sounds good.',
+  'Great, that should work.',
+  'Makes sense.',
+  'Good plan.',
+  'Yep - reassess after this over.',
 ];
 
 const CONVERSATION_END_REPLIES = [
-  'Bye! Feel free to come back anytime to analyze another match situation.',
-  "Goodbye. Come back anytime and we'll break down the next match scenario.",
-  'See you soon. I can help again whenever you want to evaluate the next-over decision.',
+  "You're welcome. Bye - come back anytime.",
+  "Bye. I'll be here when you want to revisit the match plan.",
+  'See you. Reach out anytime for the next-over call.',
+];
+
+const SOCIAL_HELP_REPLIES = [
+  'Sure - what do you need help with?',
+  'Absolutely. Tell me what you need.',
+  'Yes, happy to help - what should we look at?',
 ];
 
 const ACKNOWLEDGEMENT_EXACT_MATCHES = new Set([
@@ -253,6 +261,417 @@ const isConversationEndingMessage = (message) => {
 
 const buildConversationEndingReply = (message) =>
   pickReplyVariant(CONVERSATION_END_REPLIES, `bye:${message}`) || CONVERSATION_END_REPLIES[0];
+
+const buildSocialHelpReply = (message) =>
+  pickReplyVariant(SOCIAL_HELP_REPLIES, `help:${message}`) || SOCIAL_HELP_REPLIES[0];
+
+const normalizeCopilotIntentCategory = (value) => {
+  const token = String(value || '').trim().toUpperCase();
+  if (!token) return '';
+  if (token === 'MATCH_QUERY' || token === 'TACTICAL_QUERY') return 'MATCH_QUERY';
+  if (token === 'FOLLOW_UP_MATCH_QUERY' || token === 'FOLLOWUP_QUERY' || token === 'FOLLOW_UP_QUERY') {
+    return 'FOLLOW_UP_MATCH_QUERY';
+  }
+  if (token === 'ACKNOWLEDGEMENT' || token === 'ACKNOWLEDGMENT') return 'ACKNOWLEDGEMENT';
+  if (token === 'SOCIAL_MESSAGE') return 'SOCIAL_MESSAGE';
+  if (token === 'OUT_OF_SCOPE') return 'OUT_OF_SCOPE';
+  return '';
+};
+
+const SOCIAL_INTENT_TOKENS = new Set([
+  'ok',
+  'okay',
+  'alright',
+  'all',
+  'right',
+  'cool',
+  'perfect',
+  'got',
+  'it',
+  'thanks',
+  'thank',
+  'you',
+  'understood',
+  'makes',
+  'sense',
+  'bye',
+  'goodbye',
+  'see',
+  'ya',
+  'cya',
+  'later',
+  'talk',
+  'catch',
+  'soon',
+  'for',
+  'now',
+  'thats',
+  'good',
+  'sounds',
+  'can',
+  'could',
+  'u',
+  'you',
+  'help',
+  'me',
+  'with',
+  'smth',
+  'something',
+]);
+
+const SOCIAL_HELP_LEAD_IN_PATTERNS = [
+  /^(?:can|could)\s+(?:u|you)\s+help(?:\s+me)?(?:\s+with)?(?:\s+(?:smth|something|this|that|it))?$/,
+  /^(?:i\s+)?need\s+help$/,
+  /^(?:help|help me)$/,
+];
+
+const SOCIAL_FILLER_PATTERNS = [
+  /^(?:alright|ok|okay)\s+(?:thats\s+good|sounds\s+good|all\s+good)$/,
+  /^(?:thats\s+good|sounds\s+good|all\s+good|cool|nice|great)$/,
+];
+
+const ACKNOWLEDGEMENT_CONTEXT_PATTERNS = [
+  /^(?:ahh?\s+)?(?:ok|okay|alright|right|yeah|yep)\s+(?:that(?:\s*s)?\s+)?(?:sounds\s+good|should\s+work(?:s)?)$/,
+  /^(?:ok|okay|alright|ahh?\s+okay)(?:\s+that(?:\s*s)?\s+(?:should\s+)?work(?:s)?)$/,
+  /^(?:yeah|yep|yes)\s+(?:that(?:\s*s)?\s+)?(?:should\s+)?work(?:s)?$/,
+  /^(?:that(?:\s*s)?\s+)?(?:should\s+)?work(?:s)?$/,
+  /^(?:fair\s+enough|good\s+plan|makes\s+sense|all\s+good|sounds\s+good)$/,
+];
+
+const classifySocialIntentMessage = (message) => {
+  const normalized = normalizeForKeywordMatch(message);
+  if (!normalized) return '';
+  if (normalized.length > 64) return '';
+  if (SOCIAL_HELP_LEAD_IN_PATTERNS.some((pattern) => pattern.test(normalized))) return 'help_offer';
+  if (SOCIAL_FILLER_PATTERNS.some((pattern) => pattern.test(normalized))) return 'acknowledgement';
+  if (ACKNOWLEDGEMENT_CONTEXT_PATTERNS.some((pattern) => pattern.test(normalized))) return 'acknowledgement';
+
+  const tokens = normalized.split(' ').filter(Boolean);
+  if (tokens.length === 0) return '';
+  const nonSocialTokens = tokens.filter((token) => !SOCIAL_INTENT_TOKENS.has(token));
+  if (nonSocialTokens.length > 1) return '';
+
+  const hasClosingSignal =
+    isConversationEndingMessage(normalized) ||
+    /\b(?:bye|goodbye|see you|see ya|cya|later)\b/.test(normalized);
+  const hasAcknowledgementSignal =
+    isAcknowledgementMessage(normalized) ||
+    /\b(?:thanks|thank you|got it|understood|makes sense|ok|okay|alright|all right)\b/.test(normalized);
+
+  if (hasClosingSignal && nonSocialTokens.length <= 1) return 'conversation_close';
+  if (hasAcknowledgementSignal && nonSocialTokens.length <= 1) return 'acknowledgement';
+  if (nonSocialTokens.length === 0 && !/\bhelp\b/.test(normalized)) return 'acknowledgement';
+  return '';
+};
+
+const COPILOT_MESSAGE_CATEGORIES = Object.freeze({
+  MATCH_QUERY: 'MATCH_QUERY',
+  TACTICAL_QUERY: 'MATCH_QUERY',
+  FOLLOW_UP_MATCH_QUERY: 'FOLLOW_UP_MATCH_QUERY',
+  FOLLOW_UP_QUERY: 'FOLLOW_UP_MATCH_QUERY',
+  FOLLOWUP_QUERY: 'FOLLOW_UP_MATCH_QUERY',
+  ACKNOWLEDGEMENT: 'ACKNOWLEDGEMENT',
+  SOCIAL_MESSAGE: 'SOCIAL_MESSAGE',
+  OUT_OF_SCOPE: 'OUT_OF_SCOPE',
+});
+
+const FOLLOW_UP_MATCH_REFERENCE_PATTERNS = [
+  /\b(?:he|him|his|this player|that player|this bowler|that bowler|the player)\b/,
+  /\b(?:best option|best replacement|who instead|who should bowl|next over|backup)\b/,
+  /\b(?:who is best then|who s best then|best then|after this bowler|after this over)\b/,
+  /\b(?:why him|why her|why that|why this|why)\b/,
+  /\b(?:still rotate|should we still rotate|one over left)\b/,
+];
+
+const SHORT_CONTEXTUAL_QUERY_PATTERN = /\b(?:who|what|why|how|still|right|rn|now|next|then)\b/;
+
+const findMentionedContextPlayer = (text, playerNames) => {
+  const normalizedText = normalizeForKeywordMatch(text);
+  const compactText = compactForKeywordMatch(text);
+  if (!normalizedText || !Array.isArray(playerNames)) return '';
+
+  for (const playerName of playerNames) {
+    const normalizedName = normalizeForKeywordMatch(playerName);
+    if (!normalizedName || normalizedName.length < 3) continue;
+    if (normalizedText.includes(normalizedName)) return playerName;
+    const compactName = normalizedName.replace(/\s+/g, '');
+    if (compactName.length >= 3 && compactText.includes(compactName)) return playerName;
+  }
+
+  return '';
+};
+
+const buildCopilotSessionContext = (history, snapshot, tacticalState) => {
+  const telemetry = asRecord(snapshot.telemetry);
+  const players = asRecord(snapshot.players);
+  const snapshotPlayers = asRecord(asRecord(snapshot.matchContextSnapshot).players);
+  const selectedPlayer = toText(
+    telemetry.playerName,
+    players.selectedBowler,
+    snapshotPlayers.selectedBowler,
+    players.selectedBatter,
+    snapshotPlayers.selectedBatter,
+    players.bowler,
+    snapshotPlayers.bowler,
+    players.striker,
+    snapshotPlayers.striker
+  );
+  const latestRecommendation = toText(
+    tacticalState.recommendedMove,
+    tacticalState.tacticalPlan,
+    tacticalState.reason
+  );
+  const recommendedReplacement = toText(tacticalState.recommendedIncomingPlayer);
+  const recommendedOutgoingPlayer = toText(
+    tacticalState.recommendedOutgoingPlayer,
+    tacticalState.recommendedReplacementPlayer
+  );
+  const candidatePlayers = [
+    ...collectSnapshotPlayerNames(snapshot),
+    selectedPlayer,
+    recommendedOutgoingPlayer,
+    recommendedReplacement,
+  ].filter(Boolean);
+  const dedupe = new Set();
+  const uniquePlayers = candidatePlayers.filter((name) => {
+    const key = normalizeForKeywordMatch(name);
+    if (!key || dedupe.has(key)) return false;
+    dedupe.add(key);
+    return true;
+  });
+
+  const recentTurns = Array.isArray(history) ? history.slice(-4) : [];
+  let lastDiscussedPlayer = '';
+  for (let i = recentTurns.length - 1; i >= 0; i -= 1) {
+    const mention = findMentionedContextPlayer(asRecord(recentTurns[i]).content, uniquePlayers);
+    if (mention) {
+      lastDiscussedPlayer = mention;
+      break;
+    }
+  }
+
+  return {
+    selectedPlayer,
+    lastDiscussedPlayer,
+    latestRecommendation,
+    recommendedReplacement,
+    recommendedOutgoingPlayer,
+    hasRecentTurns: recentTurns.length > 0,
+    recentUserTurns: recentTurns.filter((turn) => asRecord(turn).role === 'user').map((turn) => asRecord(turn).content),
+    recentAssistantTurns: recentTurns
+      .filter((turn) => asRecord(turn).role === 'assistant')
+      .map((turn) => asRecord(turn).content),
+  };
+};
+
+const parseIntentClassifierOutput = (raw) => {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+
+  try {
+    const parsed = JSON.parse(text);
+    return normalizeCopilotIntentCategory(asRecord(parsed).intent);
+  } catch {
+    // Fall through to loose extraction.
+  }
+
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return normalizeCopilotIntentCategory(asRecord(parsed).intent);
+    } catch {
+      // Ignore malformed JSON fragments.
+    }
+  }
+
+  const direct = text.match(/\b(MATCH_QUERY|FOLLOW_UP_MATCH_QUERY|FOLLOW_UP_QUERY|FOLLOWUP_QUERY|ACKNOWLEDGEMENT|ACKNOWLEDGMENT|SOCIAL_MESSAGE|OUT_OF_SCOPE)\b/i);
+  return normalizeCopilotIntentCategory(direct ? direct[1] : '');
+};
+
+const buildIntentClassifierContext = (sessionContext, snapshot) => {
+  const matchContext = asRecord(snapshot.matchContext);
+  const snapshotContext = asRecord(asRecord(snapshot.matchContextSnapshot).matchContext);
+  return [
+    `selectedPlayer=${toText(sessionContext.selectedPlayer, 'n/a')}`,
+    `lastDiscussedPlayer=${toText(sessionContext.lastDiscussedPlayer, 'n/a')}`,
+    `latestRecommendation=${toText(sessionContext.latestRecommendation, 'n/a')}`,
+    `recommendedOutgoing=${toText(sessionContext.recommendedOutgoingPlayer, 'n/a')}`,
+    `recommendedReplacement=${toText(sessionContext.recommendedReplacement, 'n/a')}`,
+    `matchMode=${toText(matchContext.matchMode, snapshotContext.matchMode, 'n/a')}`,
+    `format=${toText(matchContext.format, snapshotContext.format, 'n/a')}`,
+    `phase=${toText(matchContext.phase, snapshotContext.phase, 'n/a')}`,
+    `intensity=${toText(matchContext.intensity, snapshotContext.intensity, 'n/a')}`,
+  ].join('\n');
+};
+
+const classifyIntentWithAi = async ({
+  message,
+  history,
+  sessionContext,
+  snapshot,
+  aoaiRequestUrl,
+  aoaiApiKey,
+  context,
+  traceId,
+  routeCalled,
+}) => {
+  if (!aoaiRequestUrl || !aoaiApiKey) return '';
+  const trimmedMessage = String(message || '').trim();
+  if (!trimmedMessage) return '';
+
+  const recentTurns = (Array.isArray(history) ? history : [])
+    .slice(-4)
+    .map((turn) => `${normalizeRole(asRecord(turn).role)}: ${clipText(asRecord(turn).content, 180)}`)
+    .join('\n');
+  const classifierContext = buildIntentClassifierContext(sessionContext, snapshot);
+  const systemPrompt =
+    'You are an intent classifier for a cricket match copilot. ' +
+    'Classify the user message into exactly one label: MATCH_QUERY, FOLLOW_UP_MATCH_QUERY, ACKNOWLEDGEMENT, SOCIAL_MESSAGE, OUT_OF_SCOPE. ' +
+    'Definitions: MATCH_QUERY=explicit tactical/match question. FOLLOW_UP_MATCH_QUERY=short contextual tactical follow-up. ' +
+    'ACKNOWLEDGEMENT=acceptance/confirmation reaction to prior answer. SOCIAL_MESSAGE=greeting/thanks/bye/casual social turn. ' +
+    'OUT_OF_SCOPE=clearly unrelated to cricket/match context and not social. ' +
+    'Return strict JSON only: {"intent":"<LABEL>"}';
+
+  try {
+    const response = await fetch(aoaiRequestUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': String(aoaiApiKey || ''),
+      },
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content:
+              `CURRENT_MESSAGE:\n${trimmedMessage}\n\n` +
+              `RECENT_TURNS:\n${recentTurns || 'none'}\n\n` +
+              `SESSION_CONTEXT:\n${classifierContext}\n`,
+          },
+        ],
+        temperature: 0,
+        max_tokens: 80,
+      }),
+    });
+
+    if (!response.ok) {
+      context.log?.('[copilot-chat] intent_classifier_fallback', {
+        traceId,
+        routeCalled,
+        status: parseStatusCode(response.status),
+        reason: 'classifier_http_error',
+      });
+      return '';
+    }
+
+    const rawBody = await response.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      parsed = {};
+    }
+    const completion = extractCompletionText(parsed);
+    const intent = parseIntentClassifierOutput(completion);
+    if (!intent) {
+      context.log?.('[copilot-chat] intent_classifier_fallback', {
+        traceId,
+        routeCalled,
+        reason: 'classifier_parse_failed',
+        completion: clipText(completion, 140),
+      });
+    }
+    return intent;
+  } catch (error) {
+    context.log?.('[copilot-chat] intent_classifier_fallback', {
+      traceId,
+      routeCalled,
+      reason: `classifier_error:${clipText(error instanceof Error ? error.message : String(error || 'unknown_error'), 120)}`,
+    });
+    return '';
+  }
+};
+
+const interpretCopilotMessage = ({ message, history, snapshot, tacticalState, aiIntent = '' }) => {
+  const normalizedMessage = normalizeForKeywordMatch(message);
+  const domain = classifyCopilotDomain(message, history, snapshot);
+  const sessionContext = buildCopilotSessionContext(history, snapshot, tacticalState);
+  const tokenCount = normalizedMessage ? normalizedMessage.split(' ').filter(Boolean).length : 0;
+  const hasFollowUpCue = FOLLOW_UP_MATCH_REFERENCE_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
+  const hasShortContextualCue = tokenCount > 0 && tokenCount <= 14 && SHORT_CONTEXTUAL_QUERY_PATTERN.test(normalizedMessage);
+  const hasBlockedSignal = Array.isArray(domain.blockedHits) && domain.blockedHits.length > 0;
+  const hasContextAnchor = Boolean(
+    toText(
+      sessionContext.lastDiscussedPlayer,
+      sessionContext.selectedPlayer,
+      sessionContext.recommendedOutgoingPlayer,
+      sessionContext.recommendedReplacement,
+      sessionContext.latestRecommendation
+    )
+  );
+  const hasMatchSignal = domain.allowed && domain.handling !== 'blocked';
+
+  let socialIntent = classifySocialIntentMessage(message);
+  if (!socialIntent && isGreetingMessage(message)) {
+    socialIntent = 'greeting';
+  }
+
+  const followUpLikely =
+    !socialIntent &&
+    (hasFollowUpCue || (hasShortContextualCue && hasContextAnchor && sessionContext.hasRecentTurns)) &&
+    (hasContextAnchor || domain.followUpDetected || domain.contextPlayerMention || sessionContext.hasRecentTurns) &&
+    (!hasBlockedSignal || hasFollowUpCue || domain.contextPlayerMention);
+
+  const normalizedAiIntent = normalizeCopilotIntentCategory(aiIntent);
+
+  let category = COPILOT_MESSAGE_CATEGORIES.OUT_OF_SCOPE;
+  let reason = 'out_of_scope';
+  if (normalizedAiIntent) {
+    const aiOutOfScopeConflictsWithMatchSignals =
+      normalizedAiIntent === COPILOT_MESSAGE_CATEGORIES.OUT_OF_SCOPE && (hasMatchSignal || followUpLikely);
+    if (!aiOutOfScopeConflictsWithMatchSignals) {
+      category = normalizedAiIntent;
+      reason = `ai_intent:${normalizedAiIntent.toLowerCase()}`;
+    }
+  }
+  if (reason === 'out_of_scope' && socialIntent === 'acknowledgement') {
+    category = COPILOT_MESSAGE_CATEGORIES.ACKNOWLEDGEMENT;
+    reason = 'acknowledgement';
+  } else if (reason === 'out_of_scope' && socialIntent) {
+    category = COPILOT_MESSAGE_CATEGORIES.SOCIAL_MESSAGE;
+    reason = `social:${socialIntent}`;
+  } else if (reason === 'out_of_scope' && followUpLikely) {
+    category = COPILOT_MESSAGE_CATEGORIES.FOLLOW_UP_QUERY;
+    reason = 'contextual_follow_up';
+  } else if (reason === 'out_of_scope' && hasMatchSignal) {
+    category = COPILOT_MESSAGE_CATEGORIES.TACTICAL_QUERY;
+    reason = domain.reason || 'domain_match';
+  } else if (reason === 'out_of_scope' && hasBlockedSignal) {
+    category = COPILOT_MESSAGE_CATEGORIES.OUT_OF_SCOPE;
+    reason = 'blocked_keyword_without_match_context';
+  } else if (reason === 'out_of_scope' && hasContextAnchor && hasShortContextualCue && sessionContext.hasRecentTurns) {
+    category = COPILOT_MESSAGE_CATEGORIES.FOLLOW_UP_QUERY;
+    reason = 'short_follow_up_with_context';
+  }
+
+  return {
+    category,
+    reason,
+    socialIntent,
+    domain,
+    sessionContext,
+    signals: {
+      tokenCount,
+      hasFollowUpCue,
+      hasShortContextualCue,
+      hasBlockedSignal,
+      hasContextAnchor,
+      hasMatchSignal,
+    },
+  };
+};
 
 const PERFORMANCE_INTENT_KEYWORDS = [
   'reliable',
@@ -555,6 +974,15 @@ const REPLACEMENT_INTENT_PATTERNS = [
   /\bwho\s+should\s+replace\b/,
   /\bwho\s+do\s+i\s+sub(?:stitute)?\s+in\b/,
   /\bwho\s+should\s+i\s+sub(?:stitute)?\s+in\b/,
+  /\bwho\s+is\s+the\s+best\s+option(?:\s+(?:rn|right\s+now))?\b/,
+  /\bbest\s+option(?:\s+(?:rn|right\s+now))?\b/,
+  /\bbest\s+replacement\b/,
+  /\bwho\s+is\s+best\s+then\b/,
+  /\bbest\s+then\b/,
+  /\bwho\s+instead\b/,
+  /\bwhat\s+about\s+next\s+over\b/,
+  /\bwhat\s+about\s+after\s+this\s+bowler\b/,
+  /\bafter\s+this\s+bowler\b/,
   /\bchange\s+.+\s+with\b/,
   /\breplace\s+.+\s+with\b/,
   /\bswap\s+.+\s+with\b/,
@@ -1900,11 +2328,21 @@ const applyResolutionAssumptionToReply = (reply, resolution) => {
   return `${assumptionPrefix} ${baseReply}`.trim();
 };
 
-const resolveAmbiguousPlayerReference = (message, snapshot, domain) => {
+const resolveAmbiguousPlayerReference = (message, snapshot, domain, conversationContext = {}) => {
   const resolutionContext = buildPlayerReferenceResolutionContext(snapshot);
   if (!hasAmbiguousPlayerReference(message, snapshot, domain)) {
     return {
       applies: false,
+      context: resolutionContext,
+    };
+  }
+
+  const previousTurnPlayer = toText(conversationContext.lastDiscussedPlayer);
+  if (previousTurnPlayer) {
+    return {
+      applies: true,
+      resolvedPlayerName: previousTurnPlayer,
+      resolutionSource: 'previous_turn_player',
       context: resolutionContext,
     };
   }
@@ -1915,6 +2353,20 @@ const resolveAmbiguousPlayerReference = (message, snapshot, domain) => {
       applies: true,
       resolvedPlayerName: activePlayerName,
       resolutionSource: 'active_selected_player',
+      context: resolutionContext,
+    };
+  }
+
+  const recommendationPlayer = toText(
+    conversationContext.recommendedOutgoingPlayer,
+    conversationContext.selectedPlayer
+  );
+  if (recommendationPlayer) {
+    return {
+      applies: true,
+      resolvedPlayerName: recommendationPlayer,
+      resolutionSource: 'recommendation_context',
+      assumptionPrefix: `If you mean ${recommendationPlayer},`,
       context: resolutionContext,
     };
   }
@@ -2219,14 +2671,20 @@ const buildAlignedTacticalReply = (state, message = '') => {
 
   const isWhyQuestion = /\b(why|reason|because|justify|explain)\b/.test(normalizedMessage);
   const isReplacementQuestion = matchesAnyPattern(normalizedMessage, REPLACEMENT_INTENT_PATTERNS);
+  const isBestOptionQuestion = /\b(best option|best replacement|who instead)\b/.test(normalizedMessage);
   const isNextBowlerQuestion = /\b(best next bowler|who bowls next|who should bowl next|next bowler)\b/.test(
     normalizedMessage
   );
-  const isContinueQuestion = /\b(continue|keep|stay|still okay|ok to continue)\b/.test(normalizedMessage);
+  const isContinueQuestion =
+    /\b(continue|keep|stay|still okay|ok to continue|one over left|over left|can he still bowl|can he bowl)\b/.test(
+      normalizedMessage
+    );
   const wantsDetailedBreakdown = isDetailedTacticalRequest(normalizedMessage);
 
   let response = '';
-  if (isReplacementQuestion || isNextBowlerQuestion) {
+  if (isBestOptionQuestion) {
+    response = `Right now, ${replacementIn} is the best replacement option. ${reason}`;
+  } else if (isReplacementQuestion || isNextBowlerQuestion) {
     response = `${recommendedMove} ${reason}`;
   } else if (isWhyQuestion) {
     response = `${replacementOut} is still effective, but rotating now is safer because ${reason}`;
@@ -2264,7 +2722,7 @@ const isAlignmentSensitiveQuestion = (message, state) => {
   const hasReplacementIntent =
     matchesAnyPattern(normalizedMessage, REPLACEMENT_INTENT_PATTERNS) ||
     matchesAnyPattern(normalizedMessage, TACTICAL_QUERY_PATTERNS) ||
-    /\b(rotate|rotation|replace|swap|sub(?:stitute)?|change|next over|next bowler|safest|who should|should we|why)\b/.test(
+    /\b(rotate|rotation|replace|swap|sub(?:stitute)?|change|next over|next bowler|safest|who should|should we|why|one over left|over left|can he)\b/.test(
       normalizedMessage
     );
   if (hasReplacementIntent) return true;
@@ -2549,13 +3007,76 @@ module.exports = async function copilotChat(context, req) {
       historyTurns: history.length,
     });
     const tacticalState = resolveTacticalRecommendationState(contextSnapshot);
+    const aoai = resolveAoaiRuntimeConfig();
+    const aoaiRequestUrl = buildAoaiChatUrl(aoai);
+    const preliminarySessionContext = buildCopilotSessionContext(history, contextSnapshot, tacticalState);
+    const aiIntent = await classifyIntentWithAi({
+      message,
+      history,
+      sessionContext: preliminarySessionContext,
+      snapshot: contextSnapshot,
+      aoaiRequestUrl: aoai.ok ? aoaiRequestUrl : '',
+      aoaiApiKey: aoai.apiKey,
+      context,
+      traceId,
+      routeCalled,
+    });
+    // Lightweight interpreter runs for every message and decides high-level routing.
+    const messageInterpretation = interpretCopilotMessage({
+      message,
+      history,
+      snapshot: contextSnapshot,
+      tacticalState,
+      aiIntent,
+    });
+    const domain = messageInterpretation.domain;
+    const socialIntent = toText(messageInterpretation.socialIntent);
+    const sessionContext = asRecord(messageInterpretation.sessionContext);
+    context.log?.('[copilot-chat] interpretation', {
+      traceId,
+      routeCalled,
+      category: messageInterpretation.category,
+      reason: messageInterpretation.reason,
+      aiIntent: aiIntent || undefined,
+      socialIntent: socialIntent || undefined,
+      selectedPlayer: toText(sessionContext.selectedPlayer) || undefined,
+      lastDiscussedPlayer: toText(sessionContext.lastDiscussedPlayer) || undefined,
+      recommendedOutgoingPlayer: toText(sessionContext.recommendedOutgoingPlayer) || undefined,
+      recommendedReplacement: toText(sessionContext.recommendedReplacement) || undefined,
+      latestRecommendation: toText(sessionContext.latestRecommendation) || undefined,
+      signals: asRecord(messageInterpretation.signals),
+    });
 
-    if (isAcknowledgementMessage(message)) {
-      const acknowledgementReply = buildAcknowledgementReply(message);
-      context.log?.('[copilot-chat] acknowledgement', {
+    if (
+      messageInterpretation.category === COPILOT_MESSAGE_CATEGORIES.ACKNOWLEDGEMENT ||
+      messageInterpretation.category === COPILOT_MESSAGE_CATEGORIES.SOCIAL_MESSAGE
+    ) {
+      let socialMode = 'social';
+      let socialReply = buildAcknowledgementReply(message);
+      if (messageInterpretation.category === COPILOT_MESSAGE_CATEGORIES.ACKNOWLEDGEMENT) {
+        socialMode = 'acknowledgement';
+        socialReply = buildAcknowledgementReply(message);
+      } else if (socialIntent === 'conversation_close') {
+        socialMode = 'conversation_close';
+        socialReply = buildConversationEndingReply(message);
+      } else if (socialIntent === 'help_offer') {
+        socialMode = 'help_offer';
+        socialReply = buildSocialHelpReply(message);
+      } else if (socialIntent === 'greeting') {
+        socialMode = 'greeting';
+        socialReply =
+          pickReplyVariant(GREETING_REPLIES, `${message}:${history.length}`) ||
+          GREETING_REPLIES[0];
+      } else {
+        socialMode = 'acknowledgement';
+        socialReply = buildAcknowledgementReply(message);
+      }
+
+      context.log?.('[copilot-chat] social_reply', {
         traceId,
         routeCalled,
         prompt: message,
+        socialMode,
       });
       return respond(
         jsonResponse(
@@ -2563,11 +3084,11 @@ module.exports = async function copilotChat(context, req) {
           {
             ok: true,
             source: 'ai',
-            mode: 'acknowledgement',
+            mode: socialMode,
             routeCalled,
             analysisIdUsed,
-            reply: acknowledgementReply,
-            answer: acknowledgementReply,
+            reply: socialReply,
+            answer: socialReply,
             messagesUsed: Math.min(10, countUserTurns(history) + 1),
           },
           {},
@@ -2576,33 +3097,6 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
-    if (isConversationEndingMessage(message)) {
-      const closingReply = buildConversationEndingReply(message);
-      context.log?.('[copilot-chat] conversation_close', {
-        traceId,
-        routeCalled,
-        prompt: message,
-      });
-      return respond(
-        jsonResponse(
-          200,
-          {
-            ok: true,
-            source: 'ai',
-            mode: 'conversation_close',
-            routeCalled,
-            analysisIdUsed,
-            reply: closingReply,
-            answer: closingReply,
-            messagesUsed: Math.min(10, countUserTurns(history) + 1),
-          },
-          {},
-          req
-        )
-      );
-    }
-
-    const domain = classifyCopilotDomain(message, history, contextSnapshot);
     context.log?.('[copilot-chat] domain_guard', {
       traceId,
       routeCalled,
@@ -2624,11 +3118,20 @@ module.exports = async function copilotChat(context, req) {
       tacticalRecommendationState: tacticalState,
     });
 
-    const playerReferenceResolution = resolveAmbiguousPlayerReference(message, contextSnapshot, domain);
+    const playerReferenceResolution = resolveAmbiguousPlayerReference(
+      message,
+      contextSnapshot,
+      domain,
+      sessionContext
+    );
+    const shouldTreatAsMatchIntent =
+      messageInterpretation.category === COPILOT_MESSAGE_CATEGORIES.TACTICAL_QUERY
+      || messageInterpretation.category === COPILOT_MESSAGE_CATEGORIES.FOLLOW_UP_QUERY;
     const hasDirectPlayerIntent = shouldValidatePlayerReferences(message, domain)
       && extractLikelyPlayerReferences(message).length > 0;
     const bypassBlockedDomainGuard =
-      domain.handling === 'blocked' && (playerReferenceResolution.applies || hasDirectPlayerIntent);
+      domain.handling === 'blocked'
+      && (playerReferenceResolution.applies || hasDirectPlayerIntent || shouldTreatAsMatchIntent);
     const intentBucket = classifyMessageIntentBucket(message, domain, playerReferenceResolution);
     const effectiveMessage = playerReferenceResolution.resolvedPlayerName
       ? buildResolvedPlayerPrompt(message, playerReferenceResolution.resolvedPlayerName)
@@ -2636,6 +3139,7 @@ module.exports = async function copilotChat(context, req) {
     context.log?.('[copilot-chat] intent', {
       traceId,
       routeCalled,
+      interpretedCategory: messageInterpretation.category,
       intentBucket,
       handling: domain.handling,
       bypassBlockedDomainGuard,
@@ -2657,33 +3161,13 @@ module.exports = async function copilotChat(context, req) {
       });
     }
 
-    if (domain.handling === 'greeting') {
-      const greetingReply =
-        pickReplyVariant(GREETING_REPLIES, `${message}:${history.length}`) ||
-        GREETING_REPLIES[0];
-      return respond(
-        jsonResponse(
-          200,
-          {
-            ok: true,
-            source: 'ai',
-            mode: 'domain_greeting',
-            routeCalled,
-            analysisIdUsed,
-            reply: greetingReply,
-            answer: greetingReply,
-            messagesUsed: Math.min(10, countUserTurns(history) + 1),
-          },
-          {},
-          req
-        )
-      );
-    }
+    const blockedByInterpreter =
+      messageInterpretation.category === COPILOT_MESSAGE_CATEGORIES.OUT_OF_SCOPE && !hasDirectPlayerIntent;
+    const blockedByIntentBucket =
+      intentBucket === 'OFF_TOPIC' && !hasDirectPlayerIntent && !shouldTreatAsMatchIntent;
+    const blockedByDomainGuard = domain.handling === 'blocked' && !bypassBlockedDomainGuard;
 
-    if (
-      (intentBucket === 'OFF_TOPIC' && !hasDirectPlayerIntent)
-      || (domain.handling === 'blocked' && !bypassBlockedDomainGuard)
-    ) {
+    if (blockedByInterpreter || blockedByIntentBucket || blockedByDomainGuard) {
       const redirectReply = OFF_TOPIC_REDIRECT_REPLY;
       return respond(
         jsonResponse(
@@ -2798,8 +3282,6 @@ module.exports = async function copilotChat(context, req) {
       );
     }
 
-    const aoai = resolveAoaiRuntimeConfig();
-    const aoaiRequestUrl = buildAoaiChatUrl(aoai);
     const aiPathSelected = Boolean(aoai.ok && aoaiRequestUrl);
     context.log?.('[copilot-chat] routing', {
       traceId,
