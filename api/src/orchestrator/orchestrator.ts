@@ -88,6 +88,47 @@ const capAutoSelectedAgents = (selected: LegacyAgentId[]): LegacyAgentId[] => {
   }
   return normalized.slice(0, 2);
 };
+type RouterRoutingMeta = NonNullable<RouterDecision['routingMeta']>;
+const deriveRoutingMetaFromSelectedAgents = (
+  mode: 'auto' | 'full',
+  selectedAgents: LegacyAgentId[],
+  hints?: Partial<Pick<RouterRoutingMeta, 'primaryReason' | 'secondaryReason'>>
+): RouterRoutingMeta => {
+  const selectedSet = new Set(normalizeSelectedLegacyAgents(selectedAgents));
+  if (mode === 'full') {
+    return {
+      routeMode: 'full',
+      dominantDriver: 'combined',
+      primaryReason:
+        hints?.primaryReason || 'Full combined analysis requested, so fatigue and risk were evaluated together.',
+      ...(hints?.secondaryReason ? { secondaryReason: hints.secondaryReason } : {}),
+    };
+  }
+  if (selectedSet.has('risk') && !selectedSet.has('fatigue')) {
+    return {
+      routeMode: 'auto',
+      dominantDriver: 'risk',
+      primaryReason:
+        hints?.primaryReason || 'Safety and strain exposure signals dominated this route selection.',
+      ...(hints?.secondaryReason ? { secondaryReason: hints.secondaryReason } : {}),
+    };
+  }
+  if (selectedSet.has('fatigue') && !selectedSet.has('risk')) {
+    return {
+      routeMode: 'auto',
+      dominantDriver: 'fatigue',
+      primaryReason:
+        hints?.primaryReason || 'Fatigue and workload accumulation signals dominated this route selection.',
+      ...(hints?.secondaryReason ? { secondaryReason: hints.secondaryReason } : {}),
+    };
+  }
+  return {
+    routeMode: 'auto',
+    dominantDriver: 'tactical',
+    primaryReason: hints?.primaryReason || 'Tactical continuity was prioritized from stable signals.',
+    ...(hints?.secondaryReason ? { secondaryReason: hints.secondaryReason } : {}),
+  };
+};
 const isCriticalRouterDecision = (decision: RouterDecision): boolean => {
   const intentToken = String(decision.intent || '').trim().toUpperCase();
   if (intentToken === 'SUBSTITUTION' || intentToken === 'SAFETY_ALERT') return true;
@@ -631,6 +672,26 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
 
   const selectedAgents = toLegacyAgents(orderedAgents);
   const reason = `Rules: ${rulesFired.join(', ')}`;
+  const routingMeta = deriveRoutingMetaFromSelectedAgents(mode, selectedAgents, {
+    primaryReason:
+      mode === 'full'
+        ? 'Full combined mode requested by user action.'
+        : supportAgent === 'RISK'
+          ? acuteSafetyRisk
+            ? 'Acute safety/strain exposure crossed escalation thresholds.'
+            : 'Risk-side signals outweighed fatigue-only workload drift.'
+          : 'Fatigue/workload accumulation is the dominant active signal.',
+    secondaryReason:
+      mode === 'full'
+        ? 'Combined mode keeps both supporting agents active by design.'
+        : supportAgent === 'RISK'
+          ? recoveryNotGood
+            ? 'Recovery status also reduced continuation safety margin.'
+            : undefined
+          : fatigueTrendRising
+            ? 'Fatigue trend is rising across recent workload.'
+            : undefined,
+  });
 
   return {
     intent,
@@ -638,6 +699,7 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
     rulesFired,
     inputsUsed,
     selectedAgents,
+    routingMeta,
     reason,
     signals: {
       ...inputsUsed.active,
@@ -1040,6 +1102,20 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
             ? (['risk', 'tactical'] as LegacyAgentId[])
             : (['fatigue', 'tactical'] as LegacyAgentId[]));
   const selectedAgents = normalizeSelectedLegacyAgents(selectedAgentsBase);
+  const derivedRoutingMeta = deriveRoutingMetaFromSelectedAgents(mode, selectedAgents);
+  const rawRoutingMeta = routerDecisionRaw.routingMeta;
+  const routingMeta =
+    rawRoutingMeta && rawRoutingMeta.dominantDriver === derivedRoutingMeta.dominantDriver
+      ? {
+          ...derivedRoutingMeta,
+          primaryReason: String(rawRoutingMeta.primaryReason || derivedRoutingMeta.primaryReason).trim() || derivedRoutingMeta.primaryReason,
+          ...(String(rawRoutingMeta.secondaryReason || '').trim()
+            ? { secondaryReason: String(rawRoutingMeta.secondaryReason || '').trim() }
+            : derivedRoutingMeta.secondaryReason
+              ? { secondaryReason: derivedRoutingMeta.secondaryReason }
+              : {}),
+        }
+      : derivedRoutingMeta;
   const orchestrationRule = fullModeRequested
     ? 'full_mode_all_agents'
     : criticalEscalation
@@ -1050,6 +1126,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     mode,
     agentsToRun: selectedAgents.map((agent) => toAgentCode(agent)),
     selectedAgents,
+    routingMeta,
     rulesFired: Array.from(new Set([...(routerDecisionRaw.rulesFired || []), orchestrationRule])),
     reason: `${routerDecisionRaw.reason} | ${orchestrationRule}`,
   };

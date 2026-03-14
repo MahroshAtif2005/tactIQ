@@ -1178,6 +1178,44 @@ const toAgentKey = (value: unknown): AgentKey | null => {
   if (token === 'tacticalagent') return 'tactical';
   return null;
 };
+const deriveRoutingMetaFromSelectedAgents = (
+  selectedAgents: AgentKey[],
+  mode: 'auto' | 'full'
+): {
+  routeMode: 'auto' | 'full';
+  dominantDriver: 'fatigue' | 'risk' | 'combined' | 'tactical';
+  primaryReason: string;
+  secondaryReason?: string;
+} => {
+  const selectedSet = new Set<AgentKey>(selectedAgents);
+  if (mode === 'full') {
+    return {
+      routeMode: 'full',
+      dominantDriver: 'combined',
+      primaryReason: 'Full combined mode requested by user action.',
+      secondaryReason: 'Combined mode keeps both supporting agents active by design.',
+    };
+  }
+  if (selectedSet.has('risk') && !selectedSet.has('fatigue')) {
+    return {
+      routeMode: 'auto',
+      dominantDriver: 'risk',
+      primaryReason: 'Safety and strain exposure signals dominated this route selection.',
+    };
+  }
+  if (selectedSet.has('fatigue') && !selectedSet.has('risk')) {
+    return {
+      routeMode: 'auto',
+      dominantDriver: 'fatigue',
+      primaryReason: 'Fatigue and workload accumulation signals dominated this route selection.',
+    };
+  }
+  return {
+    routeMode: 'auto',
+    dominantDriver: 'tactical',
+    primaryReason: 'Tactical continuity was prioritized from stable signals.',
+  };
+};
 
 const toSuggestedBowlerRecommendation = (
   bowlerId: unknown,
@@ -4198,6 +4236,7 @@ export default function App() {
           intent: 'General',
           agentsToRun: selectedAgents.map((agent) => toAgentCode(agent)),
           selectedAgents,
+          routingMeta: deriveRoutingMetaFromSelectedAgents(selectedAgents, 'auto'),
           signalSummaryBullets: signals,
           rationale: fallbackMessage,
           rulesFired: ['routerFallback:independentAgents', fallbackSelection.reason],
@@ -4398,6 +4437,7 @@ export default function App() {
           reason: fallbackMessage,
           rationale: fallbackMessage,
           selectedAgents: fallbackSelectedAgents,
+          routingMeta: deriveRoutingMetaFromSelectedAgents(fallbackSelectedAgents, requestMode),
           agentsToRun: fallbackSelectedAgents.map((agent) => toAgentCode(agent)),
           rulesFired: ['rules_fallback', `error:${toErrorReason(error)}`],
           signalSummaryBullets: fallbackSignals,
@@ -7672,6 +7712,36 @@ function Dashboard({
         : fallbackSelectedAgents.length > 0
           ? fallbackSelectedAgents
           : ['tactical'];
+  const selectedAgentRoutingMeta = (() => {
+    const raw = routerDecisionForView?.routingMeta;
+    const rawDriver = String(raw?.dominantDriver || '').trim().toLowerCase();
+    const normalizedDriver =
+      rawDriver === 'fatigue' || rawDriver === 'risk' || rawDriver === 'combined' || rawDriver === 'tactical'
+        ? (rawDriver as 'fatigue' | 'risk' | 'combined' | 'tactical')
+        : null;
+    if (!normalizedDriver) {
+      return deriveRoutingMetaFromSelectedAgents(selectedAgents, runMode === 'full' ? 'full' : 'auto');
+    }
+    const rawMode = String(raw?.routeMode || '').trim().toLowerCase();
+    return {
+      routeMode: rawMode === 'full' ? ('full' as const) : ('auto' as const),
+      dominantDriver: normalizedDriver,
+      primaryReason: String(raw?.primaryReason || '').trim(),
+      ...(String(raw?.secondaryReason || '').trim()
+        ? { secondaryReason: String(raw?.secondaryReason || '').trim() }
+        : {}),
+    };
+  })();
+  const routingDriverSignalLine = (() => {
+    if (runMode !== 'auto') return '';
+    if (selectedAgentRoutingMeta.dominantDriver === 'risk') {
+      return 'Routing focus: safety and strain exposure are the primary driver for this run.';
+    }
+    if (selectedAgentRoutingMeta.dominantDriver === 'fatigue') {
+      return 'Routing focus: fatigue and workload accumulation are the primary driver for this run.';
+    }
+    return '';
+  })();
   const selectedAgentSet = new Set(selectedAgents);
   const formatAgentList = (agents: AgentKey[]): string => {
     const labels = agents.map((agent) => {
@@ -8081,15 +8151,21 @@ function Dashboard({
         .filter(Boolean)
         .filter((entry) => !/(unterminated|string|invalid json|trace:|source:\s*unknown|error|failed)/i.test(entry))
         .slice(0, 7);
+    const withRoutingSignal = (items: string[]): string[] =>
+      sanitizeSignals(
+        routingDriverSignalLine && !items.some((entry) => entry.toLowerCase() === routingDriverSignalLine.toLowerCase())
+          ? [routingDriverSignalLine, ...items]
+          : items
+      );
 
     if (Array.isArray(activeStrategicAnalysis?.signals) && activeStrategicAnalysis.signals.length > 0) {
-      return sanitizeSignals(activeStrategicAnalysis.signals);
+      return withRoutingSignal(activeStrategicAnalysis.signals);
     }
     if (Array.isArray(routerDecisionForView?.signalSummaryBullets) && routerDecisionForView.signalSummaryBullets.length > 0) {
-      return sanitizeSignals(routerDecisionForView.signalSummaryBullets);
+      return withRoutingSignal(routerDecisionForView.signalSummaryBullets);
     }
     if (Array.isArray((tacticalAnalysis as unknown as Record<string, unknown>)?.signalSummaryBullets)) {
-      return sanitizeSignals(
+      return withRoutingSignal(
         ((tacticalAnalysis as unknown as Record<string, unknown>).signalSummaryBullets as unknown[])
           .map((entry) => String(entry))
       );
@@ -8139,7 +8215,7 @@ function Dashboard({
     if (bullets.length === 0 && routerDecisionForView) {
       bullets.push('Signal profile is stable; tactical selection focuses on control and continuity.');
     }
-    return sanitizeSignals(Array.from(new Set(bullets)));
+    return withRoutingSignal(Array.from(new Set(bullets)));
   })();
   const fatigueSectionVisible = Boolean(isFullAnalysis || selectedAgentSet.has('fatigue') || aiAnalysis);
   const likelyInjuries = finalRecommendation?.ifContinues?.likelyInjuries || [];
@@ -9207,6 +9283,21 @@ function Dashboard({
     2,
     'Control can dip if workload pressure is not managed early in the phase.'
   );
+  const tacticalAssessmentDisplayLines = (() => {
+    if (runMode !== 'auto') return tacticalAssessmentLines;
+    const routingReason = finalizeCoachSentence(
+      selectedAgentRoutingMeta.primaryReason,
+      selectedAgentRoutingMeta.dominantDriver === 'risk'
+        ? 'Safety and strain exposure are the dominant route driver in this run.'
+        : selectedAgentRoutingMeta.dominantDriver === 'fatigue'
+          ? 'Fatigue and workload accumulation are the dominant route driver in this run.'
+          : 'Tactical continuity is the dominant route driver in this run.',
+      150
+    );
+    if (!routingReason) return tacticalAssessmentLines;
+    const merged = [routingReason, ...tacticalAssessmentLines.filter((line) => line.toLowerCase() !== routingReason.toLowerCase())];
+    return merged.slice(0, 2);
+  })();
   const tacticalWhyLines = toCleanTacticalLines(
     tacticalRecommendation.whyThisIsSmart,
     3,
@@ -9234,6 +9325,14 @@ function Dashboard({
     | 'LIMITED'
     | 'TACTICAL_RISK'
     | 'UNAVAILABLE' = tacticalRecommendation.availabilityStatus || 'AVAILABLE';
+  const tacticalDominantDriverFromRoute =
+    runMode === 'auto' && tacticalRecommendation.dominantRiskDriver !== 'overs_quota_reached'
+      ? selectedAgentRoutingMeta.dominantDriver === 'risk'
+        ? 'injury'
+        : selectedAgentRoutingMeta.dominantDriver === 'fatigue'
+          ? 'fatigue'
+          : null
+      : null;
   const tacticalDominantDriver:
     | 'overs_quota_reached'
     | 'injury'
@@ -9242,7 +9341,7 @@ function Dashboard({
     | 'control'
     | 'matchup'
     | 'pressure_phase'
-    | 'mixed' = tacticalRecommendation.dominantRiskDriver || 'mixed';
+    | 'mixed' = tacticalDominantDriverFromRoute || tacticalRecommendation.dominantRiskDriver || 'mixed';
   const tacticalDecisionMode:
     | 'IMMEDIATE_SUBSTITUTION'
     | 'ROTATE_NEXT_OVER'
@@ -9274,7 +9373,7 @@ function Dashboard({
       recommendedIncomingPlayer: incoming || undefined,
       recommendedMove: tacticalRecommendedMove,
       tacticalPlan: tacticalSwapReason,
-      assessment: tacticalAssessmentLines.join(' '),
+      assessment: tacticalAssessmentDisplayLines.join(' '),
       whyThisIsSmart: tacticalWhyLines.join(' '),
       riskIfIgnored: tacticalIfIgnored,
       confidence: tacticalRecommendation.confidence,
@@ -9286,7 +9385,7 @@ function Dashboard({
       substitutionRequired: tacticalRecommendation.substitutionRequired === true,
       recommendedReplacement: tacticalRecommendedReplacement,
       suggestedBenchOptions: tacticalSuggestedBenchOptions,
-      reason: tacticalWhyLines[0] || tacticalAssessmentLines[0] || tacticalRecommendedMove,
+      reason: tacticalWhyLines[0] || tacticalAssessmentDisplayLines[0] || tacticalRecommendedMove,
       fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
       riskLevel:
         tacticalPriority === 'Immediate'
@@ -9301,7 +9400,7 @@ function Dashboard({
     activePlayer?.name,
     currentTelemetry.fatigueIndex,
     currentTelemetry.playerName,
-    tacticalAssessmentLines,
+    tacticalAssessmentDisplayLines,
     tacticalIfIgnored,
     tacticalMatchSituationLines,
     tacticalAvailabilityStatus,
@@ -9417,7 +9516,7 @@ function Dashboard({
     '',
     'Tactical Recommendation:',
     `MATCH SITUATION: ${tacticalMatchSituationLines.join(' ')}`,
-    `ASSESSMENT: ${tacticalAssessmentLines.join(' ')}`,
+    `ASSESSMENT: ${tacticalAssessmentDisplayLines.join(' ')}`,
     `RECOMMENDED MOVE: ${tacticalRecommendedMove || `Bring in ${tacticalRecommendation.swap.in} for ${tacticalRecommendation.swap.out}.`}`,
     'WHY THIS WORKS:',
     ...(tacticalWhyLines.map((item) => `- ${item}`)),
@@ -11768,10 +11867,10 @@ function Dashboard({
                                         ))}
                                       </div>
                                     )}
-                                    {tacticalAssessmentLines.length > 0 && (
+                                    {tacticalAssessmentDisplayLines.length > 0 && (
                                       <div>
                                         <p className="text-[10px] uppercase tracking-wide text-slate-400">Assessment</p>
-                                        {tacticalAssessmentLines.map((line, index) => (
+                                        {tacticalAssessmentDisplayLines.map((line, index) => (
                                           <p key={`tactical-assessment-${index}`} className="text-xs text-slate-300 mt-1 leading-relaxed">{line}</p>
                                         ))}
                                       </div>

@@ -550,6 +550,24 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
           : selectedSupportAgent === 'risk'
             ? ['risk', 'tactical']
             : ['fatigue', 'tactical'];
+      const routingMeta = fullModeRequested
+        ? {
+            routeMode: 'full' as const,
+            dominantDriver: 'combined' as const,
+            primaryReason: 'Full combined mode requested by user action.',
+            secondaryReason: 'Combined mode keeps both supporting agents active by design.',
+          }
+        : selectedSupportAgent === 'risk'
+          ? {
+              routeMode: 'auto' as const,
+              dominantDriver: 'risk' as const,
+              primaryReason: 'Safety and strain exposure signals dominated this route selection.',
+            }
+          : {
+              routeMode: 'auto' as const,
+              dominantDriver: 'fatigue' as const,
+              primaryReason: 'Fatigue and workload accumulation signals dominated this route selection.',
+            };
       const includeFatigue = fullModeRequested || selectedSupportAgent === 'fatigue';
       const includeRisk = fullModeRequested || selectedSupportAgent === 'risk';
       const fatigueFallback = validatedInput
@@ -662,33 +680,34 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
           intent: 'GENERAL',
           selectedAgents,
           agentsToRun: selectedAgents.map((agent) => (agent === 'fatigue' ? 'FATIGUE' : agent === 'risk' ? 'RISK' : 'TACTICAL')),
-            rulesFired: [fallbackReason],
+          routingMeta,
+          rulesFired: [fallbackReason],
           inputsUsed: {
             active: {},
             match: {},
           },
-            reason: fallbackWarning,
-            signals: {},
-            agents: {
+          reason: fallbackWarning,
+          signals: {},
+          agents: {
             fatigue: { routedTo: 'rules', reason: includeFatigue ? fallbackReason : 'not_selected_by_auto_router' },
             risk: { routedTo: 'rules', reason: includeRisk ? fallbackReason : 'not_selected_by_auto_router' },
             tactical: { routedTo: 'rules', reason: fallbackReason },
-            },
           },
-          meta: {
-            requestId: traceId,
-            mode: requestedMode,
+        },
+        meta: {
+          requestId: traceId,
+          mode: requestedMode,
           executedAgents: selectedAgents,
           modelRouting: {
-              fatigueModel: includeFatigue ? 'rules-based-fallback' : 'skipped',
-              riskModel: includeRisk ? 'rules-based-fallback' : 'skipped',
-              tacticalModel: 'rules-based-fallback',
-              fallbacksUsed: [fallbackReason],
-            },
-            usedFallbackAgents: selectedAgents,
-            routerFallbackMessage: fallbackWarning,
-            timingsMs: {},
+            fatigueModel: includeFatigue ? 'rules-based-fallback' : 'skipped',
+            riskModel: includeRisk ? 'rules-based-fallback' : 'skipped',
+            tacticalModel: 'rules-based-fallback',
+            fallbacksUsed: [fallbackReason],
           },
+          usedFallbackAgents: selectedAgents,
+          routerFallbackMessage: fallbackWarning,
+          timingsMs: {},
+        },
       }, traceId);
       const fallbackRecord = asRecord(fallbackBody);
       const fallbackMetaTimings = asRecord(asRecord(fallbackRecord.meta).timingsMs);

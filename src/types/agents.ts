@@ -264,6 +264,12 @@ export interface OrchestrateResponse {
       risk?: { routedTo: 'llm' | 'rules'; reason: string };
       tactical?: { routedTo: 'llm' | 'rules'; reason: string };
     };
+    routingMeta?: {
+      routeMode: 'auto' | 'full';
+      dominantDriver: 'fatigue' | 'risk' | 'combined' | 'tactical';
+      primaryReason: string;
+      secondaryReason?: string;
+    };
     signalSummaryBullets?: string[];
     rationale?: string;
     reason: string;

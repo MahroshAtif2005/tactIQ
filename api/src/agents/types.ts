@@ -139,6 +139,12 @@ export interface RouterDecision {
     risk: { routedTo: 'llm' | 'rules'; reason: string };
     tactical: { routedTo: 'llm' | 'rules'; reason: string };
   };
+  routingMeta?: {
+    routeMode: 'auto' | 'full';
+    dominantDriver: 'fatigue' | 'risk' | 'combined' | 'tactical';
+    primaryReason: string;
+    secondaryReason?: string;
+  };
   reason: string;
   signals: Record<string, unknown>;
 }

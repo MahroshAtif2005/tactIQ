@@ -246,6 +246,24 @@ const runOrchestrateFallback = (payload) => {
     : supportAgent === 'risk'
       ? ['risk', 'tactical']
       : ['fatigue', 'tactical'];
+  const routingMeta = fullModeRequested
+    ? {
+        routeMode: 'full',
+        dominantDriver: 'combined',
+        primaryReason: 'Full combined mode requested by user action.',
+        secondaryReason: 'Combined mode keeps both supporting agents active by design.',
+      }
+    : supportAgent === 'risk'
+      ? {
+          routeMode: 'auto',
+          dominantDriver: 'risk',
+          primaryReason: 'Safety and strain exposure signals dominated this route selection.',
+        }
+      : {
+          routeMode: 'auto',
+          dominantDriver: 'fatigue',
+          primaryReason: 'Fatigue and workload accumulation signals dominated this route selection.',
+        };
   const includeFatigue = fullModeRequested || supportAgent === 'fatigue';
   const includeRisk = fullModeRequested || supportAgent === 'risk';
   const traceId = randomUUID();
@@ -286,6 +304,7 @@ const runOrchestrateFallback = (payload) => {
       reason: 'rules_fallback',
       rulesFired: ['rules_fallback'],
       selectedAgents,
+      routingMeta,
       agentsToRun: selectedAgents.map((agent) =>
         agent === 'fatigue' ? 'FATIGUE' : agent === 'risk' ? 'RISK' : 'TACTICAL'
       ),
