@@ -17,7 +17,8 @@ For now tactIQ is built for cricket, but the system is designed to extend to mul
 Fast bowling is one of the most physically demanding actions in sport. A single delivery places forces of up to eight times a bowler’s body weight through the knees, ankles, and spine. During long tournaments like the IPL or international series, bowlers can deliver hundreds of high intensity overs within weeks.
 
 In recent years, several elite fast bowlers have missed major tournaments due to workload related injuries. Players like Jasprit Bumrah, Jofra Archer, Pat Cummins, and Mark Wood have all faced extended time away from the game because of stress injuries, back problems, or workload fatigue.
-
+ A single preventable injury to a key athlete can cost teams millions of dollars in lost performance, rehabilitation costs, and long-term availability.
+ 
 For teams and fans, these injuries appear sudden. But in reality, fatigue builds quietly across matches, one extra spell, one more over, one more sprint in the field, until the body reaches its breaking point.
 
 Imagine a crucial match.
@@ -102,6 +103,13 @@ Instead of requiring the coach to read a full analytical report, tactIQ generate
 - Substitution timing indicators  
 
 The goal is not just to show numbers but to guide decisions.
+---
+
+### Enterprise-Grade Data Security
+
+Athlete performance and health data is highly sensitive. tactIQ is designed with enterprise-grade data protection in mind by leveraging Azure’s secure cloud infrastructure. Sensitive workload and health metrics are processed within protected Azure services, with identity and access controls managed through Azure’s authentication and authorization layers.
+
+This ensures that only authorized coaching and performance staff can access player data, aligning with modern data protection standards expected in professional sports organizations.
 
 ---
 ## Repository Notes
