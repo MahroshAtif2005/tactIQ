@@ -6,9 +6,45 @@
 
 ### AI Tactical Coach for Player and Match Decisions
 
-tactIQ is a real-time AI tactical coach for cricket teams that transforms complex workload, fatigue, and match context data into clear on-field decisions, helping coaches win matches while reducing player injury risk.
+tactIQ is a real time AI tactical coach for cricket teams that transforms complex workload, fatigue, and match context data into clear on-field decisions, helping coaches win matches while reducing player injury risk.
 
 For now tactIQ is built for cricket, but the system is designed to extend to multiple sports such as football, basketball, and other real time decision environments.
+
+---
+
+## Problem
+
+Fast bowling is one of the most physically demanding actions in sport. A single delivery places forces of up to eight times a bowler’s body weight through the knees, ankles, and spine. During long tournaments like the IPL or international series, bowlers can deliver hundreds of high intensity overs within weeks.
+
+In recent years, several elite fast bowlers have missed major tournaments due to workload related injuries. Players like Jasprit Bumrah, Jofra Archer, Pat Cummins, and Mark Wood have all faced extended time away from the game because of stress injuries, back problems, or workload fatigue.
+
+For teams and fans, these injuries appear sudden. But in reality, fatigue builds quietly across matches, one extra spell, one more over, one more sprint in the field, until the body reaches its breaking point.
+
+Imagine a crucial match.
+The team’s leading fast bowler has already bowled an intense spell. The scoreboard pressure is rising. The captain must decide whether to give him another over.
+
+That decision is often made in seconds — based mostly on intuition.
+
+But what if the system could warn the coach:
+
+“This player’s fatigue level is approaching a critical threshold. Injury risk is rising. A substitution or rotation now could prevent long-term damage.”
+
+tactIQ was built to turn invisible fatigue signals into clear, real-time decisions, helping coaches protect their players while still competing at the highest level.
+
+Modern teams already collect large volumes of physical performance data. Systems such as Catapult GPS vests, STATSports Apex, and Polar heart-rate trackers measure:
+• Acceleration and deceleration loads
+• Total workload
+• Heart rate and recovery metrics
+• Fatigue indicators
+
+These tools are widely used by sports scientists and medical staff for monitoring physical performance and workload.
+
+However, these systems only collect and display data.
+
+They do not transform physiological signals and match context into real-time tactical decisions.
+As a result, coaches must manually interpret complex datasets while a match is unfolding, often leading to delayed fatigue detection, preventable injuries, tactically suboptimal substitutions, and performance decline.
+
+What is missing is a system that continuously synthesizes player workload, recovery readiness, and live match context into clear, explainable recommendations.
 
 ---
 
@@ -25,7 +61,6 @@ tactIQ helps captains and analysts answer key tactical questions
 It converts match context and player state into coach like actionable guidance.
 
 ---
-
 ## Player Intelligence System
 
 ### Fatigue Awareness
