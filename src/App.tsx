@@ -3011,26 +3011,31 @@ export default function App() {
       setAnalysisActive(false);
       return null;
     }
+    const preserveExistingAnalysisShell = mode === 'full';
     setAnalysisRequested(true);
-    setAnalysisActive(false);
+    if (!preserveExistingAnalysisShell) {
+      setAnalysisActive(false);
+    }
 
     fatigueAbortRef.current?.abort();
     const controller = new AbortController();
     fatigueAbortRef.current = controller;
     const requestId = ++fatigueRequestSeq.current;
 
-    setAiAnalysis(null);
-    setRiskAnalysis(null);
-    setTacticalAnalysis(null);
-    setStrategicAnalysis(null);
-    setCombinedAnalysis(null);
-    setCombinedBriefing(null);
-    setCombinedDecision(null);
-    setFinalRecommendation(null);
-    setOrchestrateMeta(null);
-    setRouterDecision(null);
-    setAnalysisBundleId('');
-    setCoachOutput(null);
+    if (!preserveExistingAnalysisShell) {
+      setAiAnalysis(null);
+      setRiskAnalysis(null);
+      setTacticalAnalysis(null);
+      setStrategicAnalysis(null);
+      setCombinedAnalysis(null);
+      setCombinedBriefing(null);
+      setCombinedDecision(null);
+      setFinalRecommendation(null);
+      setOrchestrateMeta(null);
+      setRouterDecision(null);
+      setAnalysisBundleId('');
+      setCoachOutput(null);
+    }
     let requestInFlight = false;
     const startRequest = () => {
       if (requestInFlight) return;
@@ -3044,6 +3049,10 @@ export default function App() {
       setAgentFailure(null);
       setAgentState('thinking');
     };
+    if (preserveExistingAnalysisShell) {
+      // Full mode should transition into visible running state immediately.
+      startRequest();
+    }
 
     const requestMode: 'auto' | 'full' = mode === 'full' ? 'full' : 'auto';
     const maxOvers = Math.max(1, safeNum(currentTelemetry.maxOvers, getMaxOvers(matchContext.format)));
@@ -3097,8 +3106,16 @@ export default function App() {
       })
       .map((p) => p.name);
     const localSelectedBaseline = activePlayer ? baselineFromPlayer(activePlayer) : null;
-    const selectedPlayerBaseline =
-      await getBaselineForPlayer(activePlayer?.id || currentTelemetry.playerId, controller.signal) || localSelectedBaseline;
+    let selectedPlayerBaseline = localSelectedBaseline;
+    try {
+      selectedPlayerBaseline =
+        await getBaselineForPlayer(activePlayer?.id || currentTelemetry.playerId, controller.signal) || localSelectedBaseline;
+    } catch (baselineError) {
+      if (import.meta.env.DEV) {
+        console.warn('[orchestrate] baseline lookup failed, using local baseline fallback', baselineError);
+      }
+      selectedPlayerBaseline = localSelectedBaseline;
+    }
     const baselineSleepHours = selectedPlayerBaseline
       ? safeNum(selectedPlayerBaseline.sleepHoursToday ?? selectedPlayerBaseline.sleep, safeNum(currentTelemetry.sleepHours, 7))
       : safeNum(currentTelemetry.sleepHours, 7);
@@ -8003,7 +8020,8 @@ function Dashboard({
   );
   const showAnalysisFailureCard = Boolean(agentFailure && !hasAnyAnalysis && !hasTacticalGuidance);
   const showAnalysisFailureInline = Boolean(agentFailure && hasAnyAnalysis);
-  const showAnalysisSkeleton = agentState === 'thinking' && !hasAnyAnalysis;
+  const showCompactRunningState = agentState === 'thinking';
+  const showAnalysisSkeleton = showCompactRunningState;
   useEffect(() => {
     if (hasCopilotActivationSignal) {
       setShowCopilotChat(true);
@@ -11591,7 +11609,7 @@ function Dashboard({
                             </div>
                           </div>
                         )}
-                        {showBatsmanAiAlert && (
+                        {!showCompactRunningState && showBatsmanAiAlert && (
                           <motion.div
                             initial={{ opacity: 0, y: 10 }}
                             animate={{ opacity: 1, y: 0 }}
@@ -11623,7 +11641,7 @@ function Dashboard({
                             </div>
                           </motion.div>
                         )}
-                        {substitutionRecommendation && (
+                        {!showCompactRunningState && substitutionRecommendation && (
                           <motion.div
                             initial={{ opacity: 0, y: 10 }}
                             animate={{ opacity: 1, y: 0 }}
@@ -11649,37 +11667,39 @@ function Dashboard({
                           </motion.div>
                         )}
                         <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="w-full text-left pr-1 space-y-4">
-                          <div className="p-4 rounded-xl border border-indigo-400/35 bg-[#162032]">
-                            <div className="flex items-center justify-between gap-3">
-                              <div>
-                                <h4 className="text-sm font-bold text-white">AI Match Intelligence</h4>
-                                <p className="text-[11px] text-slate-400 mt-0.5">Real-time tactical decision support</p>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <span className="text-[10px] px-2 py-0.5 rounded border border-indigo-400/40 text-indigo-200 bg-indigo-500/10 whitespace-nowrap">
-                                  {analysisBadgeLabel}
-                                </span>
-                                {hasAnyAnalysis && (
-                                  <button
-                                    type="button"
-                                    onClick={handleCopyBriefing}
-                                    className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200 bg-slate-800 hover:bg-slate-700 transition-colors"
-                                  >
-                                    {briefCopied ? 'Copied' : 'Copy Briefing'}
-                                  </button>
-                                )}
+                          {!showCompactRunningState && (
+                            <div className="p-4 rounded-xl border border-indigo-400/35 bg-[#162032]">
+                              <div className="flex items-center justify-between gap-3">
+                                <div>
+                                  <h4 className="text-sm font-bold text-white">AI Match Intelligence</h4>
+                                  <p className="text-[11px] text-slate-400 mt-0.5">Real-time tactical decision support</p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] px-2 py-0.5 rounded border border-indigo-400/40 text-indigo-200 bg-indigo-500/10 whitespace-nowrap">
+                                    {analysisBadgeLabel}
+                                  </span>
+                                  {hasAnyAnalysis && (
+                                    <button
+                                      type="button"
+                                      onClick={handleCopyBriefing}
+                                      className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-200 bg-slate-800 hover:bg-slate-700 transition-colors"
+                                    >
+                                      {briefCopied ? 'Copied' : 'Copy Briefing'}
+                                    </button>
+                                  )}
+                                </div>
                               </div>
                             </div>
-                          </div>
+                          )}
 
-                          {isFullAnalysis && combinedBriefing && (
+                          {!showCompactRunningState && isFullAnalysis && combinedBriefing && (
                             <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
                               <p className="text-xs font-bold text-slate-200 mb-2">Coach Briefing</p>
                               <p className="text-xs text-slate-300 whitespace-pre-line leading-relaxed">{combinedBriefing}</p>
                             </div>
                           )}
 
-                          {showAnalysisFailureInline && (
+                          {!showCompactRunningState && showAnalysisFailureInline && (
                             <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
                               <p className="text-[11px] text-amber-100">
                                 Some signals were unavailable; showing best available guidance.
@@ -11919,7 +11939,7 @@ function Dashboard({
                             </>
                           )}
 
-                          {showAnalysisFailureCard && (
+                          {!showCompactRunningState && showAnalysisFailureCard && (
                             <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-3">
                               <p className="text-xs text-rose-100">Analysis is temporarily unavailable. Please retry.</p>
                               <button
@@ -11932,7 +11952,8 @@ function Dashboard({
                             </div>
                           )}
 
-                          <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
+                          {!showCompactRunningState && (
+                            <div className="p-4 rounded-xl border border-slate-700 bg-[#162032]">
                             <button
                               type="button"
                               onClick={() =>
@@ -12085,9 +12106,10 @@ function Dashboard({
                                 )}
                               </div>
                             )}
-                          </div>
+                            </div>
+                          )}
 
-                          {isExplicitFallbackMode && (
+                          {!showCompactRunningState && isExplicitFallbackMode && (
                             <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
                               {aiEnabled
                                 ? 'Fallback mode active (using local/rules response for this run).'
