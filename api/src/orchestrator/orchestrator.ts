@@ -524,11 +524,9 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
     oversBowled >= 2 ||
     recoveryNotGood ||
     fatigueTrendRising;
-  const riskTriggered =
+  const acuteSafetyRisk =
     injuryRisk === 'HIGH' ||
     noBallRisk === 'HIGH' ||
-    fatigueIndex >= 7.5 ||
-    projectedFatigueNextOver >= 8 ||
     strainIndex >= 7 ||
     recoveryPoor ||
     availabilityEscalated ||
@@ -551,10 +549,12 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
     (routineRiskScore === routineFatigueScore &&
       (injuryRisk === 'MEDIUM' || noBallRisk === 'MEDIUM' || recoveryNotGood));
   const routineSupportAgent: 'FATIGUE' | 'RISK' = preferRiskSupport ? 'RISK' : 'FATIGUE';
+  // Tactical always runs. Pick exactly one supporting agent from dominant signals.
+  const supportAgent: 'FATIGUE' | 'RISK' = acuteSafetyRisk ? 'RISK' : routineSupportAgent;
 
   const rulesFired: string[] = [];
   let intent: RouterDecision['intent'] = 'GENERAL';
-  let agentsToRun: AgentCode[] = ['FATIGUE', 'TACTICAL'];
+  let agentsToRun: AgentCode[] = ['TACTICAL', supportAgent];
 
   if (mode === 'full') {
     rulesFired.push('mode=full');
@@ -562,7 +562,7 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
   rulesFired.push(`matchMode=${matchMode}`);
   rulesFired.push('tactical_always_on');
   if (fatigueTriggered) rulesFired.push('fatigue_triggered');
-  if (riskTriggered) rulesFired.push('critical_risk_triggered');
+  if (acuteSafetyRisk) rulesFired.push('critical_risk_triggered');
   if (recoveryNotGood) rulesFired.push('recovery_not_good');
   if (recoveryPoor) rulesFired.push('recovery_poor');
   if (fatigueTrendRising) rulesFired.push('fatigue_trend_rising');
@@ -570,19 +570,19 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
   if (substitutionRequiredSignal) rulesFired.push('substitution_required_signal');
   if (severeDecisionSignal) rulesFired.push('severe_decision_signal');
 
+  if (matchMode === 'BAT') intent = 'BATTING_NEXT';
   if (mode === 'full') {
     intent = 'BOTH_NEXT';
     agentsToRun = ['FATIGUE', 'RISK', 'TACTICAL'];
-    rulesFired.push('fullRunsAllAgents');
+    rulesFired.push('full_mode_all_agents');
   } else {
-    if (matchMode === 'BAT') intent = 'BATTING_NEXT';
-    else if (riskTriggered) intent = 'SAFETY_ALERT';
+    if (acuteSafetyRisk) intent = 'SAFETY_ALERT';
     else intent = 'GENERAL';
-    if (riskTriggered) {
-      agentsToRun = ['FATIGUE', 'RISK', 'TACTICAL'];
-      rulesFired.push('critical_escalation_all_agents');
+    agentsToRun = supportAgent === 'RISK' ? ['RISK', 'TACTICAL'] : ['FATIGUE', 'TACTICAL'];
+    if (acuteSafetyRisk) {
+      rulesFired.push('critical_support_risk');
+      rulesFired.push('two_agent_mode');
     } else {
-      agentsToRun = routineSupportAgent === 'RISK' ? ['RISK', 'TACTICAL'] : ['FATIGUE', 'TACTICAL'];
       rulesFired.push(`routine_support_${routineSupportAgent.toLowerCase()}`);
       rulesFired.push('routine_two_agent_mode');
     }
@@ -1023,26 +1023,27 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
   const requestType = manualRequest ? 'manual' : 'automatic';
 
   const routerDecisionRaw = runModelRouter(inputWithContext.context as FullMatchContext, inputWithContext, mode, requestId);
-  const forceAllAgents = mode === 'full';
-  const criticalEscalation = !forceAllAgents && isCriticalRouterDecision(routerDecisionRaw);
+  const fullModeRequested = mode === 'full';
+  const criticalEscalation = isCriticalRouterDecision(routerDecisionRaw);
   const routerSelectedAgents = normalizeSelectedLegacyAgents(
     Array.isArray(routerDecisionRaw.selectedAgents) && routerDecisionRaw.selectedAgents.length > 0
       ? routerDecisionRaw.selectedAgents
       : toLegacyAgents(routerDecisionRaw.agentsToRun)
   );
-  const cappedRoutineAgents = capAutoSelectedAgents(normalizeSelectedLegacyAgents([...routerSelectedAgents, 'tactical']));
-  const routineSelectedAgents =
-    cappedRoutineAgents.some((agent) => agent !== 'tactical')
-      ? cappedRoutineAgents
-      : (['fatigue', 'tactical'] as LegacyAgentId[]);
-  const selectedAgentsBase = forceAllAgents || criticalEscalation
-    ? (['fatigue', 'risk', 'tactical'] as LegacyAgentId[])
-    : routineSelectedAgents;
+  const cappedSelectedAgents = capAutoSelectedAgents(normalizeSelectedLegacyAgents([...routerSelectedAgents, 'tactical']));
+  const selectedAgentsBase =
+    fullModeRequested
+      ? (['fatigue', 'risk', 'tactical'] as LegacyAgentId[])
+      : cappedSelectedAgents.some((agent) => agent !== 'tactical')
+        ? cappedSelectedAgents
+        : (criticalEscalation
+            ? (['risk', 'tactical'] as LegacyAgentId[])
+            : (['fatigue', 'tactical'] as LegacyAgentId[]));
   const selectedAgents = normalizeSelectedLegacyAgents(selectedAgentsBase);
-  const orchestrationRule = forceAllAgents
+  const orchestrationRule = fullModeRequested
     ? 'full_mode_all_agents'
     : criticalEscalation
-      ? 'critical_escalation_all_agents'
+      ? 'critical_two_agent_mode'
       : 'routine_two_agent_mode';
   const routerDecision: RouterDecision = {
     ...routerDecisionRaw,
@@ -1072,7 +1073,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
     dataMode: String(inputWithContext.dataMode || '').trim().toLowerCase() || undefined,
     llmMode: String(inputWithContext.llmMode || '').trim().toLowerCase() || undefined,
     intent: routerDecision.intent,
-    forceAllAgents,
+    fullModeRequested,
     criticalEscalation,
     agentsToRun: routerDecision.selectedAgents,
     executedAgents,

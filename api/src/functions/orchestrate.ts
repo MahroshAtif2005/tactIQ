@@ -31,6 +31,52 @@ const toConfidence = (...values: unknown[]): number => {
   return 0.62;
 };
 const toIsoNow = (): string => new Date().toISOString();
+const toSafeNumber = (value: unknown, fallback = 0): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+const normalizeRiskToken = (value: unknown): 'LOW' | 'MEDIUM' | 'HIGH' => {
+  const token = String(value || '').trim().toUpperCase();
+  if (token === 'HIGH' || token === 'CRITICAL') return 'HIGH';
+  if (token === 'MED' || token === 'MEDIUM') return 'MEDIUM';
+  return 'LOW';
+};
+const selectFallbackSupportAgent = (input?: OrchestrateInput | null): 'fatigue' | 'risk' => {
+  if (!input) return 'fatigue';
+  const telemetry = asRecord(input.telemetry);
+  const analysisState = asRecord((input as unknown as Record<string, unknown>).analysisState);
+  const fatigueIndex = toSafeNumber(telemetry.fatigueIndex, 0);
+  const strainIndex = toSafeNumber(telemetry.strainIndex, 0);
+  const oversBowled = toSafeNumber(telemetry.oversBowled, 0);
+  const injuryRisk = normalizeRiskToken(telemetry.injuryRisk);
+  const noBallRisk = normalizeRiskToken(telemetry.noBallRisk);
+  const recoveryToken = String(telemetry.heartRateRecovery || '').trim().toUpperCase();
+  const availabilityToken = String(telemetry.availabilityStatus || analysisState.availabilityStatus || '').trim().toUpperCase();
+  const decisionToken = String(analysisState.decisionMode || analysisState.decision || '').trim().toUpperCase();
+  const recoveryPoor = recoveryToken === 'POOR' || recoveryToken === 'VERY POOR';
+  const safetyCritical =
+    injuryRisk === 'HIGH' ||
+    noBallRisk === 'HIGH' ||
+    strainIndex >= 7 ||
+    recoveryPoor ||
+    availabilityToken === 'LIMITED' ||
+    availabilityToken === 'UNAVAILABLE' ||
+    /IMMEDIATE_SUBSTITUTION|REMOVE_FROM_ACTIVE|MARK_UNFIT|UNSAFE_TO_CONTINUE/.test(decisionToken);
+  if (safetyCritical) return 'risk';
+
+  const fatigueScore =
+    (fatigueIndex >= 7 ? 3 : fatigueIndex >= 5 ? 2 : fatigueIndex >= 4 ? 1 : 0) +
+    (oversBowled >= 3 ? 2 : oversBowled >= 2 ? 1 : 0) +
+    (strainIndex >= 4 ? 1 : 0) +
+    (recoveryToken === 'MODERATE' ? 1 : 0);
+  const riskScore =
+    (injuryRisk === 'MEDIUM' ? 2 : 0) +
+    (noBallRisk === 'MEDIUM' ? 2 : 0) +
+    (strainIndex >= 5 ? 2 : strainIndex >= 4 ? 1 : 0) +
+    (recoveryToken === 'MODERATE' ? 1 : 0);
+
+  return riskScore > fatigueScore ? 'risk' : 'fatigue';
+};
 const asRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 const toArray = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
@@ -496,6 +542,16 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
           : fallbackReason === 'llm_mode_rules'
             ? 'LLM mode is not set to ai. Returning rules fallback.'
             : `Combined analysis completed with orchestrate fallback: ${message}`;
+      const fullModeRequested = requestedMode === 'full';
+      const selectedSupportAgent = selectFallbackSupportAgent(validatedInput);
+      const selectedAgents: Array<'fatigue' | 'risk' | 'tactical'> =
+        fullModeRequested
+          ? ['fatigue', 'risk', 'tactical']
+          : selectedSupportAgent === 'risk'
+            ? ['risk', 'tactical']
+            : ['fatigue', 'tactical'];
+      const includeFatigue = fullModeRequested || selectedSupportAgent === 'fatigue';
+      const includeRisk = fullModeRequested || selectedSupportAgent === 'risk';
       const fatigueFallback = validatedInput
         ? buildFatigueFallback(
             toFatigueRequest(validatedInput, `${String(validatedInput.telemetry?.playerId || 'UNKNOWN')}:${Date.now()}`),
@@ -547,19 +603,23 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
         warnings: [fallbackWarning],
         dataMode,
         llmMode,
-        ...(fatigueFallback ? { fatigue: fatigueFallback } : {}),
-        ...(riskFallback ? { risk: riskFallback } : {}),
+        ...(includeFatigue && fatigueFallback ? { fatigue: fatigueFallback } : {}),
+        ...(includeRisk && riskFallback ? { risk: riskFallback } : {}),
         ...(tacticalFallback ? { tactical: tacticalFallback } : {}),
         ...(tacticalFallback
           ? {
               strategicAnalysis: {
                 signals: tacticalFallback.keySignalsUsed || [],
-                fatigueAnalysis: String(
-                  fatigueFallback?.recommendation || fatigueFallback?.explanation || 'Fatigue signal reviewed via rules fallback.'
-                ),
-                injuryRiskAnalysis: String(
-                  riskFallback?.recommendation || riskFallback?.explanation || 'Risk signal reviewed via rules fallback.'
-                ),
+                fatigueAnalysis: includeFatigue
+                  ? String(
+                      fatigueFallback?.recommendation || fatigueFallback?.explanation || 'Fatigue signal reviewed via rules fallback.'
+                    )
+                  : 'Fatigue agent not selected for this run.',
+                injuryRiskAnalysis: includeRisk
+                  ? String(
+                      riskFallback?.recommendation || riskFallback?.explanation || 'Risk signal reviewed via rules fallback.'
+                    )
+                  : 'Risk agent not selected for this run.',
                 tacticalRecommendation: {
                   nextAction: tacticalFallback.nextAction || tacticalFallback.immediateAction || 'Continue with monitored plan',
                   why: tacticalFallback.rationale || fallbackWarning,
@@ -572,16 +632,16 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
           : {}),
         agentResults: {
           fatigue: {
-            status: 'fallback',
+            status: includeFatigue ? 'fallback' : 'skipped',
             routedTo: 'rules',
-            ...(fatigueFallback ? { output: fatigueFallback } : {}),
-            reason: fallbackReason,
+            ...(includeFatigue && fatigueFallback ? { output: fatigueFallback } : {}),
+            reason: includeFatigue ? fallbackReason : 'not_selected_by_auto_router',
           },
           risk: {
-            status: 'fallback',
+            status: includeRisk ? 'fallback' : 'skipped',
             routedTo: 'rules',
-            ...(riskFallback ? { output: riskFallback } : {}),
-            reason: fallbackReason,
+            ...(includeRisk && riskFallback ? { output: riskFallback } : {}),
+            reason: includeRisk ? fallbackReason : 'not_selected_by_auto_router',
           },
           tactical: {
             status: 'fallback',
@@ -591,8 +651,8 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
           },
         },
         agents: {
-          fatigue: { status: 'FALLBACK' },
-          risk: { status: 'FALLBACK' },
+          fatigue: { status: includeFatigue ? 'FALLBACK' : 'SKIPPED' },
+          risk: { status: includeRisk ? 'FALLBACK' : 'SKIPPED' },
           tactical: { status: 'FALLBACK' },
         },
         errors: [],
@@ -600,8 +660,8 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
         routerDecision: {
           mode: requestedMode,
           intent: 'GENERAL',
-          selectedAgents: ['fatigue', 'risk', 'tactical'],
-          agentsToRun: ['FATIGUE', 'RISK', 'TACTICAL'],
+          selectedAgents,
+          agentsToRun: selectedAgents.map((agent) => (agent === 'fatigue' ? 'FATIGUE' : agent === 'risk' ? 'RISK' : 'TACTICAL')),
             rulesFired: [fallbackReason],
           inputsUsed: {
             active: {},
@@ -610,22 +670,22 @@ export async function orchestrateHandler(request: HttpRequest, context: Invocati
             reason: fallbackWarning,
             signals: {},
             agents: {
-            fatigue: { routedTo: 'rules', reason: fallbackReason },
-            risk: { routedTo: 'rules', reason: fallbackReason },
+            fatigue: { routedTo: 'rules', reason: includeFatigue ? fallbackReason : 'not_selected_by_auto_router' },
+            risk: { routedTo: 'rules', reason: includeRisk ? fallbackReason : 'not_selected_by_auto_router' },
             tactical: { routedTo: 'rules', reason: fallbackReason },
             },
           },
           meta: {
             requestId: traceId,
             mode: requestedMode,
-          executedAgents: ['fatigue', 'risk', 'tactical'],
+          executedAgents: selectedAgents,
           modelRouting: {
-              fatigueModel: 'rules-based-fallback',
-              riskModel: 'rules-based-fallback',
+              fatigueModel: includeFatigue ? 'rules-based-fallback' : 'skipped',
+              riskModel: includeRisk ? 'rules-based-fallback' : 'skipped',
               tacticalModel: 'rules-based-fallback',
               fallbacksUsed: [fallbackReason],
             },
-            usedFallbackAgents: ['fatigue', 'risk', 'tactical'],
+            usedFallbackAgents: selectedAgents,
             routerFallbackMessage: fallbackWarning,
             timingsMs: {},
           },

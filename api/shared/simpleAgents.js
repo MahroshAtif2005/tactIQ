@@ -35,6 +35,44 @@ const pickMatchContext = (payload) => {
   return {};
 };
 
+const selectSupportAgent = (payload) => {
+  const telemetry = pickTelemetry(payload);
+  const analysisState = payload && typeof payload.analysisState === 'object' && payload.analysisState !== null
+    ? payload.analysisState
+    : {};
+  const fatigueIndex = clamp(toNum(telemetry.fatigueIndex, 0), 0, 10);
+  const strainIndex = clamp(toNum(telemetry.strainIndex, 0), 0, 10);
+  const oversBowled = Math.max(0, toNum(telemetry.oversBowled, 0));
+  const injuryRisk = normalizeRisk(telemetry.injuryRisk, 'LOW');
+  const noBallRisk = normalizeRisk(telemetry.noBallRisk, 'LOW');
+  const recoveryToken = toText(telemetry.heartRateRecovery || telemetry.recovery, '').toUpperCase();
+  const availabilityToken = toText(telemetry.availabilityStatus || analysisState.availabilityStatus, '').toUpperCase();
+  const decisionToken = toText(analysisState.decisionMode || analysisState.decision, '').toUpperCase();
+  const recoveryPoor = recoveryToken === 'POOR' || recoveryToken === 'VERY POOR';
+  const safetyCritical =
+    injuryRisk === 'HIGH' ||
+    noBallRisk === 'HIGH' ||
+    strainIndex >= 7 ||
+    recoveryPoor ||
+    availabilityToken === 'LIMITED' ||
+    availabilityToken === 'UNAVAILABLE' ||
+    /IMMEDIATE_SUBSTITUTION|REMOVE_FROM_ACTIVE|MARK_UNFIT|UNSAFE_TO_CONTINUE/.test(decisionToken);
+  if (safetyCritical) return 'risk';
+
+  const fatigueScore =
+    (fatigueIndex >= 7 ? 3 : fatigueIndex >= 5 ? 2 : fatigueIndex >= 4 ? 1 : 0) +
+    (oversBowled >= 3 ? 2 : oversBowled >= 2 ? 1 : 0) +
+    (strainIndex >= 4 ? 1 : 0) +
+    (recoveryToken === 'MODERATE' ? 1 : 0);
+  const riskScore =
+    (injuryRisk === 'MED' ? 2 : 0) +
+    (noBallRisk === 'MED' ? 2 : 0) +
+    (strainIndex >= 5 ? 2 : strainIndex >= 4 ? 1 : 0) +
+    (recoveryToken === 'MODERATE' ? 1 : 0);
+
+  return riskScore > fatigueScore ? 'risk' : 'fatigue';
+};
+
 const runFatigueFallback = (payload) => {
   const telemetry = pickTelemetry(payload);
   const fatigueIndex = clamp(toNum(telemetry.fatigueIndex, 3), 0, 10);
@@ -201,6 +239,15 @@ const runOrchestrateFallback = (payload) => {
   const risk = runRiskFallback(payload, fatigue);
   const tactical = runTacticalFallback(payload, fatigue, risk);
   const mode = String(payload?.mode || '').trim().toLowerCase() === 'full' ? 'full' : 'auto';
+  const fullModeRequested = mode === 'full';
+  const supportAgent = selectSupportAgent(payload);
+  const selectedAgents = fullModeRequested
+    ? ['fatigue', 'risk', 'tactical']
+    : supportAgent === 'risk'
+      ? ['risk', 'tactical']
+      : ['fatigue', 'tactical'];
+  const includeFatigue = fullModeRequested || supportAgent === 'fatigue';
+  const includeRisk = fullModeRequested || supportAgent === 'risk';
   const traceId = randomUUID();
   const match = pickMatchContext(payload);
   const matchMode = toText(match.matchMode || match.mode || 'BOWLING', 'BOWLING').toUpperCase();
@@ -210,8 +257,8 @@ const runOrchestrateFallback = (payload) => {
     analysisId: traceId,
     analysisBundleId: traceId,
     traceId,
-    fatigue,
-    risk,
+    ...(includeFatigue ? { fatigue } : {}),
+    ...(includeRisk ? { risk } : {}),
     tactical,
     summary: toText(
       tactical.rationale ||
@@ -222,7 +269,11 @@ const runOrchestrateFallback = (payload) => {
     ),
     tacticalRecommendation: toText(tactical.immediateAction || tactical.nextAction || 'Continue with monitored plan'),
     confidence: Number.isFinite(Number(tactical.confidence)) ? Number(tactical.confidence) : 0.62,
-    agentOutputs: { fatigue, risk, tactical },
+    agentOutputs: {
+      ...(includeFatigue ? { fatigue } : {}),
+      ...(includeRisk ? { risk } : {}),
+      tactical,
+    },
     combinedDecision: {
       immediateAction: tactical.immediateAction,
       suggestedAdjustments: tactical.suggestedAdjustments || [],
@@ -234,7 +285,10 @@ const runOrchestrateFallback = (payload) => {
       intent: 'GENERAL',
       reason: 'rules_fallback',
       rulesFired: ['rules_fallback'],
-      selectedAgents: ['fatigue', 'risk', 'tactical'],
+      selectedAgents,
+      agentsToRun: selectedAgents.map((agent) =>
+        agent === 'fatigue' ? 'FATIGUE' : agent === 'risk' ? 'RISK' : 'TACTICAL'
+      ),
       inputsUsed: {
         active: {
           fatigueIndex: fatigue.echo?.fatigueIndex,
@@ -250,29 +304,33 @@ const runOrchestrateFallback = (payload) => {
         },
       },
       agents: {
-        fatigue: { routedTo: 'rules', reason: 'rules_fallback' },
-        risk: { routedTo: 'rules', reason: 'rules_fallback' },
+        fatigue: { routedTo: 'rules', reason: includeFatigue ? 'rules_fallback' : 'not_selected_by_auto_router' },
+        risk: { routedTo: 'rules', reason: includeRisk ? 'rules_fallback' : 'not_selected_by_auto_router' },
         tactical: { routedTo: 'rules', reason: 'rules_fallback' },
       },
       signals: {},
     },
     agentResults: {
-      fatigue: { status: 'fallback', routedTo: 'rules', output: fatigue, reason: 'rules_fallback' },
-      risk: { status: 'fallback', routedTo: 'rules', output: risk, reason: 'rules_fallback' },
+      fatigue: includeFatigue
+        ? { status: 'fallback', routedTo: 'rules', output: fatigue, reason: 'rules_fallback' }
+        : { status: 'skipped', routedTo: 'rules', reason: 'not_selected_by_auto_router' },
+      risk: includeRisk
+        ? { status: 'fallback', routedTo: 'rules', output: risk, reason: 'rules_fallback' }
+        : { status: 'skipped', routedTo: 'rules', reason: 'not_selected_by_auto_router' },
       tactical: { status: 'fallback', routedTo: 'rules', output: tactical, reason: 'rules_fallback' },
     },
     errors: [],
     meta: {
       requestId: traceId,
       mode,
-      executedAgents: ['fatigue', 'risk', 'tactical'],
+      executedAgents: selectedAgents,
       modelRouting: {
-        fatigueModel: 'rules',
-        riskModel: 'rules',
+        fatigueModel: includeFatigue ? 'rules' : 'skipped',
+        riskModel: includeRisk ? 'rules' : 'skipped',
         tacticalModel: 'rules',
         fallbacksUsed: ['rules_fallback'],
       },
-      usedFallbackAgents: ['fatigue', 'risk', 'tactical'],
+      usedFallbackAgents: selectedAgents,
       timingsMs: {
         total: 0,
       },

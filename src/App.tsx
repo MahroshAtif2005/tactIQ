@@ -2997,7 +2997,11 @@ export default function App() {
     const startRequest = () => {
       if (requestInFlight) return;
       requestInFlight = true;
-      setAgentFeedStatus({ fatigue: 'RUNNING', risk: 'RUNNING', tactical: 'RUNNING' });
+      setAgentFeedStatus(
+        mode === 'full'
+          ? { fatigue: 'RUNNING', risk: 'RUNNING', tactical: 'RUNNING' }
+          : { fatigue: 'IDLE', risk: 'IDLE', tactical: 'RUNNING' }
+      );
       setAgentWarning(null);
       setAgentFailure(null);
       setAgentState('thinking');
@@ -3420,13 +3424,6 @@ export default function App() {
           ? 'full'
           : 'auto';
       const metaExecutedAgents = normalizeAgentList(resultMetaRecord.executedAgents);
-      const routerSelectedAgentsFromResult = normalizeAgentList(
-        Array.isArray(result.routerDecision?.selectedAgents) && result.routerDecision.selectedAgents.length > 0
-          ? result.routerDecision.selectedAgents
-          : result.routerDecision?.agentsToRun
-      );
-      const hasOrchestratorAgentSelectionData =
-        routerSelectedAgentsFromResult.length > 0 || metaExecutedAgents.length > 0;
       const metaUsedFallbackAgents = normalizeAgentList(resultMetaRecord.usedFallbackAgents);
       const metaRouterFallbackMessage =
         typeof resultMetaRecord.routerFallbackMessage === 'string'
@@ -3572,37 +3569,6 @@ export default function App() {
         metaRouterFallbackMessage ||
         ''
       ).trim() || undefined;
-      const finalRiskSummaryText = String(result.finalRecommendation?.ifContinues?.riskSummary || '').trim();
-      const strategicRiskSummaryText = String(result.strategicAnalysis?.injuryRiskAnalysis || '').trim();
-      const likelyInjuries = Array.isArray(result.finalRecommendation?.ifContinues?.likelyInjuries)
-        ? result.finalRecommendation.ifContinues.likelyInjuries
-        : [];
-      const severeLikelyInjury = likelyInjuries.some((entry) => String(entry?.severity || '').trim().toUpperCase() === 'HIGH');
-      const telemetryInjuryRiskToken = String(payload.telemetry?.injuryRisk || '').trim().toUpperCase();
-      const telemetryNoBallRiskToken = String(payload.telemetry?.noBallRisk || '').trim().toUpperCase();
-      const elevatedTelemetryRisk =
-        telemetryInjuryRiskToken === 'HIGH' ||
-        telemetryInjuryRiskToken === 'CRITICAL' ||
-        telemetryNoBallRiskToken === 'HIGH';
-      const severeRiskNarrativeText = [
-        finalRiskSummaryText,
-        strategicRiskSummaryText,
-        String(result.finalRecommendation?.title || ''),
-        String(result.finalRecommendation?.statement || ''),
-        String(result.tactical?.immediateAction || ''),
-      ].join(' ');
-      const severeRiskNarrative = /(?:\bhigh\b|\bcritical\b|unsafe|immediate substitution|remove from active|mark unfit|not fit to continue|safety thresholds exceeded|unavailable)/i.test(
-        severeRiskNarrativeText
-      );
-      const riskReasoningSurfaced = Boolean(
-        result.risk ||
-        severeLikelyInjury ||
-        elevatedTelemetryRisk ||
-        severeRiskNarrative
-      );
-      if (!hasOrchestratorAgentSelectionData && riskReasoningSurfaced && !metaExecutedAgents.includes('risk')) {
-        metaExecutedAgents.push('risk');
-      }
       setOrchestrateMeta({
         analysisId: resolvedAnalysisId || undefined,
         mode: metaMode,
@@ -3629,20 +3595,18 @@ export default function App() {
       });
       setRouterDecision(mode === 'auto' ? (result.routerDecision || null) : null);
 
-      const selectedAgentSet = new Set<AgentKey>(mode === 'full' ? AGENT_KEYS : []);
-      if (mode === 'auto') {
-        if (Array.isArray(result.routerDecision?.selectedAgents)) {
-          result.routerDecision.selectedAgents.forEach((agent) => {
-            const key = toAgentKey(agent);
-            if (key) selectedAgentSet.add(key);
-          });
-        }
-        if (Array.isArray(result.routerDecision?.agentsToRun)) {
-          result.routerDecision.agentsToRun.forEach((agent) => {
-            const key = toAgentKey(agent);
-            if (key) selectedAgentSet.add(key);
-          });
-        }
+      const selectedAgentSet = new Set<AgentKey>();
+      if (Array.isArray(result.routerDecision?.selectedAgents)) {
+        result.routerDecision.selectedAgents.forEach((agent) => {
+          const key = toAgentKey(agent);
+          if (key) selectedAgentSet.add(key);
+        });
+      }
+      if (Array.isArray(result.routerDecision?.agentsToRun)) {
+        result.routerDecision.agentsToRun.forEach((agent) => {
+          const key = toAgentKey(agent);
+          if (key) selectedAgentSet.add(key);
+        });
       }
       metaExecutedAgents.forEach((agent) => selectedAgentSet.add(agent));
       if (selectedAgentSet.size === 0) {
@@ -3691,13 +3655,7 @@ export default function App() {
           metaFallbacksUsed.length > 0 ||
           fallbackReasonRegex.test(routeReason) ||
           fallbackReasonRegex.test(routerReason);
-        const thresholdRiskCoverage =
-          !hasOrchestratorAgentSelectionData &&
-          agent === 'risk' &&
-          riskReasoningSurfaced &&
-          !hasAgentOutput('risk');
         if (routeReason.includes('not_selected_by_auto_router') || routeReason.includes('disabled_by_request')) {
-          if (thresholdRiskCoverage) return 'SUCCESS';
           return 'SKIPPED';
         }
         if (serverStatus === 'FALLBACK' || routeStatus === 'fallback') return 'FALLBACK';
@@ -3706,7 +3664,6 @@ export default function App() {
           return 'SUCCESS';
         }
         if (!selectedAgentSet.has(agent)) {
-          if (thresholdRiskCoverage) return 'SUCCESS';
           return 'SKIPPED';
         }
         if (errored || serverStatus === 'ERROR' || routeStatus === 'error') {
@@ -3811,9 +3768,9 @@ export default function App() {
         severeDecisionSignal;
       if (critical) {
         return {
-          selectedAgents: ['fatigue', 'risk', 'tactical'],
+          selectedAgents: ['risk', 'tactical'],
           critical: true,
-          reason: 'critical_signals',
+          reason: 'critical_risk_dominant',
         };
       }
 
@@ -4363,6 +4320,13 @@ export default function App() {
         safeNum(fallbackFatigue.echo?.fatigueIndex, safeNum(payload.telemetry?.fatigueIndex, 0))
       );
       const fallbackTactical = buildRulesTacticalFallback(fallbackFatigue, fallbackRisk, fallbackMessage);
+      const fallbackSelection = mode === 'full'
+        ? { selectedAgents: (['fatigue', 'risk', 'tactical'] as AgentKey[]), critical: true, reason: 'full_mode_all_agents' }
+        : deriveAutoFallbackSelection();
+      const fallbackSelectedAgents = fallbackSelection.selectedAgents;
+      const fallbackSelectedSet = new Set<AgentKey>(fallbackSelectedAgents);
+      const includeFatigue = fallbackSelectedSet.has('fatigue');
+      const includeRisk = fallbackSelectedSet.has('risk');
       const fallbackAnalysisId = `local-fallback-${Date.now()}`;
       const fallbackSignals = Array.from(
         new Set([
@@ -4382,12 +4346,16 @@ export default function App() {
       };
       const fallbackStrategicAnalysis: NonNullable<OrchestrateResponse['strategicAnalysis']> = {
         signals: fallbackSignals,
-        fatigueAnalysis: String(
-          fallbackFatigue.recommendation || fallbackFatigue.explanation || 'Fatigue signal reviewed via rules fallback.'
-        ),
-        injuryRiskAnalysis: String(
-          fallbackRisk.recommendation || fallbackRisk.explanation || 'Risk signal reviewed via rules fallback.'
-        ),
+        fatigueAnalysis: includeFatigue
+          ? String(
+              fallbackFatigue.recommendation || fallbackFatigue.explanation || 'Fatigue signal reviewed via rules fallback.'
+            )
+          : 'Fatigue agent not selected in this auto route.',
+        injuryRiskAnalysis: includeRisk
+          ? String(
+              fallbackRisk.recommendation || fallbackRisk.explanation || 'Risk signal reviewed via rules fallback.'
+            )
+          : 'Risk agent not selected in this auto route.',
         tacticalRecommendation: {
           nextAction: String(fallbackTactical.nextAction || fallbackTactical.immediateAction || 'Continue with monitored plan'),
           why: String(fallbackTactical.rationale || fallbackMessage),
@@ -4401,8 +4369,8 @@ export default function App() {
       const fallbackResponse: OrchestrateResponse = {
         ok: true,
         analysisId: fallbackAnalysisId,
-        fatigue: fallbackFatigue,
-        risk: fallbackRisk,
+        ...(includeFatigue ? { fatigue: fallbackFatigue } : {}),
+        ...(includeRisk ? { risk: fallbackRisk } : {}),
         tactical: fallbackTactical,
         strategicAnalysis: fallbackStrategicAnalysis,
         combinedBriefing:
@@ -4411,13 +4379,17 @@ export default function App() {
         combinedDecision: fallbackCombinedDecision,
         errors: [],
         agents: {
-          fatigue: { status: 'FALLBACK' },
-          risk: { status: 'FALLBACK' },
+          fatigue: { status: includeFatigue ? 'FALLBACK' : 'SKIPPED' },
+          risk: { status: includeRisk ? 'FALLBACK' : 'SKIPPED' },
           tactical: { status: 'FALLBACK' },
         },
         agentResults: {
-          fatigue: { status: 'fallback', routedTo: 'rules', output: fallbackFatigue, reason: 'rules_fallback' },
-          risk: { status: 'fallback', routedTo: 'rules', output: fallbackRisk, reason: 'rules_fallback' },
+          fatigue: includeFatigue
+            ? { status: 'fallback', routedTo: 'rules', output: fallbackFatigue, reason: 'rules_fallback' }
+            : { status: 'error', routedTo: 'rules', reason: 'not_selected_by_auto_router' },
+          risk: includeRisk
+            ? { status: 'fallback', routedTo: 'rules', output: fallbackRisk, reason: 'rules_fallback' }
+            : { status: 'error', routedTo: 'rules', reason: 'not_selected_by_auto_router' },
           tactical: { status: 'fallback', routedTo: 'rules', output: fallbackTactical, reason: 'rules_fallback' },
         },
         routerDecision: {
@@ -4425,8 +4397,8 @@ export default function App() {
           intent: 'General',
           reason: fallbackMessage,
           rationale: fallbackMessage,
-          selectedAgents: ['fatigue', 'risk', 'tactical'],
-          agentsToRun: ['FATIGUE', 'RISK', 'TACTICAL'],
+          selectedAgents: fallbackSelectedAgents,
+          agentsToRun: fallbackSelectedAgents.map((agent) => toAgentCode(agent)),
           rulesFired: ['rules_fallback', `error:${toErrorReason(error)}`],
           signalSummaryBullets: fallbackSignals,
           inputsUsed: {
@@ -4450,8 +4422,8 @@ export default function App() {
             },
           },
           agents: {
-            fatigue: { routedTo: 'rules', reason: 'rules_fallback' },
-            risk: { routedTo: 'rules', reason: 'rules_fallback' },
+            fatigue: { routedTo: 'rules', reason: includeFatigue ? 'rules_fallback' : 'not_selected_by_auto_router' },
+            risk: { routedTo: 'rules', reason: includeRisk ? 'rules_fallback' : 'not_selected_by_auto_router' },
             tactical: { routedTo: 'rules', reason: 'rules_fallback' },
           },
           signals: {
@@ -4465,14 +4437,14 @@ export default function App() {
           requestId: fallbackAnalysisId,
           analysisId: fallbackAnalysisId,
           mode: requestMode,
-          executedAgents: ['fatigue', 'risk', 'tactical'],
+          executedAgents: fallbackSelectedAgents,
           modelRouting: {
-            fatigueModel: 'rules-based-fallback',
-            riskModel: 'rules-based-fallback',
+            fatigueModel: includeFatigue ? 'rules-based-fallback' : 'skipped',
+            riskModel: includeRisk ? 'rules-based-fallback' : 'skipped',
             tacticalModel: 'rules-based-fallback',
             fallbacksUsed: ['rules_fallback', toErrorReason(error)],
           },
-          usedFallbackAgents: ['fatigue', 'risk', 'tactical'],
+          usedFallbackAgents: fallbackSelectedAgents,
           routerFallbackMessage: fallbackMessage,
           timingsMs: { total: 0 },
         },
@@ -7689,7 +7661,6 @@ function Dashboard({
   });
   const fallbackSelectedAgents = Array.from(
     new Set<('fatigue' | 'risk' | 'tactical')>([
-      ...(runMode === 'full' ? AGENT_KEYS : []),
       ...statusSelectedAgents,
     ])
   );
@@ -7715,14 +7686,14 @@ function Dashboard({
   const routerDetailRows = (['fatigue', 'risk', 'tactical'] as const).map((agent) => {
     const entry = modelRouterForView[agent];
     const status = agentFeedStatus[agent];
-    const engaged = runMode === 'full' ? true : selectedAgentSet.has(agent) || status === 'RUNNING';
+    const engaged = selectedAgentSet.has(agent) || status === 'RUNNING';
     const routedTo: 'llm' | 'rules' = entry?.routedTo
       ? entry.routedTo
       : status === 'FALLBACK' || status === 'SKIPPED'
         ? 'rules'
         : 'llm';
     const reason = sanitizeRouterReason(
-      String(entry?.reason || '').trim() || (!engaged && runMode !== 'full' ? 'not_selected_by_auto_router' : '')
+      String(entry?.reason || '').trim() || (!engaged ? 'not_selected_by_auto_router' : '')
     );
     const statusLabel =
       status === 'SUCCESS'
@@ -7930,8 +7901,11 @@ function Dashboard({
     if (!completedStatus) return false;
     return hasUsableAgentOutput[agent];
   };
-  const completedRequiredAgents = AGENT_KEYS.filter((agent) => isAgentCompleteForCoverage(agent));
-  const hasCompleteAnalysis = completedRequiredAgents.length === AGENT_KEYS.length;
+  const requiredAgentSet = new Set<AgentKey>(selectedAgents.length > 0 ? selectedAgents : ['tactical']);
+  requiredAgentSet.add('tactical');
+  const completedRequiredAgents = Array.from(requiredAgentSet).filter((agent) => isAgentCompleteForCoverage(agent));
+  const hasCompleteAnalysis = completedRequiredAgents.length === requiredAgentSet.size;
+  const hasCompleteFullCombinedAnalysis = AGENT_KEYS.every((agent) => isAgentCompleteForCoverage(agent));
   const hasPartialAnalysis = hasAnyAnalysis && completedRequiredAgents.length > 0 && !hasCompleteAnalysis;
   const hasCoachOutputText = Boolean(
     (typeof coachOutput?.summary === 'string' && coachOutput.summary.trim().length > 0) ||
@@ -10406,9 +10380,11 @@ function Dashboard({
 
   // CTA state machine: run -> current -> stale refresh.
   const fullAnalysisIsRunning = agentState === 'thinking' || fullAnalysisRunPending;
-  const shouldShowRunFullAnalysis = !fullAnalysisIsRunning && (!analysisExecuted || !hasCompleteAnalysis);
-  const fullAnalysisNeedsRefresh = analysisExecuted && analysisStale && hasCompleteAnalysis;
-  const fullAnalysisUpToDate = analysisExecuted && !analysisStale && !fullAnalysisIsRunning && hasCompleteAnalysis;
+  const shouldShowRunFullAnalysis =
+    !fullAnalysisIsRunning && (!fullAnalysisExecuted || !hasCompleteFullCombinedAnalysis);
+  const fullAnalysisNeedsRefresh = fullAnalysisExecuted && analysisStale;
+  const fullAnalysisUpToDate =
+    fullAnalysisExecuted && !analysisStale && !fullAnalysisIsRunning && hasCompleteFullCombinedAnalysis;
   const fullAnalysisCtaLabel = fullAnalysisIsRunning
     ? 'Refreshing Analysis...'
     : shouldShowRunFullAnalysis
