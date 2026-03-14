@@ -23,7 +23,7 @@ For teams and fans, these injuries appear sudden. But in reality, fatigue builds
 Imagine a crucial match.
 The team’s leading fast bowler has already bowled an intense spell. The scoreboard pressure is rising. The captain must decide whether to give him another over.
 
-That decision is often made in seconds — based mostly on intuition.
+That decision is often made in seconds, based mostly on intuition.
 
 But what if the system could warn the coach:
 
@@ -56,9 +56,15 @@ tactIQ helps captains and analysts answer key tactical questions
 - Should a substitution be made right now  
 - Which player is most suitable for the current match context  
 - How fatigue is impacting performance and injury risk  
-- Whether the team is tactically on track or under pressure  
+- Whether the team is tactically on track or under pressure
 
-It converts match context and player state into coach like actionable guidance.
+### What tactIQ Analyzes
+
+• Current match context such as overs remaining, pressure situations, and tactical needs  
+• Real-time player fatigue indicators and recovery readiness  
+• Historical performance trends and workload thresholds
+
+tactIQ converts historical workload data and live match context into clear, coach-like actionable guidance.
 
 ---
 ## Player Intelligence System
@@ -81,7 +87,7 @@ It converts match context and player state into coach like actionable guidance.
 tactIQ introduces a router based multi-agent architecture that dynamically selects specialized AI agents based on live match signals.
 Instead of running a single model prompt, the system orchestrates fatigue analysis, injury risk assessment, and tactical reasoning agents to produce explainable coaching decisions.
 
-Quick Rotation
+### Quick Rotation
 
 tactIQ includes a quick rotation notification system designed for fast decision making during live matches. When the coach triggers a rotation action, the AI immediately analyzes the current match phase, player fatigue levels, workload, and tactical context.
 Instead of requiring the coach to read a full analytical report, tactIQ generates a real-time notification suggesting the next best player substitution from the current roster. This allows coaches to make rapid decisions during high pressure match moments.
