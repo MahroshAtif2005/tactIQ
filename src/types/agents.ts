@@ -90,6 +90,10 @@ export interface TacticalAgentResponse {
   immediateAction: string;
   rationale: string;
   suggestedAdjustments: string[];
+  assessment?: string;
+  tradeoff?: string;
+  decision?: string;
+  decisionRationale?: string;
   nextAction?: string;
   why?: string[];
   swap?: {

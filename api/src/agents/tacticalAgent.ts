@@ -97,6 +97,137 @@ const getFormatMaxOvers = (format?: string): number => {
   if (token === 'ODI') return 10;
   return 12;
 };
+type CoachRiskBand = 'LOW' | 'MODERATE' | 'HIGH';
+const normalizeRecoveryToken = (value: unknown): 'GOOD' | 'MODERATE' | 'POOR' => {
+  const token = String(value || '').trim().toUpperCase();
+  if (token.includes('POOR') || token.includes('SLOW') || token.includes('VERY')) return 'POOR';
+  if (token.includes('MODERATE') || token.includes('FAIR')) return 'MODERATE';
+  return 'GOOD';
+};
+const toCoachRiskBand = (score: number): CoachRiskBand => {
+  if (score >= 0.67) return 'HIGH';
+  if (score >= 0.36) return 'MODERATE';
+  return 'LOW';
+};
+const buildTacticalDecisionInputs = (
+  input: TacticalAgentInput,
+  teamMode: 'BATTING' | 'BOWLING',
+  focusRole: 'BOWLER' | 'BATTER',
+  baselineDirective: {
+    profile: {
+      sleepHours?: number;
+      recoveryMinutes?: number;
+      fatigueLimit?: number;
+      role?: string;
+      control?: number;
+      speed?: number;
+      power?: number;
+    };
+    constrained: boolean;
+  }
+) => {
+  const requiredRunRate = Number(input.matchContext?.requiredRunRate || 0);
+  const currentRunRate = Number(input.matchContext?.currentRunRate || 0);
+  const runRatePressure = Number((requiredRunRate - currentRunRate).toFixed(2));
+  const scoreboardPressureScore = Math.max(0, Math.min(1, runRatePressure > 0 ? runRatePressure / 2.4 : 0));
+  const scoreboardPressure = toCoachRiskBand(scoreboardPressureScore);
+
+  const fatigueIndex = Math.max(0, Number(input.telemetry?.fatigueIndex || 0));
+  const strainIndex = Math.max(0, Number(input.telemetry?.strainIndex || 0));
+  const injuryRiskToken = normalizeRisk(input.telemetry?.injuryRisk);
+  const noBallRiskToken = normalizeRisk(input.telemetry?.noBallRisk);
+  const recoveryToken = normalizeRecoveryToken(input.telemetry?.heartRateRecovery);
+  const oversBowled = Math.max(0, Number(input.telemetry?.oversBowled || 0));
+  const oversRemaining = Number.isFinite(Number(input.telemetry?.oversRemaining))
+    ? Math.max(0, Number(input.telemetry?.oversRemaining))
+    : undefined;
+  const maxOvers = Number.isFinite(Number(input.telemetry?.maxOvers))
+    ? Math.max(1, Number(input.telemetry?.maxOvers))
+    : getFormatMaxOvers(input.matchContext?.format);
+  const fatigueLimit = Number.isFinite(Number(input.telemetry?.fatigueLimit))
+    ? Math.max(1, Number(input.telemetry?.fatigueLimit))
+    : undefined;
+
+  const injuryWeight = injuryRiskToken === 'HIGH' ? 0.22 : injuryRiskToken === 'MEDIUM' ? 0.1 : 0.03;
+  const noBallWeight = noBallRiskToken === 'HIGH' ? 0.26 : noBallRiskToken === 'MEDIUM' ? 0.12 : 0.03;
+  const recoveryWeight = recoveryToken === 'POOR' ? 0.18 : recoveryToken === 'MODERATE' ? 0.09 : 0.03;
+  const fatigueWeight = Math.max(0, Math.min(1, fatigueIndex / 10));
+  const strainWeight = Math.max(0, Math.min(1, strainIndex / 10));
+
+  const dismissalRiskScore = Math.max(
+    0,
+    Math.min(1, fatigueWeight * 0.36 + strainWeight * 0.24 + scoreboardPressureScore * 0.22 + injuryWeight + recoveryWeight * 0.7)
+  );
+  const controlExecutionRiskScore = Math.max(
+    0,
+    Math.min(1, fatigueWeight * 0.26 + strainWeight * 0.24 + noBallWeight + recoveryWeight + scoreboardPressureScore * 0.14)
+  );
+  const dismissalRisk = toCoachRiskBand(dismissalRiskScore);
+  const controlExecutionRisk = toCoachRiskBand(controlExecutionRiskScore);
+
+  const alternatives = listEligibleReplacements(input, teamMode).slice(0, 3).map((candidate) => ({
+    playerId: candidate.playerId,
+    name: candidate.name,
+    role: candidate.role,
+    reason: candidate.reason,
+  }));
+
+  return {
+    matchState: {
+      teamMode,
+      focusRole,
+      phase: String(input.matchContext?.phase || '').toLowerCase(),
+      format: String(input.matchContext?.format || ''),
+      score: Number.isFinite(Number(input.matchContext?.score)) ? Number(input.matchContext?.score) : undefined,
+      wicketsInHand: Number.isFinite(Number(input.matchContext?.wicketsInHand))
+        ? Number(input.matchContext?.wicketsInHand)
+        : undefined,
+      over: Number.isFinite(Number(input.matchContext?.over)) ? Number(input.matchContext?.over) : undefined,
+      balls: Number.isFinite(Number(input.matchContext?.balls)) ? Number(input.matchContext?.balls) : undefined,
+      target: Number.isFinite(Number(input.matchContext?.target)) ? Number(input.matchContext?.target) : undefined,
+      intensity: String(input.matchContext?.intensity || ''),
+      conditions: String(input.matchContext?.conditions || ''),
+      requiredRunRate: Number(requiredRunRate.toFixed(2)),
+      currentRunRate: Number(currentRunRate.toFixed(2)),
+      runRatePressure,
+      scoreboardPressure,
+    },
+    playerPhysicalRisk: {
+      playerId: String(input.telemetry?.playerId || ''),
+      playerName: String(input.telemetry?.playerName || ''),
+      role: String(input.telemetry?.role || ''),
+      fatigueIndex: Number(fatigueIndex.toFixed(1)),
+      strainIndex: Number(strainIndex.toFixed(1)),
+      injuryRisk: injuryRiskToken,
+      noBallRisk: noBallRiskToken,
+      heartRateRecovery: recoveryToken,
+      oversBowled: Number(oversBowled.toFixed(1)),
+      oversRemaining,
+      maxOvers,
+      fatigueLimit,
+      sleepHours: baselineDirective.profile.sleepHours,
+      recoveryMinutes: baselineDirective.profile.recoveryMinutes,
+      baselineConstrained: baselineDirective.constrained,
+      dismissalRisk,
+      controlExecutionRisk,
+    },
+    alternatives,
+    fatigueSignalSummary: input.fatigueOutput
+      ? {
+          headline: input.fatigueOutput.headline,
+          severity: input.fatigueOutput.severity,
+          recommendation: input.fatigueOutput.recommendation,
+        }
+      : undefined,
+    riskSignalSummary: input.riskOutput
+      ? {
+          headline: input.riskOutput.headline,
+          severity: input.riskOutput.severity,
+          recommendation: input.riskOutput.recommendation,
+        }
+      : undefined,
+  };
+};
 const sanitizeLine = (value: unknown, fallback: string, maxChars = 120): string => {
   const normalized = String(value || '')
     .replace(/\s+/g, ' ')
@@ -135,6 +266,56 @@ const sanitizeBullets = (items: Array<unknown>, max = 3): string[] =>
       .filter((entry) => entry.length > 0)
       .filter((entry) => !/(?:\bof\.?$|\bof$| of and )/i.test(entry))
   ).slice(0, max);
+const buildStructuredTradeoff = (
+  teamMode: 'BATTING' | 'BOWLING',
+  decisionInputs: ReturnType<typeof buildTacticalDecisionInputs>,
+  playerName: string
+): string => {
+  const subject = sanitizeLine(playerName, 'the current player', 40).replace(/[.!?]$/g, '') || 'the current player';
+  const dismissalRisk = String(decisionInputs.playerPhysicalRisk.dismissalRisk || 'MODERATE').toLowerCase();
+  const controlRisk = String(decisionInputs.playerPhysicalRisk.controlExecutionRisk || 'MODERATE').toLowerCase();
+  const phaseToken = String(decisionInputs.matchState.phase || '').trim().toLowerCase();
+  const phaseLabel = phaseToken ? `${phaseToken} phase` : 'current phase';
+  const pressureToken = String(decisionInputs.matchState.scoreboardPressure || 'MODERATE').toLowerCase();
+
+  if (teamMode === 'BATTING') {
+    const battingRiskClause =
+      dismissalRisk === 'high'
+        ? `high dismissal exposure can rise further if ${pressureToken} pressure spikes`
+        : dismissalRisk === 'moderate'
+          ? `moderate dismissal exposure remains if ${pressureToken} pressure rises`
+          : `dismissal exposure can still rise if workload and pressure drift upward`;
+    return `Keeping ${subject} preserves continuity at the crease and avoids exposing a new batter, but ${battingRiskClause}.`;
+  }
+
+  const bowlingRiskClause =
+    controlRisk === 'high'
+      ? 'fatigue drift is now increasing control execution risk'
+      : controlRisk === 'moderate'
+        ? 'ongoing fatigue drift can push execution risk higher under pressure'
+        : 'continued workload can still elevate control risk if pressure increases';
+  return `Allowing another over preserves the matchup value in the ${phaseLabel}, but ${bowlingRiskClause}.`;
+};
+const normalizeTradeoffSentence = (
+  value: unknown,
+  teamMode: 'BATTING' | 'BOWLING',
+  decisionInputs: ReturnType<typeof buildTacticalDecisionInputs>,
+  playerName: string
+): string => {
+  const fallback = buildStructuredTradeoff(teamMode, decisionInputs, playerName);
+  const cleaned = sanitizeLine(value, fallback, 200);
+  if (!cleaned) return fallback;
+  const lower = cleaned.toLowerCase();
+  const circular =
+    /(risk|exposure)\s+(?:due to|because of)\s+(risk|exposure)/i.test(cleaned) ||
+    /dismissal risk[^.]{0,80}dismissal risk/i.test(cleaned) ||
+    /control risk[^.]{0,80}control risk/i.test(cleaned);
+  const weakBenefit = /stability in the batting order/i.test(cleaned);
+  const missingContrast = !/\bbut\b/i.test(cleaned);
+  const nonCricketGeneric = !/(crease|batter|phase|fatigue drift|control risk|dismissal exposure|matchup)/i.test(lower);
+  if (circular || weakBenefit || missingContrast || nonCricketGeneric) return fallback;
+  return cleaned;
+};
 const applyTacticalDefaults = (input: TacticalAgentInput): TacticalAgentInput => {
   const bowlerName = sanitizeLine(input.telemetry?.playerName || input.players?.bowler, 'Current bowler', 80);
   const fatigueIndex = Number.isFinite(Number(input.telemetry?.fatigueIndex)) ? Number(input.telemetry?.fatigueIndex) : 0;
@@ -270,6 +451,11 @@ const buildContinueGuardrailOutput = (input: TacticalAgentInput, status: Tactica
     status,
     immediateAction: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
     nextAction: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
+    decision: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
+    assessment: `${bowlerName} remains within safe workload and recovery boundaries for this phase.`,
+    tradeoff:
+      `Keeping ${bowlerName} preserves control continuity in this phase, but cumulative workload can still increase execution risk if intensity rises.`,
+    decisionRationale: 'Control stability and workload profile support one controlled continuation over.',
     rationale: `${bowlerName} is in a safe state to continue this spell.`,
     suggestedAdjustments: optionsLine ? [...whyBullets, optionsLine] : [...whyBullets],
     why: [...whyBullets],
@@ -282,6 +468,14 @@ const buildContinueGuardrailOutput = (input: TacticalAgentInput, status: Tactica
 const sanitizeTacticalOutput = (output: TacticalAgentOutput): TacticalAgentOutput => {
   const immediateAction = sanitizeLine(output.immediateAction, 'Continue with monitored tactical plan', 70);
   const rationale = sanitizeLine(output.rationale, 'Tactical recommendation generated from live telemetry.', 90);
+  const assessment = sanitizeLine(output.assessment, rationale || 'Tactical assessment generated from live context.', 160);
+  const tradeoff = sanitizeLine(
+    output.tradeoff,
+    'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.',
+    200
+  );
+  const decision = sanitizeLine(output.decision || output.nextAction || immediateAction, immediateAction, 160);
+  const decisionRationale = sanitizeLine(output.decisionRationale || rationale, rationale, 170);
   const why = sanitizeBullets(output.why || [rationale], 3);
   const suggestedAdjustments = sanitizeBullets(output.suggestedAdjustments || why, 6);
   const ifIgnored = sanitizeLine(output.ifIgnored, 'Minimal risk; continue monitoring for workload changes.', 90);
@@ -290,6 +484,10 @@ const sanitizeTacticalOutput = (output: TacticalAgentOutput): TacticalAgentOutpu
     ...output,
     immediateAction,
     nextAction: sanitizeLine(output.nextAction || immediateAction, immediateAction, 70),
+    assessment,
+    tradeoff,
+    decision,
+    decisionRationale,
     rationale,
     why,
     suggestedAdjustments,
@@ -434,6 +632,11 @@ const sanitizeByMode = (
         ? 'Execute bowling control plan and monitor workload'
         : 'Execute batting tempo plan and preserve wicket value'
       : output.immediateAction,
+    decision: forbiddenPattern.test(String(output.decision || output.nextAction || output.immediateAction))
+      ? teamMode === 'BOWLING'
+        ? 'Execute bowling control plan and monitor workload'
+        : 'Execute batting tempo plan and preserve wicket value'
+      : output.decision,
     rationale: `${output.rationale} ${telemetryBasis}`.trim(),
     suggestedAdjustments: safeAdjustments,
     substitutionAdvice:
@@ -468,6 +671,11 @@ const applyRotationGuardrail = (
   return {
     ...output,
     immediateAction: 'Continue current bowler with monitored plan',
+    decision: 'Continue current bowler with monitored plan',
+    assessment: 'Current bowler remains in a low-risk state for immediate continuation.',
+    tradeoff:
+      'Keeping the current bowler preserves matchup continuity in this phase, but workload drift can still raise execution risk if pressure spikes.',
+    decisionRationale: 'No acute safety trigger is present, so maintain one-over continuity and reassess.',
     rationale:
       `No immediate rotation: oversBowled is 0 and risk signals are not high. ${telemetryBasis}`.trim(),
     suggestedAdjustments: [
@@ -484,6 +692,10 @@ type TacticalLLMOutput = {
   status?: unknown;
   suggestion?: unknown;
   nextOverPlan?: unknown;
+  assessment?: unknown;
+  tradeoff?: unknown;
+  decision?: unknown;
+  decisionRationale?: unknown;
   nextAction?: unknown;
   why?: unknown;
   swap?: unknown;
@@ -641,6 +853,17 @@ const coerceTacticalOutput = (
     raw.nextAction || raw.immediateAction || raw.suggestion || 'Continue with monitored tactical plan',
     70
   ) || 'Continue with monitored tactical plan';
+  const assessment = truncateChars(raw.assessment || raw.rationale || whyBullets[0] || 'Tactical assessment generated from live context.', 160)
+    || 'Tactical assessment generated from live context.';
+  const tradeoff = truncateChars(
+    raw.tradeoff || 'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.',
+    200
+  ) || 'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.';
+  const decision = truncateChars(raw.decision || raw.nextAction || raw.immediateAction || immediateAction, 160) || immediateAction;
+  const decisionRationale = truncateChars(
+    raw.decisionRationale || raw.rationale || whyBullets[0] || 'Decision grounded in current match leverage and player physical risk.',
+    170
+  ) || 'Decision grounded in current match leverage and player physical risk.';
   let rationale = truncateChars(raw.rationale || whyBullets[0] || 'Tactical recommendation generated from live telemetry.', 90)
     || 'Tactical recommendation generated from live telemetry.';
   if (rationale.toLowerCase() === immediateAction.toLowerCase()) {
@@ -652,6 +875,10 @@ const coerceTacticalOutput = (
   return {
     status: 'ok',
     immediateAction,
+    assessment,
+    tradeoff,
+    decision,
+    decisionRationale,
     rationale,
     suggestedAdjustments: dedupedAdjustments.length > 0 ? dedupedAdjustments.slice(0, 6) : defaultAdjustments,
     substitutionAdvice: swap,
@@ -806,6 +1033,8 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
   const noBallRisk = String(safeInput.telemetry.noBallRisk || 'MEDIUM').toUpperCase();
   const telemetryBasis = buildTelemetryBasis(safeInput);
   const baselineDirective = deriveBaselineDirective(safeInput);
+  const fallbackFocusRole = normalizeFocusRole(safeInput, teamMode);
+  const fallbackDecisionInputs = buildTacticalDecisionInputs(safeInput, teamMode, fallbackFocusRole, baselineDirective);
   const poorRecovery = ['poor', 'very poor'].includes(String(safeInput.telemetry.heartRateRecovery || '').toLowerCase());
   const replacementCandidate = listEligibleReplacements(safeInput, teamMode)[0];
   const replacement = replacementCandidate?.name || pickBenchReplacement(safeInput, teamMode);
@@ -861,6 +1090,45 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
           : shouldSubstitute
             ? 'Substitute now and rotate workload'
             : 'Continue with monitored plan',
+      decision:
+        teamMode === 'BATTING'
+          ? 'Adjust batting plan and protect wicket value'
+          : shouldSubstitute
+            ? 'Substitute now and rotate workload'
+            : 'Continue with monitored plan',
+      assessment:
+        teamMode === 'BATTING'
+          ? 'Batting continuity decision is driven by current pressure phase and physical readiness profile.'
+          : shouldSubstitute
+            ? 'Bowling continuation risk is elevated enough to justify immediate workload rotation.'
+            : 'Bowling continuation remains viable with controlled execution and one-over reassessment.',
+      tradeoff:
+        teamMode === 'BATTING'
+          ? normalizeTradeoffSentence(
+              'Keeping the current batter preserves continuity at the crease and avoids exposing a new batter, but dismissal exposure can tighten under pressure.',
+              teamMode,
+              fallbackDecisionInputs,
+              String(safeInput.telemetry.playerName || safeInput.players.bowler || 'the current player')
+            )
+          : shouldSubstitute
+            ? normalizeTradeoffSentence(
+                'Changing now protects control and safety in this phase, but it also gives up current-bowler continuity.',
+                teamMode,
+                fallbackDecisionInputs,
+                String(safeInput.telemetry.playerName || safeInput.players.bowler || 'the current player')
+              )
+            : normalizeTradeoffSentence(
+                'Allowing another over preserves the current matchup in this phase, but fatigue drift can still increase execution risk.',
+                teamMode,
+                fallbackDecisionInputs,
+                String(safeInput.telemetry.playerName || safeInput.players.bowler || 'the current player')
+              ),
+      decisionRationale:
+        teamMode === 'BATTING'
+          ? 'Decision balances scoreboard pressure, baseline readiness, and dismissal exposure.'
+          : shouldSubstitute
+            ? 'Decision prioritizes safety and control stability over short-term matchup continuity.'
+            : 'Decision prioritizes controlled continuation with an explicit reassessment checkpoint.',
       rationale: shouldSubstitute
         ? `Heuristic fallback: elevated risk (injury ${injuryRisk}, fatigue ${fatigueIndex.toFixed(1)}, no-ball ${noBallRisk}). ${baselineDirective.text} ${telemetryBasis}`
         : `Heuristic fallback: current risk remains manageable (injury ${injuryRisk}, fatigue ${fatigueIndex.toFixed(1)}). ${baselineDirective.text} ${telemetryBasis}`,
@@ -932,6 +1200,7 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
   const focusRole = normalizeFocusRole(safeInput, teamMode);
   const telemetryBasis = buildTelemetryBasis(safeInput);
   const baselineDirective = deriveBaselineDirective(safeInput);
+  const decisionInputs = buildTacticalDecisionInputs(safeInput, teamMode, focusRole, baselineDirective);
   const teamModeInstruction =
     teamMode === 'BOWLING'
       ? 'Team mode is BOWLING. Recommend only bowling actions (next safe bowler, bowling field plan, workload safety). Never mention next batter.'
@@ -942,11 +1211,17 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
       role: 'system',
       content:
         'You are a cricket tactical coach agent. Return only valid JSON. ' +
-        'Required keys: nextAction (<=70 chars), why (array with exactly 2 bullets, each <=90 chars), ifIgnored (<=90 chars), coachNote (<=110 chars). ' +
+        'Required keys: assessment (<=160 chars), tradeoff (<=200 chars), decision (<=160 chars), nextAction (<=70 chars), why (array with exactly 2 bullets, each <=90 chars), ifIgnored (<=90 chars), coachNote (<=110 chars). ' +
         'Optional key: swap object {out: playerId, in: playerId, reason <=90 chars}. ' +
-        'Also include compatibility keys: immediateAction, rationale, suggestedAdjustments when possible. ' +
+        'Also include compatibility keys: immediateAction, rationale, decisionRationale, suggestedAdjustments when possible. ' +
         `${teamModeInstruction} Use telemetry and baseline as evidence, but do not just restate raw stats. ` +
-        'Focus on tactical implications: control stability, momentum, workload compounding, and next-over consequence. ' +
+        'Focus on tactical implications: scoreboard pressure, control stability, momentum, workload compounding, and next-over consequence. ' +
+        'Your tradeoff and decision must be grounded in the provided decisionInputs.matchState and decisionInputs.playerPhysicalRisk signals. ' +
+        'TRADEOFF must be one concise sentence in ADVANTAGE vs RISK format: "<advantage>, but <risk>". ' +
+        'Avoid circular wording like "dismissal risk due to dismissal risk" and avoid generic phrases like "stability in the batting order". ' +
+        'Use cricket-specific concepts such as continuity at the crease, exposing a new batter, phase pressure, fatigue drift, control risk, and dismissal exposure. ' +
+        'Use available alternatives when deciding continuity vs change. ' +
+        'Do not produce generic "monitor closely" output unless all pressure and risk signals are low. ' +
         'Prefer coach-briefing language and include a short tactical sequence when useful (next over, then following over/backup). ' +
         'Every field must be a complete sentence or complete tactical clause. ' +
         'Do not output unfinished endings like "based on...", "instead of...", "if...", "because...", "while...", or "with...". ' +
@@ -965,12 +1240,14 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         constraints: {
           modeStrictness: teamModeInstruction,
           telemetryRequired: ['oversBowled', 'fatigueIndex', 'strainIndex'],
+          requiredOutputs: ['assessment', 'tradeoff', 'decision', 'nextAction', 'why', 'ifIgnored', 'coachNote'],
           baselineRequired:
             'When baseline exists, use sleepHours + recoveryMinutes + fatigueLimit to shape tactical reasoning without repeating every metric.',
           noImmediateRotationRule:
             'If oversBowled=0 and fatigueIndex<=4 and strainIndex<=2 and injury/no-ball risk are not HIGH, avoid immediate bowler rotation.',
         },
         baseline: baselineDirective.profile,
+        decisionInputs,
         input: safeInput,
         context: compactTacticalContext(safeInput),
       }),
@@ -984,7 +1261,7 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         fallbackDeployment: routing.fallbackDeployment,
         baseMessages,
         strictSystemMessage:
-          'Return ONLY valid JSON. No markdown. Required keys: nextAction, why, ifIgnored, coachNote. Optional key: swap {out,in,reason}. Keep text short. Include compatibility keys immediateAction/rationale if present.',
+          'Return ONLY valid JSON. No markdown. Required keys: assessment, tradeoff, decision, nextAction, why, ifIgnored, coachNote. Optional key: swap {out,in,reason}. Keep text short. TRADEOFF must be one sentence in "advantage, but risk" form. Include compatibility keys immediateAction/rationale/decisionRationale if present.',
         validate: isTacticalOutput,
         temperature: routing.temperature,
         maxTokens: routing.maxTokens,
@@ -1025,6 +1302,29 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         90
       );
     }
+    if (!parsed.assessment || parsed.assessment.trim().length < 20) {
+      parsed.assessment = truncateChars(
+        `${parsed.rationale || ''} Current decision uses live scoreboard and player-risk context.`.trim(),
+        160
+      );
+    }
+    if (!parsed.tradeoff || parsed.tradeoff.trim().length < 20) {
+      const scorePressure = String(decisionInputs.matchState.scoreboardPressure || 'MODERATE').toLowerCase();
+      const riskToken =
+        teamMode === 'BATTING'
+          ? String(decisionInputs.playerPhysicalRisk.dismissalRisk || 'MODERATE').toLowerCase()
+          : String(decisionInputs.playerPhysicalRisk.controlExecutionRisk || 'MODERATE').toLowerCase();
+      parsed.tradeoff = truncateChars(
+        `Tradeoff: ${scorePressure} scoreboard pressure must be balanced against ${riskToken} physical risk for the active player.`,
+        200
+      );
+    }
+    if (!parsed.decision || parsed.decision.trim().length < 10) {
+      parsed.decision = truncateChars(parsed.nextAction || parsed.immediateAction, 160) || parsed.immediateAction;
+    }
+    if (!parsed.decisionRationale || parsed.decisionRationale.trim().length < 16) {
+      parsed.decisionRationale = truncateChars(parsed.rationale, 170);
+    }
     if (!parsed.coachNote || !/baseline|sleep|recovery|fatigue ceiling|fatigue limit/i.test(parsed.coachNote)) {
       parsed.coachNote = truncateChars(
         `${baselineDirective.text} Use a one-over checkpoint, then reassess control quality before committing the following spell.`.trim(),
@@ -1042,6 +1342,18 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
       fallbacksUsed = [...new Set([...fallbacksUsed, 'guardrail:stable_continue'])];
     }
     parsed.nextAction = truncateChars(parsed.nextAction || parsed.immediateAction, 70) || parsed.immediateAction;
+    parsed.decision = truncateChars(parsed.decision || parsed.nextAction || parsed.immediateAction, 160) || parsed.immediateAction;
+    parsed.decisionRationale = truncateChars(parsed.decisionRationale || parsed.rationale, 170);
+    parsed.assessment = truncateChars(parsed.assessment || parsed.rationale, 160);
+    parsed.tradeoff = normalizeTradeoffSentence(
+      truncateChars(
+        parsed.tradeoff || 'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.',
+        200
+      ),
+      teamMode,
+      decisionInputs,
+      String(safeInput.telemetry.playerName || safeInput.players.bowler || 'the current player')
+    );
     parsed.why = dedupeTextList((parsed.why || [parsed.rationale]).map((entry) => truncateChars(entry, 90))).slice(0, 2);
     parsed.ifIgnored = truncateChars(parsed.ifIgnored || parsed.suggestedAdjustments?.[0] || 'Risk may increase if unchanged.', 90);
     parsed.coachNote = truncateChars(parsed.coachNote || `${baselineDirective.text} ${telemetryBasis}`, 110);

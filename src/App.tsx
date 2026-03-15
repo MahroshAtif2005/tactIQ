@@ -3091,6 +3091,51 @@ export default function App() {
       typeof matchState.target === 'number' && matchState.target > 0 && ballsRemaining > 0
         ? Math.max(0, (matchState.target - matchState.runs) / (ballsRemaining / 6))
         : currentRunRate;
+    const runRatePressureGap =
+      Number.isFinite(requiredRunRate) && Number.isFinite(currentRunRate)
+        ? Number((requiredRunRate - currentRunRate).toFixed(2))
+        : 0;
+    const recoveryToken = String(currentTelemetry.heartRateRecovery || '').trim().toUpperCase();
+    const normalizedRecoveryPenalty = recoveryToken === 'POOR' ? 0.2 : recoveryToken === 'MODERATE' ? 0.1 : 0.04;
+    const dismissalRiskScore = clamp(
+      (fatigue / 10) * 0.38 +
+        (strainIndex / 10) * 0.24 +
+        Math.max(0, runRatePressureGap) * 0.16 +
+        (injuryLabel === 'CRITICAL' || injuryLabel === 'HIGH'
+          ? 0.2
+          : injuryLabel === 'MEDIUM'
+            ? 0.1
+            : 0.03) +
+        normalizedRecoveryPenalty,
+      0,
+      1
+    );
+    const controlExecutionRiskScore = clamp(
+      (fatigue / 10) * 0.24 +
+        (strainIndex / 10) * 0.24 +
+        (noBallRiskLabel === 'HIGH' ? 0.26 : noBallRiskLabel === 'MEDIUM' ? 0.13 : 0.04) +
+        normalizedRecoveryPenalty +
+        Math.max(0, runRatePressureGap) * 0.14,
+      0,
+      1
+    );
+    const dismissalRiskEstimate =
+      focusRole === 'BATTER'
+        ? dismissalRiskScore >= 0.67
+          ? 'HIGH'
+          : dismissalRiskScore >= 0.36
+            ? 'MODERATE'
+            : 'LOW'
+        : undefined;
+    const controlExecutionRiskEstimate =
+      focusRole === 'BOWLER'
+        ? controlExecutionRiskScore >= 0.67
+          ? 'HIGH'
+          : controlExecutionRiskScore >= 0.36
+            ? 'MODERATE'
+            : 'LOW'
+        : undefined;
+    const ballsInOver = ballsBowled % 6;
     const batsmen = players.filter((p) => {
       if (p.role !== 'Batsman') return false;
       if (p.inRoster === false) return false;
@@ -3290,8 +3335,16 @@ export default function App() {
         defendingOrChasing,
         phaseOfPlay: normalizedPhase,
         scoreContext,
+        scoreRuns: matchState.runs,
+        wickets: matchState.wickets,
+        overs: Number(formatOverStr(matchState.ballsBowled)),
+        balls: ballsInOver,
         target: typeof matchState.target === 'number' ? matchState.target : undefined,
+        targetRuns: typeof matchState.target === 'number' ? matchState.target : undefined,
         wicketContext,
+        runRatePressure: runRatePressureGap,
+        dismissalRiskEstimate,
+        controlExecutionRiskEstimate,
         suggestedBenchOptions,
       },
       text,
@@ -3314,6 +3367,14 @@ export default function App() {
         substitutionRequired,
         dominantRiskDriver,
         intensity: matchContext.pitch || 'Medium',
+        runRatePressure: runRatePressureGap,
+        dismissalRiskEstimate,
+        controlExecutionRiskEstimate,
+        scoreRuns: matchState.runs,
+        wickets: matchState.wickets,
+        over: Number(formatOverStr(matchState.ballsBowled)),
+        ballsInOver,
+        targetRuns: typeof matchState.target === 'number' ? matchState.target : undefined,
       },
       telemetry: {
         playerId: currentTelemetry.playerId,
@@ -3372,7 +3433,13 @@ export default function App() {
         score: matchState.runs,
         scoreRuns: matchState.runs,
         wickets: matchState.wickets,
-        balls: ballsRemaining,
+        balls: ballsInOver,
+        ballsInOver,
+        runRatePressure: runRatePressureGap,
+        dismissalRiskEstimate,
+        controlExecutionRiskEstimate,
+        scoreboardPressure:
+          runRatePressureGap >= 1.2 ? 'HIGH' : runRatePressureGap >= 0.45 ? 'MODERATE' : 'LOW',
         ballsRemaining,
       },
       players: {
@@ -6204,9 +6271,15 @@ interface CoachAnalysisInputSnapshot {
   fatigueIndex: number;
   strainIndex: number;
   heartRateRecovery: string;
+  scoreRuns: number;
+  wickets: number;
+  ballsBowled: number;
+  totalOvers: number;
+  targetRuns: number;
   matchMode: string;
   phase: string;
   intensity: string;
+  weather: string;
   format: string;
 }
 
@@ -6227,9 +6300,15 @@ const normalizeAnalysisInputs = (
   fatigueIndex: normalizeAnalysisInputValue(snapshot.fatigueIndex, 0),
   strainIndex: normalizeAnalysisInputValue(snapshot.strainIndex, 0),
   heartRateRecovery: normalizeAnalysisInputToken(snapshot.heartRateRecovery, 'GOOD'),
+  scoreRuns: normalizeAnalysisInputValue(snapshot.scoreRuns, 0, 0),
+  wickets: normalizeAnalysisInputValue(snapshot.wickets, 0, 0),
+  ballsBowled: normalizeAnalysisInputValue(snapshot.ballsBowled, 0, 0),
+  totalOvers: normalizeAnalysisInputValue(snapshot.totalOvers, 20, 0),
+  targetRuns: normalizeAnalysisInputValue(snapshot.targetRuns, -1, 0),
   matchMode: normalizeAnalysisInputToken(snapshot.matchMode, 'BOWLING'),
   phase: normalizeAnalysisInputToken(snapshot.phase, 'MIDDLE'),
   intensity: normalizeAnalysisInputToken(snapshot.intensity, 'MEDIUM'),
+  weather: normalizeAnalysisInputToken(snapshot.weather, 'COOL'),
   format: normalizeAnalysisInputToken(snapshot.format, 'T20'),
 });
 
@@ -6652,6 +6731,7 @@ function Dashboard({
   } | null>(null);
   const lastValidPressureRef = useRef<{ playerId: string; value: number } | null>(null);
   const lastCapturedAnalysisBundleIdRef = useRef<string>('');
+  const pendingAnalysisSnapshotRef = useRef<CoachAnalysisInputSnapshot | null>(null);
   const previousSelectedPlayerIdRef = useRef<string>(String(activePlayer?.id || ''));
   const playerSwitchResetRef = useRef<boolean>(false);
 
@@ -6714,6 +6794,7 @@ function Dashboard({
       setAnalysisExecuted(false);
       setAnalysisStale(false);
       setAnalysisSnapshot(null);
+      pendingAnalysisSnapshotRef.current = null;
       setShowFullAnalysisInfo(false);
       setShowDismissAnalysisInfo(false);
       lastCapturedAnalysisBundleIdRef.current = String(analysisBundleId || '').trim();
@@ -6801,6 +6882,7 @@ function Dashboard({
     setAnalysisExecuted(false);
     setAnalysisStale(false);
     setAnalysisSnapshot(null);
+    pendingAnalysisSnapshotRef.current = null;
     lastCapturedAnalysisBundleIdRef.current = '';
     setCopilotSessionAnalysisId('');
     setCopilotVerifiedAnalysisId('');
@@ -6838,9 +6920,15 @@ function Dashboard({
         fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
         strainIndex: safeNum(strainIndex, currentTelemetry.strainIndex),
         heartRateRecovery: recoveryMode === 'manual' ? manualRecovery : activePlayer?.hrRecovery || 'Good',
+        scoreRuns: safeNum(matchState.runs, 0),
+        wickets: safeNum(matchState.wickets, 0),
+        ballsBowled: safeNum(matchState.ballsBowled, 0),
+        totalOvers: safeNum(matchState.totalOvers, 20),
+        targetRuns: typeof matchState.target === 'number' ? safeNum(matchState.target, -1) : -1,
         matchMode: matchContext.matchMode,
         phase: matchContext.phase,
         intensity: matchContext.pitch,
+        weather: matchContext.weather,
         format: matchContext.format,
       });
       return normalized;
@@ -6854,10 +6942,16 @@ function Dashboard({
       currentTelemetry.playerId,
       currentTelemetry.strainIndex,
       manualRecovery,
+      matchState.ballsBowled,
+      matchState.runs,
+      matchState.target,
+      matchState.totalOvers,
+      matchState.wickets,
       matchContext.format,
       matchContext.matchMode,
       matchContext.phase,
       matchContext.pitch,
+      matchContext.weather,
       recoveryMode,
       strainIndex,
     ]
@@ -6866,6 +6960,7 @@ function Dashboard({
   useEffect(() => {
     if (!fullAnalysisRunPending) return;
     if (playerSwitchResetRef.current) {
+      pendingAnalysisSnapshotRef.current = null;
       setFullAnalysisRunPending(false);
       return;
     }
@@ -6876,7 +6971,9 @@ function Dashboard({
           selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
         });
       }
-      const normalizedAnalysisSnapshot = normalizeAnalysisInputs(analysisInputSnapshot);
+      const normalizedAnalysisSnapshot = normalizeAnalysisInputs(
+        pendingAnalysisSnapshotRef.current || analysisInputSnapshot
+      );
       setFullAnalysisExecuted(true);
       setAnalysisExecuted(true);
       setAnalysisStale(false);
@@ -6884,9 +6981,13 @@ function Dashboard({
       setShowFullAnalysisInfo(false);
       setShowDismissAnalysisInfo(false);
       lastCapturedAnalysisBundleIdRef.current = String(analysisBundleId || '').trim();
+      pendingAnalysisSnapshotRef.current = null;
       if (import.meta.env.DEV) {
         console.log('[dashboard] analysis_snapshot_stored', normalizedAnalysisSnapshot);
       }
+    }
+    if (agentState !== 'thinking' && agentState !== 'done') {
+      pendingAnalysisSnapshotRef.current = null;
     }
     setFullAnalysisRunPending(false);
   }, [agentState, analysisBundleId, analysisInputSnapshot, fullAnalysisRunPending]);
@@ -6898,10 +6999,13 @@ function Dashboard({
     if (!completedBundleId) return;
     if (lastCapturedAnalysisBundleIdRef.current === completedBundleId) return;
     lastCapturedAnalysisBundleIdRef.current = completedBundleId;
-    const normalizedAnalysisSnapshot = normalizeAnalysisInputs(analysisInputSnapshot);
+    const normalizedAnalysisSnapshot = normalizeAnalysisInputs(
+      pendingAnalysisSnapshotRef.current || analysisInputSnapshot
+    );
     setAnalysisExecuted(true);
     setAnalysisStale(false);
     setAnalysisSnapshot(normalizedAnalysisSnapshot);
+    pendingAnalysisSnapshotRef.current = null;
     if (import.meta.env.DEV) {
       console.log('[dashboard] analysis_executed', {
         selectedPlayerId: analysisInputSnapshot.selectedPlayerId || null,
@@ -8245,6 +8349,9 @@ function Dashboard({
     : aiAnalysis?.severity === 'HIGH' || aiAnalysis?.severity === 'CRITICAL'
       ? 'Up'
       : 'Stable';
+  const isBattingNoTelemetry = (focusRole === 'BATTER' || teamMode === 'BATTING') && ballsFaced === 0;
+  const fatigueTrendDisplayLabel: 'Up' | 'Down' | 'Stable' | 'Baseline' =
+    isBattingNoTelemetry ? 'Baseline' : fatigueTrendLabel;
   const shortText = (value: unknown, fallback: string, maxChars = 110): string => {
     const normalized = String(value || '').replace(/\s+/g, ' ').trim();
     if (!normalized) return fallback;
@@ -8367,6 +8474,7 @@ function Dashboard({
       role: string;
       fatigueIndex: number;
       strainIndex: number;
+      ballsFaced: number;
       injuryRisk: 'LOW' | 'MED' | 'HIGH';
       noBallRisk: 'LOW' | 'MED' | 'HIGH';
       trend: 'Up' | 'Down' | 'Stable';
@@ -8376,10 +8484,25 @@ function Dashboard({
   ): {
     title: string;
     bullets: string[];
-    nextOverRiskLabel: 'Low' | 'Medium' | 'High';
+    nextOverRiskLabel: 'Low' | 'Medium' | 'High' | 'None';
   } => {
     const roleToken = String(inputTelemetry.role || '').toLowerCase();
     const isBowler = roleToken.includes('bowl') || roleToken.includes('spin') || roleToken.includes('fast');
+    const isBattingContext =
+      String(teamMode || '').toUpperCase() === 'BATTING' ||
+      (roleToken.includes('bat') && !isBowler);
+    const battingBallsFaced = Math.max(0, safeNum(inputTelemetry.ballsFaced, 0));
+    if (isBattingContext && battingBallsFaced === 0) {
+      return {
+        title: 'Batting workload has not started.',
+        bullets: [
+          'No batting workload recorded yet.',
+          'Player is currently at baseline readiness.',
+          'Fatigue evaluation will begin once batting workload starts.',
+        ],
+        nextOverRiskLabel: 'None',
+      };
+    }
     const highLoad = inputTelemetry.fatigueIndex >= 7 || inputTelemetry.strainIndex >= 4;
     const elevatedLoad = inputTelemetry.fatigueIndex >= 5.8 || inputTelemetry.strainIndex >= 2.8;
     const poorRecovery = Number.isFinite(Number(baseline.recoveryMinutes)) && Number(baseline.recoveryMinutes) < 35;
@@ -8389,8 +8512,13 @@ function Dashboard({
         : inputTelemetry.injuryRisk === 'MED' || inputTelemetry.noBallRisk === 'MED' || elevatedLoad
           ? 'Medium'
           : 'Low';
-    const title =
-      riskLabel === 'High'
+    const title = isBattingContext
+      ? riskLabel === 'High'
+        ? 'Batting workload trend is elevated.'
+        : riskLabel === 'Medium'
+          ? 'Batting workload trend is manageable.'
+          : 'Stable workload trend.'
+      : riskLabel === 'High'
         ? 'Control may dip next over'
         : riskLabel === 'Medium'
           ? 'Stable for now — watch late spell'
@@ -8414,10 +8542,25 @@ function Dashboard({
         : riskLabel === 'Medium'
           ? 'Trim the next spell segment, add a short reset, and keep the tactical plan conservative.'
           : 'Continue for one controlled over, apply a micro-reset, and reassess before extending.';
+    const battingReassessmentWindow =
+      riskLabel === 'High' ? '~4-6' : riskLabel === 'Medium' ? '~6-8' : '~8-10';
+    const battingBaselineLine =
+      riskLabel === 'High'
+        ? 'Batting workload is above baseline tolerance.'
+        : riskLabel === 'Medium'
+          ? 'Batting workload is approaching baseline tolerance.'
+          : 'Batting workload remains within baseline tolerance.';
+    const battingStabilityLine =
+      riskLabel === 'High'
+        ? 'Reaction stability is declining, and timing precision can drop quickly if exertion stays high.'
+        : 'Reaction stability is slightly declining as workload accumulates, and timing precision may begin dropping if exertion continues.';
+    const battingReassessmentLine = `Reassessment recommended in ${battingReassessmentWindow} balls if exertion continues.`;
     const recoveryNote = poorRecovery ? 'Recovery quality is limited, so avoid extending this spell aggressively.' : '';
     return {
       title,
-      bullets: dedupeBullets([happening, nextOverMeaning, action, recoveryNote], 3),
+      bullets: isBattingContext
+        ? dedupeBullets([battingBaselineLine, battingStabilityLine, battingReassessmentLine], 3)
+        : dedupeBullets([happening, nextOverMeaning, action, recoveryNote], 3),
       nextOverRiskLabel: riskLabel,
     };
   };
@@ -8507,6 +8650,7 @@ function Dashboard({
       role: String(activePlayer?.role || currentTelemetry.role || ''),
       fatigueIndex: safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex),
       strainIndex: clampedStrainIndex,
+      ballsFaced,
       injuryRisk: normalizeRiskBand(activePlayer?.injuryRisk || riskAnalysis?.injuryRisk),
       noBallRisk: normalizeRiskBand(activePlayer?.noBallRisk || riskAnalysis?.noBallRisk),
       trend: fatigueTrendLabel,
@@ -8584,7 +8728,13 @@ function Dashboard({
       | 'SHORTEN_SPELL'
       | 'KEEP_BOWLING_WITH_ADJUSTMENT'
       | 'MATCHUP_CHANGE'
-      | 'RECOVERY_ONLY';
+      | 'RECOVERY_ONLY'
+      | 'KEEP_BATTING'
+      | 'KEEP_BATTING_WITH_ADJUSTMENT'
+      | 'ROTATE_STRIKE'
+      | 'ATTACK_SPIN'
+      | 'STABILIZE_INNINGS'
+      | 'ROLE_CONTEXT_MISMATCH';
     substitutionRequired: boolean;
     primaryPlayerName: string;
     recommendedReplacement: string;
@@ -8690,7 +8840,7 @@ function Dashboard({
       activePlayer?.name || telemetry.playerName || 'Current player'
     ) || 'Current player';
     const activeName = isInitialOnlyName(unresolvedActiveName)
-      ? normalizeRecommendationText(activePlayer?.name || '') || 'Current bowler'
+      ? normalizeRecommendationText(activePlayer?.name || '') || 'Current player'
       : unresolvedActiveName;
     const activeRoleTag = resolvePlayerTypeTag(activePlayer?.role || 'Bowler');
     const replacementPool = roster.filter(
@@ -8711,6 +8861,232 @@ function Dashboard({
       if (token === 'CRITICAL') return 'CRITICAL';
       return 'UNKNOWN';
     };
+    const fatigue = Math.max(0, safeNum(telemetry.fatigueIndex, 0));
+    const strain = Math.max(0, safeNum(telemetry.strainIndex, 0));
+    const oversBowled = Math.max(0, safeNum(telemetry.oversBowled, safeNum(activePlayer?.overs, 0)));
+    const maxOvers = Math.max(1, safeNum(activePlayer?.maxOvers, getMaxOvers(inputMatchContext.format)));
+    const oversQuotaReached = oversBowled >= maxOvers;
+    const injuryRiskToken = String(telemetry.injuryRisk || 'LOW').toUpperCase();
+    const noBallRiskToken = String(telemetry.noBallRisk || 'LOW').toUpperCase();
+    const activeRoleToken = roleToken(activePlayer?.role || currentTelemetry.role || '');
+    const activeIsAllRounder = activeRoleToken.includes('all-rounder') || activeRoleToken.includes('all rounder');
+    const activeIsBatter = activeRoleToken.includes('bat');
+    const activeIsBowler =
+      activeRoleToken.includes('bowl') ||
+      activeRoleToken.includes('spin') ||
+      activeRoleToken.includes('fast') ||
+      activeRoleToken.includes('pace') ||
+      activeRoleToken.includes('seam');
+    const isBattingContext = modeLabel === 'BATTING' && (activeIsBatter || activeIsAllRounder);
+    const isBowlingContext = modeLabel === 'BOWLING' && (activeIsBowler || activeIsAllRounder);
+    const buildBattingContinuationInsights = (): {
+      dismissalRisk: 'LOW' | 'MODERATE' | 'HIGH';
+      dismissalRiskReason: string;
+      safeContinuationText: string;
+      thresholdBreachText: string;
+      baselineComparisonText: string;
+      decisionMode: 'KEEP_BATTING' | 'KEEP_BATTING_WITH_ADJUSTMENT' | 'STABILIZE_INNINGS';
+      priority: 'Stable' | 'Monitor' | 'Immediate';
+      availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK';
+      dominantRiskDriver: 'fatigue' | 'recovery' | 'pressure_phase' | 'mixed';
+      confidenceScore: number;
+    } => {
+      const fatigueLimit = Math.max(1, safeNum(baseline.fatigueLimit, safeNum(activePlayer?.baselineFatigue, 6)));
+      const baselineToday = clamp(safeNum(baseline.baselineToday, fatigueLimit), 0, 10);
+      const recoveryToken = String(activePlayer?.hrRecovery || 'GOOD').trim().toUpperCase();
+      const normalizedInjuryRisk = normalizeRiskToken(injuryRiskToken);
+      const chasePressureGap =
+        targetRuns != null &&
+        Number.isFinite(requiredRunRate) &&
+        Number.isFinite(currentRunRate)
+          ? Math.max(0, requiredRunRate - currentRunRate)
+          : 0;
+      const fatigueDelta = fatigue - fatigueLimit;
+      const fatigueDriftToday = fatigue - baselineToday;
+      const fatiguePenalty = clamp(Math.max(0, fatigueDelta * 0.09 + fatigueDriftToday * 0.06), 0, 0.34);
+      const strainPenalty = clamp((strain / 10) * 0.26, 0, 0.26);
+      const pressurePenalty = clamp((chasePressureGap / 2.6) * 0.2, 0, 0.2);
+      const wicketPenalty = clamp((Math.max(0, safeNum(matchState.wickets, 0) - 3) / 7) * 0.16, 0, 0.16);
+      const recoveryPenalty = recoveryToken === 'POOR' ? 0.2 : recoveryToken === 'MODERATE' ? 0.11 : 0.03;
+      const injuryPenalty =
+        normalizedInjuryRisk === 'CRITICAL' ? 0.25 : normalizedInjuryRisk === 'HIGH' ? 0.18 : normalizedInjuryRisk === 'MEDIUM' ? 0.08 : 0;
+      const dismissalScore = clamp(
+        fatiguePenalty + strainPenalty + pressurePenalty + wicketPenalty + recoveryPenalty + injuryPenalty,
+        0,
+        1
+      );
+      const dismissalRisk: 'LOW' | 'MODERATE' | 'HIGH' =
+        dismissalScore >= 0.62 ? 'HIGH' : dismissalScore >= 0.36 ? 'MODERATE' : 'LOW';
+      const reactionDrift = clamp((strain / 10) * 0.58 + Math.max(0, fatigueDriftToday / 3.2) * 0.42, 0, 1);
+      const reactionDriftPct = Math.round(reactionDrift * 100);
+      const recoveryDescriptor =
+        recoveryToken === 'POOR'
+          ? 'recovery profile'
+          : recoveryToken === 'MODERATE'
+            ? 'recovery trend'
+            : 'fatigue drift';
+      const dismissalRiskReason = `Dismissal risk is ${dismissalRisk} due to elevated ${recoveryDescriptor} and a ${reactionDriftPct}% reaction-stability drift indicator.`;
+      const meaningfulThreshold = clamp(fatigueLimit + 0.9, 0, 10);
+      const perBallFatigueDrift = clamp(
+        0.045 +
+          strain * 0.008 +
+          (recoveryToken === 'POOR' ? 0.028 : recoveryToken === 'MODERATE' ? 0.014 : 0.007) +
+          pressurePenalty * 0.06,
+        0.04,
+        0.16
+      );
+      const rawBallsToBreach =
+        fatigue >= meaningfulThreshold ? 0 : Math.floor((meaningfulThreshold - fatigue) / Math.max(0.01, perBallFatigueDrift));
+      const estimatedBallsToBreach = clamp(rawBallsToBreach, 0, Math.max(0, ballsRemainingInInnings));
+      const safeWindowMin = Math.max(1, estimatedBallsToBreach - 2);
+      const safeWindowMax = Math.max(safeWindowMin, Math.min(ballsRemainingInInnings, estimatedBallsToBreach + 2));
+      const safeContinuationText =
+        estimatedBallsToBreach <= 2
+          ? `Safe continuation window is narrowing: ~${estimatedBallsToBreach} more balls at current exertion.`
+          : safeWindowMin === safeWindowMax
+            ? `Projected safe continuation window: ~${safeWindowMin} more balls if intensity remains stable.`
+            : `Projected safe continuation window: ${safeWindowMin}-${safeWindowMax} balls if intensity remains stable.`;
+      const thresholdBreachText =
+        estimatedBallsToBreach <= 2
+          ? `Estimated balls before fatigue exceeds baseline threshold: ${estimatedBallsToBreach}.`
+          : safeWindowMin === safeWindowMax
+            ? `Projected threshold breach in ~${safeWindowMin} balls at current exertion.`
+            : `Projected threshold breach in ${safeWindowMin}-${safeWindowMax} balls at current exertion.`;
+      const fatigueDeviationPercent = Math.round(((fatigue - fatigueLimit) / Math.max(1, fatigueLimit)) * 100);
+      const baselineComparisonText =
+        fatigueDeviationPercent >= 6
+          ? `Baseline comparison: current batting load is ${fatigueDeviationPercent}% above expected threshold.`
+          : fatigueDeviationPercent <= -6
+            ? `Baseline comparison: current batting load is ${Math.abs(fatigueDeviationPercent)}% below expected threshold.`
+            : 'Baseline comparison: current batting load is within expected threshold range.';
+      const dominantRiskDriver: 'fatigue' | 'recovery' | 'pressure_phase' | 'mixed' =
+        recoveryToken === 'POOR' ? 'recovery' : chasePressureGap > 0.9 ? 'pressure_phase' : dismissalRisk === 'LOW' ? 'mixed' : 'fatigue';
+      const availabilityStatus: 'AVAILABLE' | 'LIMITED' | 'TACTICAL_RISK' =
+        dismissalRisk === 'HIGH' ? 'TACTICAL_RISK' : dismissalRisk === 'MODERATE' ? 'LIMITED' : 'AVAILABLE';
+      const decisionMode: 'KEEP_BATTING' | 'KEEP_BATTING_WITH_ADJUSTMENT' | 'STABILIZE_INNINGS' =
+        dismissalRisk === 'HIGH' ? 'STABILIZE_INNINGS' : dismissalRisk === 'MODERATE' ? 'KEEP_BATTING_WITH_ADJUSTMENT' : 'KEEP_BATTING';
+      const priority: 'Stable' | 'Monitor' | 'Immediate' =
+        dismissalRisk === 'HIGH' ? 'Immediate' : dismissalRisk === 'MODERATE' ? 'Monitor' : 'Stable';
+      const confidenceScore = dismissalRisk === 'HIGH' ? 0.81 : dismissalRisk === 'MODERATE' ? 0.72 : 0.64;
+      return {
+        dismissalRisk,
+        dismissalRiskReason,
+        safeContinuationText,
+        thresholdBreachText,
+        baselineComparisonText,
+        decisionMode,
+        priority,
+        availabilityStatus,
+        dominantRiskDriver,
+        confidenceScore,
+      };
+    };
+    if (!isBattingContext && !isBowlingContext) {
+      const neutralMessage = 'Awaiting role-consistent tactical recommendation';
+      return {
+        matchSituation: [matchSituationLine, scoreLine] as [string, string],
+        assessment: [
+          'Selected player role is not aligned with the current match state.',
+          neutralMessage,
+        ] as [string, string],
+        recommendedMove: neutralMessage,
+        whyThisIsSmart: dedupeBullets(
+          [
+            'It prevents incorrect tactical actions from being shown for the active role.',
+            'Switching to a role-consistent player or match state restores full tactical guidance.',
+          ],
+          3
+        ),
+        ifYouIgnore: 'If ignored, tactical guidance may not match the current player context.',
+        confidence: 'Moderate',
+        priority: 'Monitor',
+        availabilityStatus: 'TACTICAL_RISK',
+        dominantRiskDriver: 'mixed',
+        decisionMode: 'ROLE_CONTEXT_MISMATCH',
+        substitutionRequired: false,
+        primaryPlayerName: activeName,
+        recommendedReplacement: activeName,
+        swap: {
+          out: activeName,
+          in: activeName,
+          reason: neutralMessage,
+        },
+        suggestedBenchOptions: [],
+      };
+    }
+    if (isBattingContext) {
+      const battingBallsFaced = Math.max(0, safeNum(activePlayer?.balls, 0));
+      const batterIsOut = activeDismissalStatus === 'OUT';
+      if (batterIsOut || battingBallsFaced === 0) {
+        const noTelemetryAssessment = batterIsOut
+          ? 'Batting analysis unavailable. Player has already been dismissed. Tactical evaluation will apply to the next active batter.'
+          : 'No batting telemetry yet. Player has not faced a delivery in this innings.';
+        const dismissalRiskLine = batterIsOut
+          ? 'Dismissal risk: N/A - player already dismissed.'
+          : 'Dismissal risk: N/A - insufficient batting data.';
+        const stableSwapName = isInitialOnlyName(activeName) ? 'Current player' : activeName;
+        return {
+          matchSituation: [matchSituationLine, scoreLine] as [string, string],
+          assessment: [noTelemetryAssessment, dismissalRiskLine] as [string, string?],
+          recommendedMove: noTelemetryAssessment,
+          whyThisIsSmart: dedupeBullets(
+            [
+              batterIsOut
+                ? 'Dismissed batters are excluded from live continuity projection until the next active batter is selected.'
+                : 'Batting continuity projections start after the player records live ball-by-ball telemetry.',
+            ],
+            3
+          ),
+          ifYouIgnore: noTelemetryAssessment,
+          confidence: 'Low',
+          priority: 'Monitor',
+          availabilityStatus: 'AVAILABLE',
+          dominantRiskDriver: 'mixed',
+          decisionMode: 'KEEP_BATTING',
+          substitutionRequired: false,
+          primaryPlayerName: activeName,
+          recommendedReplacement: 'No recommendation available.',
+          swap: {
+            out: stableSwapName,
+            in: stableSwapName,
+            reason: noTelemetryAssessment,
+          },
+          suggestedBenchOptions: [],
+        };
+      }
+      const battingInsights = buildBattingContinuationInsights();
+      const stableSwapName = isInitialOnlyName(activeName) ? 'Current player' : activeName;
+      return {
+        matchSituation: [matchSituationLine, scoreLine] as [string, string],
+        assessment: [
+          battingInsights.dismissalRiskReason,
+          battingInsights.safeContinuationText,
+        ] as [string, string],
+        recommendedMove: battingInsights.thresholdBreachText,
+        whyThisIsSmart: dedupeBullets(
+          [
+            'It frames batting continuity as probabilistic risk support instead of deterministic instructions.',
+            battingInsights.baselineComparisonText,
+          ],
+          3
+        ),
+        ifYouIgnore: 'If ignored, fatigue drift can tighten the continuation window and increase dismissal exposure in this phase.',
+        confidence: toConfidenceLabel(battingInsights.confidenceScore),
+        priority: battingInsights.priority,
+        availabilityStatus: battingInsights.availabilityStatus,
+        dominantRiskDriver: battingInsights.dominantRiskDriver,
+        decisionMode: battingInsights.decisionMode,
+        substitutionRequired: false,
+        primaryPlayerName: activeName,
+        recommendedReplacement: 'Not applicable while batter is active',
+        swap: {
+          out: stableSwapName,
+          in: stableSwapName,
+          reason: battingInsights.baselineComparisonText,
+        },
+        suggestedBenchOptions: [],
+      };
+    }
     const scoreBowlingCandidate = (player: Player) => {
       const fatigueValue = clamp(safeNum(player.fatigue, 5), 0, 10);
       const strainValue = clamp(safeNum(player.strainIndex, 3), 0, 10);
@@ -8790,11 +9166,6 @@ function Dashboard({
         .map((entry) => resolveRosterName(entry.player.id || entry.player.name, entry.player.name)),
       3
     );
-    const fatigue = Math.max(0, safeNum(telemetry.fatigueIndex, 0));
-    const strain = Math.max(0, safeNum(telemetry.strainIndex, 0));
-    const oversBowled = Math.max(0, safeNum(telemetry.oversBowled, safeNum(activePlayer?.overs, 0)));
-    const maxOvers = Math.max(1, safeNum(activePlayer?.maxOvers, getMaxOvers(inputMatchContext.format)));
-    const oversQuotaReached = oversBowled >= maxOvers;
     const suggestedBenchOptions = rankedBowlingCandidates.slice(0, 3).map((entry) => ({
       name: resolveRosterName(entry.player.id || entry.player.name, entry.player.name) || entry.player.name,
       roleTag: entry.roleTag,
@@ -8845,8 +9216,6 @@ function Dashboard({
         suggestedBenchOptions,
       };
     }
-    const injuryRiskToken = String(telemetry.injuryRisk || 'LOW').toUpperCase();
-    const noBallRiskToken = String(telemetry.noBallRisk || 'LOW').toUpperCase();
     const elevatedControlRisk = noBallRiskToken === 'HIGH' || noBallRiskToken === 'MED' || noBallRiskToken === 'MEDIUM';
     const elevatedInjuryRisk = injuryRiskToken === 'HIGH' || injuryRiskToken === 'CRITICAL' || injuryRiskToken === 'MED' || injuryRiskToken === 'MEDIUM';
     const safeContinue = oversBowled === 0 || (fatigue <= 4 && injuryRiskToken === 'LOW');
@@ -9301,8 +9670,12 @@ function Dashboard({
     2,
     'Control can dip if workload pressure is not managed early in the phase.'
   );
+  const tacticalAiAssessmentLine = finalizeCoachSentence(tacticalAnalysis?.assessment, '', 160);
   const tacticalAssessmentDisplayLines = (() => {
-    if (runMode !== 'auto') return tacticalAssessmentLines;
+    const baseLines = tacticalAiAssessmentLine
+      ? [tacticalAiAssessmentLine, ...tacticalAssessmentLines.filter((line) => line.toLowerCase() !== tacticalAiAssessmentLine.toLowerCase())]
+      : tacticalAssessmentLines;
+    if (runMode !== 'auto') return baseLines.slice(0, 2);
     const routingReason = finalizeCoachSentence(
       selectedAgentRoutingMeta.primaryReason,
       selectedAgentRoutingMeta.dominantDriver === 'risk'
@@ -9312,28 +9685,44 @@ function Dashboard({
           : 'Tactical continuity is the dominant route driver in this run.',
       150
     );
-    if (!routingReason) return tacticalAssessmentLines;
-    const merged = [routingReason, ...tacticalAssessmentLines.filter((line) => line.toLowerCase() !== routingReason.toLowerCase())];
+    if (!routingReason) return baseLines.slice(0, 2);
+    const merged = [routingReason, ...baseLines.filter((line) => line.toLowerCase() !== routingReason.toLowerCase())];
     return merged.slice(0, 2);
   })();
   const tacticalWhyLines = toCleanTacticalLines(
-    tacticalRecommendation.whyThisIsSmart,
+    [
+      ...(Array.isArray(tacticalAnalysis?.why) ? tacticalAnalysis.why : []),
+      tacticalAnalysis?.rationale,
+      ...tacticalRecommendation.whyThisIsSmart,
+    ],
     3,
     'This move protects control and reduces the chance of workload escalation.'
   );
+  const isBattingTacticalContext = focusRole === 'BATTER' || teamMode === 'BATTING';
+  const tacticalAiDecision = finalizeCoachSentence(
+    tacticalAnalysis?.decision || tacticalAnalysis?.nextAction,
+    '',
+    170
+  );
   const tacticalRecommendedMove = finalizeCoachSentence(
-    tacticalRecommendation.recommendedMove,
-    'Bring in the top-ranked fresh option for the next over.',
+    tacticalAiDecision || tacticalRecommendation.recommendedMove,
+    isBattingTacticalContext
+      ? 'Projected threshold-breach estimate unavailable; continue monitoring batting load versus baseline.'
+      : 'Bring in the top-ranked fresh option for the next over.',
     160
   );
   const tacticalSwapReason = finalizeCoachSentence(
-    tacticalRecommendation.swap.reason,
-    'Next over: rotate to the recommended bowler and reassess immediately after.',
+    tacticalAnalysis?.decisionRationale || tacticalRecommendation.swap.reason,
+    isBattingTacticalContext
+      ? 'Baseline comparison is currently limited; reassess batting continuation signals at over end.'
+      : 'Next over: rotate to the recommended bowler and reassess immediately after.',
     160
   );
   const tacticalIfIgnored = finalizeCoachSentence(
     tacticalRecommendation.ifYouIgnore,
-    'Continuing the current spell may increase fatigue-related performance drop.',
+    isBattingTacticalContext
+      ? 'Ignoring this adjustment may increase pressure and dismissal risk in the current phase.'
+      : 'Continuing the current spell may increase fatigue-related performance drop.',
     160
   );
   const tacticalPriority: 'Stable' | 'Monitor' | 'Immediate' =
@@ -9366,22 +9755,159 @@ function Dashboard({
     | 'SHORTEN_SPELL'
     | 'KEEP_BOWLING_WITH_ADJUSTMENT'
     | 'MATCHUP_CHANGE'
-    | 'RECOVERY_ONLY' = tacticalRecommendation.decisionMode || 'KEEP_BOWLING_WITH_ADJUSTMENT';
-  const tacticalRecommendedReplacement = finalizeCoachSentence(
-    tacticalRecommendation.recommendedReplacement,
-    tacticalRecommendation.swap?.in || 'No eligible replacement',
-    120
-  );
+    | 'RECOVERY_ONLY'
+    | 'KEEP_BATTING'
+    | 'KEEP_BATTING_WITH_ADJUSTMENT'
+    | 'ROTATE_STRIKE'
+    | 'ATTACK_SPIN'
+    | 'STABILIZE_INNINGS'
+    | 'ROLE_CONTEXT_MISMATCH' =
+      tacticalRecommendation.decisionMode || (focusRole === 'BATTER' ? 'KEEP_BATTING_WITH_ADJUSTMENT' : 'KEEP_BOWLING_WITH_ADJUSTMENT');
+  const battingNextBatterInsight = isBattingTacticalContext
+    ? (() => {
+        const roleToken = (value: unknown): string => String(value || '').trim().toLowerCase();
+        const activeKey = baselineKey(activePlayer?.id || activePlayer?.name || currentTelemetry.playerId || currentTelemetry.playerName);
+        const phaseToken = String(matchContext.phase || '')
+          .trim()
+          .toLowerCase();
+        const pressureGap =
+          Number.isFinite(requiredRunRate) && Number.isFinite(currentRunRate)
+            ? Math.max(0, Number(requiredRunRate) - Number(currentRunRate))
+            : 0;
+        const candidates = players.filter((player) => {
+          const playerKey = baselineKey(player.id || player.name);
+          const role = roleToken(player.role);
+          const battingRole = role.includes('bat') || role.includes('all-round');
+          return (
+            battingRole &&
+            player.inRoster !== false &&
+            !player.isSub &&
+            !player.isUnfit &&
+            !player.isInjured &&
+            playerKey !== activeKey
+          );
+        });
+        if (candidates.length === 0) return null;
+        const ranked = [...candidates]
+          .map((player) => {
+            const fatigueValue = clamp(safeNum(player.fatigue, 5), 0, 10);
+            const strainValue = clamp(safeNum(player.strainIndex, 3), 0, 10);
+            const powerValue = clamp(safeNum(player.power, 6), 0, 10);
+            const controlValue = clamp(safeNum(player.controlBaseline, 72), 0, 100);
+            const recoveryValue = clamp(safeNum(player.recoveryTime, 45), 0, 120);
+            const baselineFatigue = Math.max(1, safeNum(player.baselineFatigue, 6));
+            const fatigueHeadroom = clamp((baselineFatigue - fatigueValue) / baselineFatigue, -1, 1);
+            const role = roleToken(player.role);
+            const accelerationBoost =
+              phaseToken.includes('death') || pressureGap >= 0.8
+                ? powerValue * 0.95
+                : phaseToken.includes('middle')
+                  ? powerValue * 0.62
+                  : controlValue * 0.14;
+            const score =
+              (10 - fatigueValue) * 2.3 +
+              (10 - strainValue) * 1.6 +
+              fatigueHeadroom * 4 +
+              controlValue * 0.05 +
+              recoveryValue * 0.03 +
+              accelerationBoost +
+              (role.includes('all-round') ? 0.8 : 0);
+            return { player, score, powerValue, fatigueHeadroom };
+          })
+          .sort((a, b) => (b.score !== a.score ? b.score - a.score : a.player.name.localeCompare(b.player.name)));
+        const top = ranked[0];
+        if (!top) return null;
+        const nextBatterName =
+          resolveRosterName(top.player.id || top.player.name, top.player.name) || normalizeRecommendationText(top.player.name) || '';
+        if (!nextBatterName) return null;
+        const phaseReason = phaseToken.includes('death')
+          ? 'death-overs acceleration'
+          : phaseToken.includes('middle')
+            ? 'middle-overs acceleration'
+            : 'powerplay stability';
+        const pressureReason = pressureGap >= 0.8 ? 'current run-rate pressure' : 'current run-rate demand';
+        const headroomReason = top.fatigueHeadroom >= 0 ? 'better fatigue headroom' : 'manageable workload profile';
+        const reason = `Best matchup for this phase with strong ${phaseReason}, ${headroomReason}, and support for ${pressureReason}.`;
+        return { name: nextBatterName, reason };
+      })()
+    : null;
+  const tacticalRecommendedReplacement = isBattingTacticalContext
+    ? battingNextBatterInsight?.name || 'No recommendation available.'
+    : finalizeCoachSentence(
+        tacticalRecommendation.recommendedReplacement,
+        tacticalRecommendation.swap?.in || 'No eligible replacement',
+        120
+      );
+  const tacticalReplacementReason = isBattingTacticalContext ? battingNextBatterInsight?.reason || '' : '';
+  const tacticalReplacementLabel = isBattingTacticalContext ? 'Next Batter If Wicket Falls' : 'Recommended Replacement';
   const tacticalNotFitToContinue = tacticalAvailabilityStatus === 'UNAVAILABLE';
   const tacticalSuggestedBenchOptions = Array.isArray(tacticalRecommendation.suggestedBenchOptions)
     ? tacticalRecommendation.suggestedBenchOptions.slice(0, 3)
     : [];
   const tacticalDecisionLabel = tacticalDominantDriver === 'overs_quota_reached'
     ? 'Select replacement bowler'
-    : tacticalDecisionMode.replace(/_/g, ' ');
+    : tacticalDecisionMode === 'ROLE_CONTEXT_MISMATCH'
+      ? 'Awaiting role-consistent tactical recommendation'
+      : tacticalDecisionMode.replace(/_/g, ' ');
   const tacticalDominantDriverLabel = tacticalDominantDriver === 'overs_quota_reached'
     ? 'Overs quota reached'
     : tacticalDominantDriver.replace(/_/g, ' ');
+  const tacticalTradeoffLine = (() => {
+    const aiTradeoff = finalizeCoachSentence(tacticalAnalysis?.tradeoff, '', 200);
+    if (aiTradeoff) return aiTradeoff;
+    const fallback = 'Tradeoff: decision primarily guided by current match phase and baseline performance signals.';
+    const phaseToken = String(matchContext.phase || '').trim().toLowerCase();
+    const phaseContext = phaseToken ? `${phaseToken} phase` : 'current phase';
+    const fatigueValue = safeNum(activePlayer?.fatigue, currentTelemetry.fatigueIndex);
+    const fatigueBaseline = safeNum(activePlayer?.baselineFatigue, Number.NaN);
+    const hasBaseline = Number.isFinite(fatigueBaseline) && fatigueBaseline > 0;
+    const fatigueDelta = hasBaseline ? fatigueValue - fatigueBaseline : Number.NaN;
+    const runRateGap =
+      Number.isFinite(requiredRunRate) && Number.isFinite(currentRunRate)
+        ? Number(requiredRunRate) - Number(currentRunRate)
+        : Number.NaN;
+    const chasePressureHigh = Number.isFinite(runRateGap) && runRateGap > 0.8;
+    if (!hasBaseline && !Number.isFinite(runRateGap)) return fallback;
+
+    if (isBattingTacticalContext) {
+      if (activeDismissalStatus === 'OUT' || ballsFaced === 0) return fallback;
+      if (tacticalPriority === 'Immediate' || tacticalAvailabilityStatus === 'TACTICAL_RISK') {
+        return finalizeCoachSentence(
+          `Tradeoff: fatigue drift is challenging batting continuity, but in the ${phaseContext} exposing a new batter under ${chasePressureHigh ? 'high' : 'current'} run-rate pressure may carry greater dismissal risk.`,
+          fallback,
+          200
+        );
+      }
+      if (chasePressureHigh) {
+        return finalizeCoachSentence(
+          `Tradeoff: acceleration is needed in the ${phaseContext}, but wicket context still favors keeping the current batter while fatigue remains near baseline limits.`,
+          fallback,
+          200
+        );
+      }
+      return finalizeCoachSentence(
+        `Tradeoff: reaction stability is drifting mildly, yet retaining current batting continuity in the ${phaseContext} offers better value than forcing a change before baseline limits are approached.`,
+        fallback,
+        200
+      );
+    }
+
+    if (tacticalPriority === 'Immediate' || tacticalDominantDriver === 'fatigue' || tacticalDominantDriver === 'recovery') {
+      return finalizeCoachSentence(
+        'Tradeoff: fatigue and control drift now outweigh matchup upside, so rotation is the safer choice for maintaining execution quality.',
+        fallback,
+        200
+      );
+    }
+    if (phaseToken.includes('death') && tacticalPriority !== 'Immediate') {
+      return finalizeCoachSentence(
+        'Tradeoff: fatigue risk is rising, but death-phase leverage and baseline control still justify one controlled continuation.',
+        fallback,
+        200
+      );
+    }
+    return fallback;
+  })();
   const copilotTacticalRecommendationState = useMemo(() => {
     const outgoing = String(tacticalRecommendation.swap?.out || activePlayer?.name || currentTelemetry.playerName || '').trim();
     const incoming = String(tacticalRecommendation.swap?.in || '').trim();
@@ -9392,6 +9918,7 @@ function Dashboard({
       recommendedMove: tacticalRecommendedMove,
       tacticalPlan: tacticalSwapReason,
       assessment: tacticalAssessmentDisplayLines.join(' '),
+      tradeoff: tacticalTradeoffLine,
       whyThisIsSmart: tacticalWhyLines.join(' '),
       riskIfIgnored: tacticalIfIgnored,
       confidence: tacticalRecommendation.confidence,
@@ -9433,6 +9960,7 @@ function Dashboard({
     tacticalRecommendation.swap?.out,
     tacticalRecommendedMove,
     tacticalSwapReason,
+    tacticalTradeoffLine,
     tacticalWhyLines,
   ]);
   const tacticalPriorityBadgeClass =
@@ -10099,6 +10627,10 @@ function Dashboard({
       playerSwitchResetRef.current = false;
       const resolvedMode = modeOverride || teamMode;
       const resolvedFocusRole: 'BOWLER' | 'BATTER' = resolvedMode === 'BATTING' ? 'BATTER' : 'BOWLER';
+      pendingAnalysisSnapshotRef.current = normalizeAnalysisInputs({
+        ...analysisInputSnapshot,
+        matchMode: resolvedMode,
+      });
       setShowCoachInsights(true);
       primeCoachAutoScroll();
       return runAgent('auto', 'button_click', {
@@ -10107,7 +10639,7 @@ function Dashboard({
         strainIndex: clampedStrainIndex,
       });
     },
-    [clampedStrainIndex, primeCoachAutoScroll, runAgent, teamMode]
+    [analysisInputSnapshot, clampedStrainIndex, primeCoachAutoScroll, runAgent, teamMode]
   );
 
   const eligibleReplacementBatters = useMemo(
@@ -10200,6 +10732,10 @@ function Dashboard({
       console.log(`[${logPrefix}] falling back to full analysis`);
     }
 
+    pendingAnalysisSnapshotRef.current = normalizeAnalysisInputs({
+      ...analysisInputSnapshot,
+      matchMode: mode,
+    });
     const fullResult = await runAgent('full', 'button_click', {
       teamMode: mode,
       focusRole: mode === 'BATTING' ? 'BATTER' : 'BOWLER',
@@ -10213,7 +10749,7 @@ function Dashboard({
     }
 
     return { recommendation: null, raw: fullResult?.response || routeResult?.response };
-  }, [activePlayer?.id, clampedStrainIndex, players, runAgent, runCoachAgentAuto]);
+  }, [activePlayer?.id, analysisInputSnapshot, clampedStrainIndex, players, runAgent, runCoachAgentAuto]);
 
   const closeRotateBowlerConfirm = useCallback(() => {
     setShowRotateBowlerConfirm(false);
@@ -10468,6 +11004,10 @@ function Dashboard({
     const execute = (modeOverride: TeamMode) => {
       playerSwitchResetRef.current = false;
       const resolvedFocusRole: 'BOWLER' | 'BATTER' = modeOverride === 'BATTING' ? 'BATTER' : 'BOWLER';
+      pendingAnalysisSnapshotRef.current = normalizeAnalysisInputs({
+        ...analysisInputSnapshot,
+        matchMode: modeOverride,
+      });
       setShowCoachInsights(true);
       setShowFullAnalysisInfo(false);
       setShowDismissAnalysisInfo(false);
@@ -10486,7 +11026,7 @@ function Dashboard({
       sourcePanel,
       runFn: () => execute(requiredMode),
     });
-  }, [activePlayer?.id, agentState, clampedStrainIndex, currentTelemetry.playerId, focusRole, guardModeAndRun, primeCoachAutoScroll, runAgent, teamMode]);
+  }, [activePlayer?.id, agentState, analysisInputSnapshot, clampedStrainIndex, currentTelemetry.playerId, focusRole, guardModeAndRun, primeCoachAutoScroll, runAgent, teamMode]);
 
   // Auto-follow new analysis output while user is near the bottom.
   useEffect(() => {
@@ -11778,7 +12318,7 @@ function Dashboard({
                                   <div className="flex items-center justify-between mb-2">
                                     <p className="text-xs font-bold text-slate-200">Fatigue Analysis</p>
                                     <span className="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800">
-                                      Trend: {fatigueTrendLabel}
+                                      Trend: {fatigueTrendDisplayLabel}
                                     </span>
                                   </div>
                                   <p className="text-xs text-slate-300 leading-relaxed">
@@ -11792,7 +12332,9 @@ function Dashboard({
                                     </ul>
                                   )}
                                   <p className="text-[11px] text-slate-400 mt-3 leading-relaxed">
-                                    Next over risk: {fatigueCoachCopy.nextOverRiskLabel}
+                                    {isBattingTacticalContext
+                                      ? `Projected fatigue risk: ${fatigueCoachCopy.nextOverRiskLabel}`
+                                      : `Next over risk: ${fatigueCoachCopy.nextOverRiskLabel}`}
                                   </p>
                                 </div>
                               )}
@@ -11875,8 +12417,13 @@ function Dashboard({
                                         <p className="text-xs text-slate-100 mt-1">{tacticalDecisionLabel}</p>
                                       </div>
                                       <div className="rounded-lg border border-slate-700 bg-slate-900/30 px-2.5 py-2">
-                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Recommended Replacement</p>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">{tacticalReplacementLabel}</p>
                                         <p className="text-xs text-slate-100 mt-1">{tacticalRecommendedReplacement}</p>
+                                        {tacticalReplacementReason && (
+                                          <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                                            Reason: {tacticalReplacementReason}
+                                          </p>
+                                        )}
                                       </div>
                                     </div>
                                     {tacticalMatchSituationLines.length > 0 && (
@@ -11893,6 +12440,12 @@ function Dashboard({
                                         {tacticalAssessmentDisplayLines.map((line, index) => (
                                           <p key={`tactical-assessment-${index}`} className="text-xs text-slate-300 mt-1 leading-relaxed">{line}</p>
                                         ))}
+                                      </div>
+                                    )}
+                                    {tacticalTradeoffLine && (
+                                      <div>
+                                        <p className="text-[10px] uppercase tracking-wide text-slate-400">Tradeoff</p>
+                                        <p className="text-xs text-slate-300 mt-1 leading-relaxed">{tacticalTradeoffLine}</p>
                                       </div>
                                     )}
                                     {(tacticalRecommendedMove || tacticalSwapReason) && (

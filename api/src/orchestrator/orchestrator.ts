@@ -1416,9 +1416,13 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
       : noEligibleModeReplacement
         ? noEligibleMessageWithCandidates
         : `Next safe bowler: ${guardedFinalRecommendation.nextSafeBowler.name} (${guardedFinalRecommendation.nextSafeBowler.reason})`;
+  const tacticalDecisionText = String(tactical?.decision || tactical?.nextAction || tactical?.immediateAction || '').trim();
+  const tacticalTradeoffText = String(tactical?.tradeoff || '').trim();
+  const tacticalAssessmentText = String(tactical?.assessment || '').trim();
+  const tacticalRationaleText = String(tactical?.decisionRationale || tactical?.rationale || '').trim();
 
   const combinedDecision = {
-    immediateAction: guardedFinalRecommendation.title,
+    immediateAction: tacticalDecisionText || guardedFinalRecommendation.title,
     substitutionAdvice:
       (routerDecision.intent === 'SUBSTITUTION' || routerDecision.intent === 'SAFETY_ALERT') &&
       recommendationMode === 'BOWLING' &&
@@ -1430,11 +1434,11 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
           }
         : undefined,
     suggestedAdjustments:
-      [guardedFinalRecommendation.statement, modeScopedSuggestionLine],
+      [tacticalRationaleText || guardedFinalRecommendation.statement, modeScopedSuggestionLine],
     confidence: normalizeConfidenceToScore(finalRecommendation.confidence),
-    rationale: `Router intent ${routerDecision.intent}; agents run: ${
-      executedAgents.length > 0 ? executedAgents.join(' + ') : 'none'
-    }.`,
+    rationale:
+      tacticalTradeoffText ||
+      `Router intent ${routerDecision.intent}; agents run: ${executedAgents.length > 0 ? executedAgents.join(' + ') : 'none'}.`,
   };
   const subject = String(activePlayer?.name || inputWithContext.telemetry.playerName || 'the active player');
   const fatigueNow = safeNumber(activePlayer?.live?.fatigueIndex, Number.NaN);
@@ -1500,7 +1504,7 @@ export async function orchestrateAgents(input: OrchestrateRequest, context: Invo
         : `Injury risk profile remains manageable, but repeated high-intensity spells can still create preventable exposure. ${baselineLine} ${decisiveRiskLine}`.trim(),
     tacticalRecommendation: {
       nextAction: combinedDecision.immediateAction,
-      why: `${baselineLine} ${combinedDecision.rationale} ${decisiveRiskLine}`.trim(),
+      why: `${tacticalAssessmentText || baselineLine} ${combinedDecision.rationale} ${decisiveRiskLine}`.trim(),
       ifIgnored: guardedFinalRecommendation.ifContinues.riskSummary,
       alternatives: combinedDecision.suggestedAdjustments.slice(0, 3),
     },
