@@ -3,8 +3,6 @@
 ## 👉 Live Demo : https://mango-sea-0c5e55e03.6.azurestaticapps.net/
 ## 👉 Demo Video : https://youtu.be/5dvwOPDOKBM
 
-📄 Research Abstract: [Extended Abstract](Extended%20abstract%20.pdf)
-
 ### AI Tactical Coach for Player and Match Decisions
 
 tactIQ is a real time AI tactical coach for cricket teams that transforms complex workload, fatigue, and match context data into clear on-field decisions, helping coaches win matches while reducing player injury risk.
@@ -818,4 +816,4 @@ The platform enables:
 
 All capabilities are powered by a **cloud-native, multi-agent architecture built on Microsoft Azure**.
 
-
+📄 Research Abstract: [Extended Abstract](Extended%20abstract%20.pdf)
