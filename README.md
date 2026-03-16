@@ -816,3 +816,5 @@ The platform enables:
 - explainable decision reasoning through multi-agent analysis  
 
 All capabilities are powered by a **cloud-native, multi-agent architecture built on Microsoft Azure**.
+
+📄 Research Abstract: [Extended Abstract](Extended abstract .pdf)
