@@ -51,9 +51,20 @@ function normalizeRisk(value: unknown, fallback: 'LOW' | 'MEDIUM' | 'HIGH' | 'UN
 }
 
 function normalizePhase(value: unknown): 'powerplay' | 'middle' | 'death' {
-  const lower = String(value || 'middle').toLowerCase();
-  if (!validPhases.has(lower)) return 'middle';
-  return lower as 'powerplay' | 'middle' | 'death';
+  const lower = String(value || '').trim().toLowerCase();
+  if (validPhases.has(lower)) return lower as 'powerplay' | 'middle' | 'death';
+  if (lower.includes('power')) return 'powerplay';
+  if (lower.includes('death')) return 'death';
+  if (lower.includes('middle')) return 'middle';
+  return 'middle';
+}
+
+function normalizePhaseSource(value: unknown, hasManualOverride = false): 'manual' | 'derived' {
+  const lower = String(value || '').trim().toLowerCase();
+  if (lower === 'manual') return 'manual';
+  if (lower === 'derived' || lower === 'overs') return 'derived';
+  if (lower === 'resolved') return hasManualOverride ? 'manual' : 'derived';
+  return hasManualOverride ? 'manual' : 'derived';
 }
 
 function normalizeTeamMode(value: unknown): 'BATTING' | 'BOWLING' {
@@ -256,7 +267,6 @@ export const validateOrchestrateRequest = (body: unknown): { ok: true; value: Or
           score: legacyMatch.score,
           balls: legacyMatch.balls,
         };
-
   const text = String(payload.text || '').trim();
   const lowerText = text.toLowerCase();
   const rawMode = normalizeMode(payload.mode);
@@ -292,6 +302,17 @@ export const validateOrchestrateRequest = (body: unknown): { ok: true; value: Or
     payload.focusRole,
     sourceTelemetry.role ?? sourceTelemetry.playerRole,
     teamMode
+  );
+  const resolvedPhase = normalizePhase(
+    sourceMatchContext.resolvedMatchPhase ??
+      sourceMatchContext.phase ??
+      signals.resolvedMatchPhase ??
+      signals.phase ??
+      normalizedContext.value.match.phase
+  );
+  const phaseSource = normalizePhaseSource(
+    sourceMatchContext.phaseSource ?? signals.phaseSource,
+    String(sourceMatchContext.phaseSource || '').trim().toLowerCase() === 'manual'
   );
 
   const value: OrchestrateRequest = {
@@ -351,7 +372,9 @@ export const validateOrchestrateRequest = (body: unknown): { ok: true; value: Or
     matchContext: {
       teamMode,
       matchMode: normalizeMatchMode(sourceMatchContext.matchMode || sourceMatchContext.teamMode || teamMode),
-      phase: normalizePhase(sourceMatchContext.phase ?? signals.phase),
+      phase: resolvedPhase,
+      resolvedMatchPhase: resolvedPhase,
+      phaseSource,
       requiredRunRate: toNum(sourceMatchContext.requiredRunRate ?? signals.requiredRunRate, 0),
       currentRunRate: toNum(sourceMatchContext.currentRunRate ?? signals.currentRunRate, 0),
       wicketsInHand: Math.max(0, toNum(sourceMatchContext.wicketsInHand ?? signals.wicketsInHand, 7)),
@@ -381,7 +404,12 @@ export const validateTacticalRequest = (body: unknown): { ok: true; value: Tacti
   const telemetry = toReqObject(payload.telemetry);
   const matchContext = toReqObject(payload.matchContext);
   const players = toReqObject(payload.players);
-  if (!matchContext.phase || !isFiniteNumber(matchContext.requiredRunRate) || !isFiniteNumber(matchContext.currentRunRate)) {
+  const resolvedPhase = normalizePhase(matchContext.resolvedMatchPhase ?? matchContext.phase);
+  const phaseSource = normalizePhaseSource(
+    matchContext.phaseSource,
+    String(matchContext.phaseSource || '').trim().toLowerCase() === 'manual'
+  );
+  if ((!matchContext.phase && !matchContext.resolvedMatchPhase) || !isFiniteNumber(matchContext.requiredRunRate) || !isFiniteNumber(matchContext.currentRunRate)) {
     return { ok: false, message: 'Missing required field: matchContext (phase, requiredRunRate, currentRunRate)' };
   }
   if (!players.striker || !players.nonStriker || !players.bowler) {
@@ -401,7 +429,9 @@ export const validateTacticalRequest = (body: unknown): { ok: true; value: Tacti
       matchContext: {
         teamMode: matchContext.teamMode ? String(matchContext.teamMode) : undefined,
         matchMode: matchContext.matchMode ? String(matchContext.matchMode) : undefined,
-        phase: String(matchContext.phase).toLowerCase() as TacticalAgentInput['matchContext']['phase'],
+        phase: resolvedPhase,
+        resolvedMatchPhase: resolvedPhase,
+        phaseSource,
         requiredRunRate: Number(matchContext.requiredRunRate),
         currentRunRate: Number(matchContext.currentRunRate),
         wicketsInHand: Number(matchContext.wicketsInHand || 0),

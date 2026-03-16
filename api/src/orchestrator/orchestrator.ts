@@ -283,6 +283,11 @@ const normalizePhaseValue = (value: unknown): 'powerplay' | 'middle' | 'death' =
   if (token === 'death') return 'death';
   return 'middle';
 };
+const phaseTokenToContextLabel = (token: 'powerplay' | 'middle' | 'death'): 'Powerplay' | 'Middle' | 'Death' => {
+  if (token === 'powerplay') return 'Powerplay';
+  if (token === 'death') return 'Death';
+  return 'Middle';
+};
 const normalizeMatchMode = (value: unknown): 'BAT' | 'BOWL' => {
   const token = String(value || 'BOWL').trim().toUpperCase();
   if (token === 'BAT' || token === 'BATTING') return 'BAT';
@@ -349,6 +354,24 @@ const deriveRuntimeInputFromContext = (input: OrchestrateRequest): OrchestrateRe
     context.roster.find((player) => player.playerId === context.activePlayerId) ||
     context.roster[0];
   const match = context.match;
+  const requestedPhaseSource = normalizeToken(input.matchContext?.phaseSource);
+  const requestedResolvedPhase = String(input.matchContext?.resolvedMatchPhase || '').trim();
+  const hasManualPhaseOverride =
+    requestedPhaseSource === 'manual' ||
+    requestedPhaseSource === 'resolved' ||
+    requestedResolvedPhase.length > 0;
+  const resolvedPhaseToken = hasManualPhaseOverride
+    ? normalizePhaseValue(requestedResolvedPhase || input.matchContext?.phase || match.phase)
+    : normalizePhaseValue(match.phase);
+  const resolvedPhaseLabel = phaseTokenToContextLabel(resolvedPhaseToken);
+  const phaseSource: 'manual' | 'resolved' | 'derived' | 'overs' =
+    requestedPhaseSource === 'manual' || requestedPhaseSource === 'resolved'
+      ? (requestedPhaseSource as 'manual' | 'resolved')
+      : hasManualPhaseOverride
+        ? 'resolved'
+        : requestedPhaseSource === 'overs'
+          ? 'overs'
+          : 'derived';
   const matchMode = normalizeMatchMode(match.matchMode);
   const teamMode = toTeamMode(input.teamMode || matchMode);
   const maxOvers = maxOversByFormat(match.format);
@@ -378,6 +401,10 @@ const deriveRuntimeInputFromContext = (input: OrchestrateRequest): OrchestrateRe
     context: {
       ...context,
       activePlayerId: activePlayer.playerId,
+      match: {
+        ...context.match,
+        phase: resolvedPhaseLabel,
+      },
     },
     telemetry: {
       playerId: activePlayer.playerId,
@@ -401,7 +428,9 @@ const deriveRuntimeInputFromContext = (input: OrchestrateRequest): OrchestrateRe
     matchContext: {
       teamMode,
       matchMode,
-      phase: normalizePhaseValue(match.phase),
+      phase: resolvedPhaseToken,
+      resolvedMatchPhase: resolvedPhaseToken,
+      phaseSource,
       requiredRunRate: safeNumber(match.requiredRunRate, 0),
       currentRunRate: Number(currentRunRate.toFixed(2)),
       wicketsInHand: Math.max(0, 10 - safeNumber(match.wickets, 0)),
@@ -555,6 +584,15 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
   const matchMode = normalizeMatchMode(match?.matchMode);
   const matchPhase = String(match?.phase || 'Middle');
   const matchIntensity = String(match?.intensity || 'Medium');
+  const requiredRunRate = safeNumber(
+    input.matchContext?.requiredRunRate,
+    safeNumber((match as Record<string, unknown> | undefined)?.requiredRunRate, 0)
+  );
+  const currentRunRate = safeNumber(
+    input.matchContext?.currentRunRate,
+    safeNumber((match as Record<string, unknown> | undefined)?.currentRunRate, 0)
+  );
+  const runRateGap = Number((requiredRunRate - currentRunRate).toFixed(2));
   const fatigueLimit = safeNumber(activeFromContext?.baseline?.fatigueLimit, safeNumber(input.telemetry?.fatigueLimit, 6));
   const projectedFatigueNextOver = Number(clamp(fatigueIndex + Math.max(0, strainIndex) * 0.15 + 0.6, 0, 10).toFixed(1));
   // Cost-aware hybrid routing with safety fallback:
@@ -592,6 +630,21 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
   const routineSupportAgent: 'FATIGUE' | 'RISK' = preferRiskSupport ? 'RISK' : 'FATIGUE';
   // Tactical always runs. Pick exactly one supporting agent from dominant signals.
   const supportAgent: 'FATIGUE' | 'RISK' = acuteSafetyRisk ? 'RISK' : routineSupportAgent;
+  const battingPressureDominant =
+    matchMode === 'BAT' &&
+    supportAgent === 'FATIGUE' &&
+    fatigueIndex <= 4.8 &&
+    strainIndex <= 2.8 &&
+    oversBowled <= 1.5 &&
+    injuryRisk !== 'HIGH' &&
+    noBallRisk !== 'HIGH' &&
+    runRateGap >= 0.45;
+  const pressurePrimaryReason =
+    runRateGap >= 0.8
+      ? 'Chase pressure and scoring tempo are the dominant active signals.'
+      : String(matchPhase || '').trim().toLowerCase().includes('middle')
+        ? 'Run-rate pressure and middle-overs tempo are the dominant active signals.'
+        : 'Scoreboard pressure is the dominant active signal in this phase.';
 
   const rulesFired: string[] = [];
   let intent: RouterDecision['intent'] = 'GENERAL';
@@ -680,7 +733,9 @@ export function buildRouterDecision(mode: 'auto' | 'full', input: OrchestrateReq
           ? acuteSafetyRisk
             ? 'Acute safety/strain exposure crossed escalation thresholds.'
             : 'Risk-side signals outweighed fatigue-only workload drift.'
-          : 'Fatigue/workload accumulation is the dominant active signal.',
+          : battingPressureDominant
+            ? pressurePrimaryReason
+            : 'Fatigue/workload accumulation is the dominant active signal.',
     secondaryReason:
       mode === 'full'
         ? 'Combined mode keeps both supporting agents active by design.'

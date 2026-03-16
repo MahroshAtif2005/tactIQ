@@ -14,6 +14,8 @@ export interface TacticalMatchContext {
   teamMode?: 'BATTING' | 'BOWLING' | string;
   matchMode?: 'BAT' | 'BOWL' | string;
   phase: 'powerplay' | 'middle' | 'death';
+  resolvedMatchPhase?: 'powerplay' | 'middle' | 'death' | string;
+  phaseSource?: 'manual' | 'derived' | 'resolved' | 'overs' | string;
   requiredRunRate: number;
   currentRunRate: number;
   wicketsInHand: number;
@@ -81,6 +83,7 @@ export interface TacticalAgentInput {
 
 export interface TacticalAgentOutput {
   status: 'ok' | 'fallback' | 'error';
+  tradeoffSource?: 'ai' | 'fallback_template';
   immediateAction: string;
   rationale: string;
   suggestedAdjustments: string[];

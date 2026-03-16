@@ -43,6 +43,7 @@ interface PlayerContextInput {
 
 export interface MatchContextBuilderInput {
   matchContext: MatchContextInput;
+  resolvedPhase?: string;
   matchState: MatchStateInput;
   players: PlayerContextInput[];
   baselines: Baseline[];
@@ -90,6 +91,25 @@ const toHeartRateLabel = (value: unknown): 'Poor' | 'Ok' | 'Good' | undefined =>
   if (token === 'moderate' || token === 'ok' || token === 'okay') return 'Ok';
   if (token === 'good') return 'Good';
   return undefined;
+};
+const normalizePhaseLabel = (value: unknown): 'Powerplay' | 'Middle' | 'Death' => {
+  const token = String(value || '').trim().toLowerCase();
+  if (token.includes('power')) return 'Powerplay';
+  if (token.includes('death')) return 'Death';
+  return 'Middle';
+};
+const toCricketOverNumber = (totalBallsBowled: number): number => {
+  const safeBalls = Math.max(0, Math.floor(totalBallsBowled));
+  const wholeOvers = Math.floor(safeBalls / 6);
+  const ballsIntoOver = safeBalls % 6;
+  return Number(`${wholeOvers}.${ballsIntoOver}`);
+};
+const derivePhaseFromBalls = (format: string, totalBallsBowled: number, fallbackPhase: string): string => {
+  if (String(format || '').trim().toUpperCase() !== 'T20') return normalizePhaseLabel(fallbackPhase);
+  const safeBalls = Math.max(0, Math.floor(totalBallsBowled));
+  if (safeBalls <= 36) return 'Powerplay';
+  if (safeBalls <= 90) return 'Middle';
+  return 'Death';
 };
 
 const buildBaselineIndex = (rows: Baseline[]): Map<string, Baseline> => {
@@ -171,8 +191,15 @@ export const buildMatchContext = (input: MatchContextBuilderInput): FullMatchCon
   const nowIso = new Date().toISOString();
   const baselineIndex = buildBaselineIndex(input.baselines);
   const rosterPlayers = input.players.filter((player) => player.inRoster !== false);
-  const oversFloat = Number((safeNumber(input.matchState.ballsBowled, 0) / 6).toFixed(1));
-  const phaseLabel = String(input.matchContext.phase || 'Middle');
+  const safeBallsBowled = Math.max(0, Math.floor(safeNumber(input.matchState.ballsBowled, 0)));
+  const oversFloat = toCricketOverNumber(safeBallsBowled);
+  const selectedOrDefaultPhase = normalizePhaseLabel(input.matchContext.phase || 'Middle');
+  const derivedPhase = derivePhaseFromBalls(
+    String(input.matchContext.format || ''),
+    safeBallsBowled,
+    selectedOrDefaultPhase
+  );
+  const phaseLabel = normalizePhaseLabel(input.resolvedPhase || derivedPhase);
   const matchMode = String(input.matchContext.matchMode || 'BOWLING').trim().toUpperCase();
   const normalizedMatchMode = matchMode === 'BAT' || matchMode === 'BATTING' ? 'BATTING' : 'BOWLING';
 
@@ -186,7 +213,7 @@ export const buildMatchContext = (input: MatchContextBuilderInput): FullMatchCon
       scoreRuns: Math.max(0, Math.floor(safeNumber(input.matchState.runs, 0))),
       wickets: Math.max(0, Math.floor(safeNumber(input.matchState.wickets, 0))),
       overs: oversFloat,
-      balls: Math.max(0, Math.floor(safeNumber(input.matchState.ballsBowled, 0))),
+      balls: safeBallsBowled,
       targetRuns: Number.isFinite(Number(input.matchState.target))
         ? Math.max(0, Math.floor(Number(input.matchState.target)))
         : undefined,

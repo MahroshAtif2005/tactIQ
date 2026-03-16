@@ -87,6 +87,7 @@ export interface TacticalCombinedDecision {
 
 export interface TacticalAgentResponse {
   status?: 'ok' | 'fallback' | 'error';
+  tradeoffSource?: 'ai' | 'fallback_template';
   immediateAction: string;
   rationale: string;
   suggestedAdjustments: string[];

@@ -97,6 +97,36 @@ const getFormatMaxOvers = (format?: string): number => {
   if (token === 'ODI') return 10;
   return 12;
 };
+const derivePhaseFromOvers = (
+  format: string,
+  overValue: number | undefined,
+  fallbackPhase: string
+): { token: 'powerplay' | 'middle' | 'death'; label: string } => {
+  const normalizedFallback = String(fallbackPhase || '').trim().toLowerCase();
+  const fallbackToken: 'powerplay' | 'middle' | 'death' =
+    normalizedFallback.includes('death')
+      ? 'death'
+      : normalizedFallback.includes('power')
+        ? 'powerplay'
+        : 'middle';
+  const fallbackLabel =
+    fallbackToken === 'powerplay'
+      ? 'powerplay phase'
+      : fallbackToken === 'death'
+        ? 'death overs phase'
+        : 'middle overs phase';
+  const formatToken = String(format || '').trim().toUpperCase();
+  if (!Number.isFinite(Number(overValue))) {
+    return { token: fallbackToken, label: fallbackLabel };
+  }
+  const overs = Number(overValue);
+  if (formatToken === 'T20') {
+    if (overs <= 6) return { token: 'powerplay', label: 'powerplay phase' };
+    if (overs <= 15) return { token: 'middle', label: 'middle overs phase' };
+    return { token: 'death', label: 'death overs phase' };
+  }
+  return { token: fallbackToken, label: fallbackLabel };
+};
 type CoachRiskBand = 'LOW' | 'MODERATE' | 'HIGH';
 const normalizeRecoveryToken = (value: unknown): 'GOOD' | 'MODERATE' | 'POOR' => {
   const token = String(value || '').trim().toUpperCase();
@@ -126,6 +156,22 @@ const buildTacticalDecisionInputs = (
     constrained: boolean;
   }
 ) => {
+  const matchContextRecord = input.matchContext as unknown as Record<string, unknown>;
+  const overValue = Number.isFinite(Number(input.matchContext?.over))
+    ? Number(input.matchContext?.over)
+    : Number.isFinite(Number(matchContextRecord.overs))
+      ? Number(matchContextRecord.overs)
+      : undefined;
+  const formatToken = String(input.matchContext?.format || '');
+  const phaseSource = String(matchContextRecord.phaseSource || '').trim().toLowerCase();
+  const resolvedMatchPhase = String(matchContextRecord.resolvedMatchPhase || '').trim();
+  const phaseFallback = resolvedMatchPhase || String(input.matchContext?.phase || 'middle');
+  const shouldTrustResolvedPhase = resolvedMatchPhase.length > 0 || phaseSource === 'manual';
+  const derivedPhase = derivePhaseFromOvers(
+    formatToken,
+    shouldTrustResolvedPhase ? undefined : overValue,
+    phaseFallback
+  );
   const requiredRunRate = Number(input.matchContext?.requiredRunRate || 0);
   const currentRunRate = Number(input.matchContext?.currentRunRate || 0);
   const runRatePressure = Number((requiredRunRate - currentRunRate).toFixed(2));
@@ -176,13 +222,15 @@ const buildTacticalDecisionInputs = (
     matchState: {
       teamMode,
       focusRole,
-      phase: String(input.matchContext?.phase || '').toLowerCase(),
-      format: String(input.matchContext?.format || ''),
+      phase: derivedPhase.token,
+      phaseLabel: derivedPhase.label,
+      phaseSource: phaseSource || (shouldTrustResolvedPhase ? 'resolved' : 'overs'),
+      format: formatToken,
       score: Number.isFinite(Number(input.matchContext?.score)) ? Number(input.matchContext?.score) : undefined,
       wicketsInHand: Number.isFinite(Number(input.matchContext?.wicketsInHand))
         ? Number(input.matchContext?.wicketsInHand)
         : undefined,
-      over: Number.isFinite(Number(input.matchContext?.over)) ? Number(input.matchContext?.over) : undefined,
+      over: overValue,
       balls: Number.isFinite(Number(input.matchContext?.balls)) ? Number(input.matchContext?.balls) : undefined,
       target: Number.isFinite(Number(input.matchContext?.target)) ? Number(input.matchContext?.target) : undefined,
       intensity: String(input.matchContext?.intensity || ''),
@@ -274,27 +322,39 @@ const buildStructuredTradeoff = (
   const subject = sanitizeLine(playerName, 'the current player', 40).replace(/[.!?]$/g, '') || 'the current player';
   const dismissalRisk = String(decisionInputs.playerPhysicalRisk.dismissalRisk || 'MODERATE').toLowerCase();
   const controlRisk = String(decisionInputs.playerPhysicalRisk.controlExecutionRisk || 'MODERATE').toLowerCase();
-  const phaseToken = String(decisionInputs.matchState.phase || '').trim().toLowerCase();
-  const phaseLabel = phaseToken ? `${phaseToken} phase` : 'current phase';
+  const phaseLabel = String(decisionInputs.matchState.phaseLabel || '').trim().toLowerCase() || 'current phase';
   const pressureToken = String(decisionInputs.matchState.scoreboardPressure || 'MODERATE').toLowerCase();
+  const phaseToken = String(decisionInputs.matchState.phase || '').trim().toLowerCase();
 
   if (teamMode === 'BATTING') {
+    const battingAdvantage =
+      phaseToken === 'powerplay'
+        ? 'preserves powerplay leverage against field restrictions with controlled intent'
+        : phaseToken === 'death'
+          ? 'retains an established hitter for death-over acceleration'
+          : 'preserves continuity at the crease and avoids exposing a new batter';
     const battingRiskClause =
       dismissalRisk === 'high'
-        ? `high dismissal exposure can rise further if ${pressureToken} pressure spikes`
+        ? `${pressureToken} pressure can force high-risk strokes and raise dismissal exposure quickly`
         : dismissalRisk === 'moderate'
-          ? `moderate dismissal exposure remains if ${pressureToken} pressure rises`
-          : `dismissal exposure can still rise if workload and pressure drift upward`;
-    return `Keeping ${subject} preserves continuity at the crease and avoids exposing a new batter, but ${battingRiskClause}.`;
+          ? `dismissal exposure remains if ${pressureToken} pressure pushes an early acceleration`
+          : `dismissal exposure can still rise if fatigue drift and pressure build through ${phaseLabel}`;
+    return `Keeping ${subject} ${battingAdvantage}, but ${battingRiskClause}.`;
   }
 
+  const bowlingAdvantage =
+    phaseToken === 'powerplay'
+      ? `preserves early-overs wicket pressure and field-restriction leverage in the ${phaseLabel}`
+      : phaseToken === 'death'
+        ? `keeps a death-overs matchup plan in place for yorker and boundary-prevention execution`
+        : `preserves matchup value and run-suppression control in the ${phaseLabel}`;
   const bowlingRiskClause =
     controlRisk === 'high'
-      ? 'fatigue drift is now increasing control execution risk'
-      : controlRisk === 'moderate'
-        ? 'ongoing fatigue drift can push execution risk higher under pressure'
-        : 'continued workload can still elevate control risk if pressure increases';
-  return `Allowing another over preserves the matchup value in the ${phaseLabel}, but ${bowlingRiskClause}.`;
+      ? 'fatigue drift is now increasing control errors and boundary risk'
+    : controlRisk === 'moderate'
+      ? 'continued workload can push execution risk higher under pressure'
+      : 'continued workload can still elevate no-ball or execution risk if pressure rises';
+  return `Allowing another over ${bowlingAdvantage}, but ${bowlingRiskClause}.`;
 };
 const normalizeTradeoffSentence = (
   value: unknown,
@@ -315,6 +375,95 @@ const normalizeTradeoffSentence = (
   const nonCricketGeneric = !/(crease|batter|phase|fatigue drift|control risk|dismissal exposure|matchup)/i.test(lower);
   if (circular || weakBenefit || missingContrast || nonCricketGeneric) return fallback;
   return cleaned;
+};
+const extractTradeoffFromRawResponse = (rawText: string): string => {
+  const normalized = String(rawText || '').trim();
+  if (!normalized) return '';
+  try {
+    const parsed = JSON.parse(normalized) as Record<string, unknown>;
+    const tradeoff = String(parsed?.tradeoff || '').trim();
+    if (tradeoff) return tradeoff;
+  } catch {
+    // Fall through to regex extraction for imperfect JSON response fragments.
+  }
+  const match = normalized.match(/"tradeoff"\s*:\s*"([^"]*)"/i);
+  return match ? String(match[1] || '').trim() : '';
+};
+const normalizeIfIgnoredSentence = (
+  value: unknown,
+  teamMode: 'BATTING' | 'BOWLING',
+  decisionText: string,
+  hasReplacementAction: boolean
+): string => {
+  const isWicketScenario = /\b(wicket|dismiss|if wicket falls)\b/i.test(decisionText);
+  const isContinueBatting = /\b(keep|continue|retain)\b.*\b(bat|batter|batting)\b/i.test(decisionText);
+  const isAccelerationCall = /\b(accelerat|attack|increase tempo|push run rate|intent shift)\b/i.test(decisionText);
+  const isReplaceBowlerCall =
+    hasReplacementAction || /\b(replace|rotate|substitut|change)\b.*\b(bowler|spell)\b/i.test(decisionText);
+  const isAllowAnotherOver =
+    !isReplaceBowlerCall &&
+    /\b(allow|continue|keep)\b.*\b(over|spell|bowling|bowler)\b/i.test(decisionText);
+
+  const fallback =
+    teamMode === 'BATTING'
+      ? isContinueBatting
+        ? 'If ignored, forcing acceleration too early could increase dismissal exposure in this phase.'
+        : isAccelerationCall
+          ? 'If ignored, delaying intent shift can increase phase pressure and force riskier shots later.'
+          : 'If ignored, tactical timing can drift and increase dismissal exposure under pressure.'
+      : isReplaceBowlerCall
+        ? 'If ignored, letting the fatigued bowler continue can increase control errors and injury exposure.'
+        : isAllowAnotherOver
+          ? 'If ignored, changing the bowler now can forfeit matchup advantage and disrupt control rhythm.'
+          : 'If ignored, phase-control risk can rise if the current plan is not executed.';
+
+  const cleaned = sanitizeLine(value, fallback, 90);
+  if (!cleaned) return fallback;
+  if (teamMode === 'BATTING' && !isWicketScenario && /\b(new batter|next batter|replace batter|introduc.*batter)\b/i.test(cleaned)) {
+    return fallback;
+  }
+  const hasConsequence = /\b(could|can|may|risk|increase|exposure|pressure|errors|drift|forfeit|disrupt)\b/i.test(cleaned);
+  if (!hasConsequence) return fallback;
+  return cleaned;
+};
+const normalizeBowlingTerminology = (
+  output: TacticalAgentOutput,
+  teamMode: 'BATTING' | 'BOWLING'
+): TacticalAgentOutput => {
+  if (teamMode !== 'BOWLING') return output;
+  const rewrite = (value: unknown): string =>
+    String(value || '')
+      .replace(/\bsubstitution\b/gi, 'replacement')
+      .replace(/\bsubstitute\b/gi, 'replace')
+      .replace(/\bsubstituting\b/gi, 'replacing')
+      .replace(/\s+/g, ' ')
+      .trim();
+  return {
+    ...output,
+    immediateAction: rewrite(output.immediateAction),
+    nextAction: rewrite(output.nextAction),
+    decision: rewrite(output.decision),
+    rationale: rewrite(output.rationale),
+    decisionRationale: rewrite(output.decisionRationale),
+    tradeoff: rewrite(output.tradeoff),
+    assessment: rewrite(output.assessment),
+    ifIgnored: rewrite(output.ifIgnored),
+    coachNote: rewrite(output.coachNote),
+    suggestedAdjustments: (output.suggestedAdjustments || []).map((entry) => rewrite(entry)),
+    why: (output.why || []).map((entry) => rewrite(entry)),
+    substitutionAdvice: output.substitutionAdvice
+      ? {
+          ...output.substitutionAdvice,
+          reason: rewrite(output.substitutionAdvice.reason),
+        }
+      : output.substitutionAdvice,
+    swap: output.swap
+      ? {
+          ...output.swap,
+          reason: rewrite(output.swap.reason),
+        }
+      : output.swap,
+  };
 };
 const applyTacticalDefaults = (input: TacticalAgentInput): TacticalAgentInput => {
   const bowlerName = sanitizeLine(input.telemetry?.playerName || input.players?.bowler, 'Current bowler', 80);
@@ -449,6 +598,7 @@ const buildContinueGuardrailOutput = (input: TacticalAgentInput, status: Tactica
   const optionsLine = alternatives.length > 0 ? `Other options: ${alternatives.join(', ')}.` : '';
   return {
     status,
+    tradeoffSource: 'fallback_template',
     immediateAction: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
     nextAction: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
     decision: `Continue with ${bowlerName} for the next over — projected fatigue remains within safe range.`,
@@ -465,25 +615,29 @@ const buildContinueGuardrailOutput = (input: TacticalAgentInput, status: Tactica
     keySignalsUsed: ['oversBowled', 'fatigueIndex', 'injuryRisk', 'heartRateRecovery', 'guardrail:stable_continue'],
   };
 };
-const sanitizeTacticalOutput = (output: TacticalAgentOutput): TacticalAgentOutput => {
-  const immediateAction = sanitizeLine(output.immediateAction, 'Continue with monitored tactical plan', 70);
-  const rationale = sanitizeLine(output.rationale, 'Tactical recommendation generated from live telemetry.', 90);
-  const assessment = sanitizeLine(output.assessment, rationale || 'Tactical assessment generated from live context.', 160);
+const sanitizeTacticalOutput = (
+  output: TacticalAgentOutput,
+  teamMode: 'BATTING' | 'BOWLING' = 'BOWLING'
+): TacticalAgentOutput => {
+  const normalizedOutput = normalizeBowlingTerminology(output, teamMode);
+  const immediateAction = sanitizeLine(normalizedOutput.immediateAction, 'Continue with monitored tactical plan', 70);
+  const rationale = sanitizeLine(normalizedOutput.rationale, 'Tactical recommendation generated from live telemetry.', 90);
+  const assessment = sanitizeLine(normalizedOutput.assessment, rationale || 'Tactical assessment generated from live context.', 160);
   const tradeoff = sanitizeLine(
-    output.tradeoff,
+    normalizedOutput.tradeoff,
     'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.',
     200
   );
-  const decision = sanitizeLine(output.decision || output.nextAction || immediateAction, immediateAction, 160);
-  const decisionRationale = sanitizeLine(output.decisionRationale || rationale, rationale, 170);
-  const why = sanitizeBullets(output.why || [rationale], 3);
-  const suggestedAdjustments = sanitizeBullets(output.suggestedAdjustments || why, 6);
-  const ifIgnored = sanitizeLine(output.ifIgnored, 'Minimal risk; continue monitoring for workload changes.', 90);
-  const coachNote = sanitizeLine(output.coachNote, 'Apply this plan for one over, then reassess live risk signals.', 110);
+  const decision = sanitizeLine(normalizedOutput.decision || normalizedOutput.nextAction || immediateAction, immediateAction, 160);
+  const decisionRationale = sanitizeLine(normalizedOutput.decisionRationale || rationale, rationale, 170);
+  const why = sanitizeBullets(normalizedOutput.why || [rationale], 3);
+  const suggestedAdjustments = sanitizeBullets(normalizedOutput.suggestedAdjustments || why, 6);
+  const ifIgnored = sanitizeLine(normalizedOutput.ifIgnored, 'Minimal risk; continue monitoring for workload changes.', 90);
+  const coachNote = sanitizeLine(normalizedOutput.coachNote, 'Apply this plan for one over, then reassess live risk signals.', 110);
   return {
-    ...output,
+    ...normalizedOutput,
     immediateAction,
-    nextAction: sanitizeLine(output.nextAction || immediateAction, immediateAction, 70),
+    nextAction: sanitizeLine(normalizedOutput.nextAction || immediateAction, immediateAction, 70),
     assessment,
     tradeoff,
     decision,
@@ -493,18 +647,18 @@ const sanitizeTacticalOutput = (output: TacticalAgentOutput): TacticalAgentOutpu
     suggestedAdjustments,
     ifIgnored,
     coachNote,
-    substitutionAdvice: output.substitutionAdvice
+    substitutionAdvice: normalizedOutput.substitutionAdvice
       ? {
-          out: sanitizeLine(output.substitutionAdvice.out, 'Current player', 80),
-          in: sanitizeLine(output.substitutionAdvice.in, 'No eligible replacement', 80),
-          reason: sanitizeLine(output.substitutionAdvice.reason, 'Substitution recommended from tactical model.', 90),
+          out: sanitizeLine(normalizedOutput.substitutionAdvice.out, 'Current player', 80),
+          in: sanitizeLine(normalizedOutput.substitutionAdvice.in, 'No eligible replacement', 80),
+          reason: sanitizeLine(normalizedOutput.substitutionAdvice.reason, 'Replacement recommended from tactical model.', 90),
         }
       : undefined,
-    swap: output.swap
+    swap: normalizedOutput.swap
       ? {
-          out: sanitizeLine(output.swap.out, 'Current player', 80),
-          in: sanitizeLine(output.swap.in, 'No eligible replacement', 80),
-          reason: sanitizeLine(output.swap.reason, 'Substitution recommended from tactical model.', 90),
+          out: sanitizeLine(normalizedOutput.swap.out, 'Current player', 80),
+          in: sanitizeLine(normalizedOutput.swap.in, 'No eligible replacement', 80),
+          reason: sanitizeLine(normalizedOutput.swap.reason, 'Replacement recommended from tactical model.', 90),
         }
       : undefined,
   };
@@ -596,7 +750,7 @@ const hasModeViolation = (output: TacticalAgentOutput, teamMode: 'BATTING' | 'BO
   if (teamMode === 'BOWLING') {
     return /next\s+(safe\s+)?batt(er|sman)|next\s+batter|if wicket falls|send .*batt/.test(text);
   }
-  return /next\s+(safe\s+)?bowl(er)?|rotate .*bowl|change .*bowl|substitut.*bowler|switch .*bowler/.test(text);
+  return /next\s+(safe\s+)?bowl(er)?|rotate .*bowl|change .*bowl|replace .*bowler|substitut.*bowler|switch .*bowler/.test(text);
 };
 const sanitizeByMode = (
   output: TacticalAgentOutput,
@@ -606,7 +760,7 @@ const sanitizeByMode = (
   const forbiddenPattern =
     teamMode === 'BOWLING'
       ? /next\s+(safe\s+)?batt(er|sman)|next\s+batter|if wicket falls|send .*batt/i
-      : /next\s+(safe\s+)?bowl(er)?|rotate .*bowl|change .*bowl|substitut.*bowler|switch .*bowler/i;
+      : /next\s+(safe\s+)?bowl(er)?|rotate .*bowl|change .*bowl|replace .*bowler|substitut.*bowler|switch .*bowler/i;
   const safeAdjustments = (output.suggestedAdjustments || [])
     .filter((item) => !forbiddenPattern.test(item))
     .slice(0, 6);
@@ -659,7 +813,7 @@ const shouldAvoidImmediateRotation = (input: TacticalAgentInput, teamMode: 'BATT
   return oversBowled <= 0 && fatigueIndex <= 4 && strainIndex <= 2 && injuryRisk !== 'HIGH' && noBallRisk !== 'HIGH';
 };
 const hasImmediateRotationDirective = (output: TacticalAgentOutput): boolean =>
-  /substitut|rotate|switch now|change bowler|immediate/.test(outputTextBlob(output));
+  /replace|substitut|rotate|switch now|change bowler|immediate/.test(outputTextBlob(output));
 const applyRotationGuardrail = (
   output: TacticalAgentOutput,
   input: TacticalAgentInput,
@@ -714,6 +868,8 @@ const isTacticalOutput = (value: unknown): value is TacticalLLMOutput => {
   if (!candidate || typeof candidate !== 'object') return false;
   const hasStructured =
     typeof candidate.nextAction === 'string' &&
+    typeof candidate.tradeoff === 'string' &&
+    String(candidate.tradeoff || '').trim().length > 0 &&
     Array.isArray(candidate.why) &&
     candidate.why.every((item) => typeof item === 'string');
   const hasLegacy = (
@@ -855,8 +1011,9 @@ const coerceTacticalOutput = (
   ) || 'Continue with monitored tactical plan';
   const assessment = truncateChars(raw.assessment || raw.rationale || whyBullets[0] || 'Tactical assessment generated from live context.', 160)
     || 'Tactical assessment generated from live context.';
+  const rawTradeoffText = String(raw.tradeoff || '').trim();
   const tradeoff = truncateChars(
-    raw.tradeoff || 'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.',
+    rawTradeoffText || 'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.',
     200
   ) || 'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.';
   const decision = truncateChars(raw.decision || raw.nextAction || raw.immediateAction || immediateAction, 160) || immediateAction;
@@ -874,6 +1031,7 @@ const coerceTacticalOutput = (
   const coachNote = coerceCoachNote(raw.coachNote, 'Apply this plan for one over, then reassess live risk signals.');
   return {
     status: 'ok',
+    tradeoffSource: rawTradeoffText ? 'ai' : 'fallback_template',
     immediateAction,
     assessment,
     tradeoff,
@@ -1023,7 +1181,7 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
   logStableContinueGuardrail(guardrailDecision, safeInput, reason);
   if (guardrailDecision.applied) {
     return {
-      output: sanitizeTacticalOutput(buildContinueGuardrailOutput(safeInput, 'fallback')),
+      output: sanitizeTacticalOutput(buildContinueGuardrailOutput(safeInput, 'fallback'), teamMode),
       model: 'fallback-heuristic',
       fallbacksUsed: [reason, 'guardrail:stable_continue'],
     };
@@ -1064,7 +1222,7 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
         ]
       : shouldSubstitute
         ? [
-            'Substitute the current bowler before the next over.',
+            'Replace the current bowler before the next over.',
             'Use a fresher bowler to protect execution under pressure.',
             'Reduce high-risk line-length plans for the next spell.',
             'Reassess fatigue and risk after one over.',
@@ -1072,29 +1230,30 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
         : [
             'Continue with current player for one over.',
             'Monitor fatigue trend and recovery markers ball-by-ball.',
-            'Keep a bench substitute warm for rapid swap if risk rises.',
+            'Keep a bench replacement ready for rapid swap if risk rises.',
           ];
 
   return {
     output: sanitizeTacticalOutput({
       status: 'fallback',
+      tradeoffSource: 'fallback_template',
       immediateAction:
         teamMode === 'BATTING'
           ? 'Adjust batting plan and protect wicket value'
           : shouldSubstitute
-            ? 'Substitute now and rotate workload'
+            ? 'Replace now and rotate workload'
             : 'Continue with monitored plan',
       nextAction:
         teamMode === 'BATTING'
           ? 'Adjust batting plan and protect wicket value'
           : shouldSubstitute
-            ? 'Substitute now and rotate workload'
+            ? 'Replace now and rotate workload'
             : 'Continue with monitored plan',
       decision:
         teamMode === 'BATTING'
           ? 'Adjust batting plan and protect wicket value'
           : shouldSubstitute
-            ? 'Substitute now and rotate workload'
+            ? 'Replace now and rotate workload'
             : 'Continue with monitored plan',
       assessment:
         teamMode === 'BATTING'
@@ -1152,7 +1311,7 @@ export function buildTacticalFallback(input: TacticalAgentInput, reason: string)
         : undefined,
       confidence: shouldSubstitute ? 0.72 : 0.67,
       keySignalsUsed: ['fatigueIndex', 'injuryRisk', 'noBallRisk', 'heartRateRecovery', 'phase', reason],
-    }),
+    }, teamMode),
     model: 'fallback-heuristic',
     fallbacksUsed: [reason],
   };
@@ -1220,6 +1379,19 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         'TRADEOFF must be one concise sentence in ADVANTAGE vs RISK format: "<advantage>, but <risk>". ' +
         'Avoid circular wording like "dismissal risk due to dismissal risk" and avoid generic phrases like "stability in the batting order". ' +
         'Use cricket-specific concepts such as continuity at the crease, exposing a new batter, phase pressure, fatigue drift, control risk, and dismissal exposure. ' +
+        'Do not reuse stock template wording across runs; generate context-specific tradeoff language from the provided signals and alternatives. ' +
+        'Avoid boilerplate like "preserves matchup value and run-suppression control" unless that wording is directly justified by this exact context. ' +
+        'IF_IGNORED must describe realistic tactical consequences of ignoring the recommendation (not impossible actions). ' +
+        'When recommendation is keep/continue batting, IF_IGNORED should focus on premature acceleration and dismissal exposure. ' +
+        'When recommendation is replace bowler, IF_IGNORED should focus on fatigue/control/injury risk if the bowler continues. ' +
+        'When recommendation is allow another over, IF_IGNORED should focus on losing current matchup advantage if changed too early. ' +
+        'Do not mention introducing a new batter unless the context explicitly states a wicket-fall scenario. ' +
+        'Use decisionInputs.matchState.phaseLabel as the authoritative resolved phase for all wording. ' +
+        'If decisionInputs.matchState.phaseSource is manual or resolved, do not re-derive phase from over value. ' +
+        'Only derive phase from overs when phaseSource is derived or overs. ' +
+        'Phase-aware focus must change with the resolved phase context: powerplay = wicket pressure/field restrictions, middle overs = control and tempo management, death overs = execution under boundary pressure. ' +
+        'For batting, tie tradeoff to phase goals: powerplay exploit restrictions vs early-dismissal risk; middle overs continuity/rotation vs tempo drift; death overs acceleration urgency vs dismissal exposure. ' +
+        'For bowling, tie tradeoff to phase goals: powerplay attacking lines vs control risk; middle overs containment vs fatigue drift; death overs yorker execution/boundary prevention vs no-ball risk. ' +
         'Use available alternatives when deciding continuity vs change. ' +
         'Do not produce generic "monitor closely" output unless all pressure and risk signals are low. ' +
         'Prefer coach-briefing language and include a short tactical sequence when useful (next over, then following over/backup). ' +
@@ -1248,6 +1420,11 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         },
         baseline: baselineDirective.profile,
         decisionInputs,
+        resolvedPhaseContext: {
+          resolvedMatchPhase: decisionInputs.matchState.phase,
+          phaseLabel: decisionInputs.matchState.phaseLabel,
+          phaseSource: decisionInputs.matchState.phaseSource,
+        },
         input: safeInput,
         context: compactTacticalContext(safeInput),
       }),
@@ -1255,22 +1432,38 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
   ];
 
   try {
+    let rawAiTradeoff = '';
+    const shouldDebugTradeoffLogs = String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production';
     const llmCall = (baseMessages: LLMMessage[]) =>
       callLLMJsonWithRetry<TacticalLLMOutput>({
         deployment: routing.deployment,
         fallbackDeployment: routing.fallbackDeployment,
         baseMessages,
         strictSystemMessage:
-          'Return ONLY valid JSON. No markdown. Required keys: assessment, tradeoff, decision, nextAction, why, ifIgnored, coachNote. Optional key: swap {out,in,reason}. Keep text short. TRADEOFF must be one sentence in "advantage, but risk" form. Include compatibility keys immediateAction/rationale/decisionRationale if present.',
+          'Return ONLY valid JSON. No markdown. Required keys: assessment, tradeoff, decision, nextAction, why, ifIgnored, coachNote. Optional key: swap {out,in,reason}. Keep text short. TRADEOFF must be one sentence in "advantage, but risk" form. IF_IGNORED must state realistic tactical consequences and must not suggest impossible batter replacement unless wicket context is explicit. For bowlers use replace/switch/bring in wording, never substitute. Include compatibility keys immediateAction/rationale/decisionRationale if present.',
         validate: isTacticalOutput,
         temperature: routing.temperature,
         maxTokens: routing.maxTokens,
         timeoutMs: 10000,
         retryOnTransient: true,
+        onRawResponse: ({ text }) => {
+          const extracted = extractTradeoffFromRawResponse(text);
+          if (extracted) rawAiTradeoff = extracted;
+          if (shouldDebugTradeoffLogs) {
+            console.log('[tactical][tradeoff][raw_ai]', extracted || '(missing)');
+          }
+        },
+        onValidation: ({ schemaOk, parsed }) => {
+          if (!shouldDebugTradeoffLogs || !schemaOk) return;
+          const parsedTradeoff = String((parsed as Record<string, unknown> | undefined)?.tradeoff || '').trim();
+          if (parsedTradeoff) rawAiTradeoff = parsedTradeoff;
+          console.log('[tactical][tradeoff][parsed_ai]', parsedTradeoff || '(missing)');
+        },
       });
 
     const initial = await llmCall(messages);
     let parsed: TacticalAgentOutput = coerceTacticalOutput(initial.parsed, teamMode);
+    let tradeoffSource: 'ai' | 'fallback_template' = parsed.tradeoffSource === 'ai' ? 'ai' : 'fallback_template';
     let deploymentUsed = initial.deploymentUsed;
     let fallbacksUsed = [...initial.fallbacksUsed];
 
@@ -1287,6 +1480,7 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
       ];
       const corrected = await llmCall(correctionMessages);
       parsed = coerceTacticalOutput(corrected.parsed, teamMode);
+      tradeoffSource = parsed.tradeoffSource === 'ai' ? 'ai' : 'fallback_template';
       deploymentUsed = corrected.deploymentUsed;
       fallbacksUsed = [...new Set([...fallbacksUsed, ...corrected.fallbacksUsed, 'mode-correction-retry'])];
     }
@@ -1308,17 +1502,6 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         160
       );
     }
-    if (!parsed.tradeoff || parsed.tradeoff.trim().length < 20) {
-      const scorePressure = String(decisionInputs.matchState.scoreboardPressure || 'MODERATE').toLowerCase();
-      const riskToken =
-        teamMode === 'BATTING'
-          ? String(decisionInputs.playerPhysicalRisk.dismissalRisk || 'MODERATE').toLowerCase()
-          : String(decisionInputs.playerPhysicalRisk.controlExecutionRisk || 'MODERATE').toLowerCase();
-      parsed.tradeoff = truncateChars(
-        `Tradeoff: ${scorePressure} scoreboard pressure must be balanced against ${riskToken} physical risk for the active player.`,
-        200
-      );
-    }
     if (!parsed.decision || parsed.decision.trim().length < 10) {
       parsed.decision = truncateChars(parsed.nextAction || parsed.immediateAction, 160) || parsed.immediateAction;
     }
@@ -1331,7 +1514,7 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
         110
       );
     }
-    if (baselineDirective.constrained && teamMode === 'BOWLING' && !/rotate|substitut|switch/i.test(parsed.immediateAction.toLowerCase())) {
+    if (baselineDirective.constrained && teamMode === 'BOWLING' && !/rotate|replace|substitut|switch/i.test(parsed.immediateAction.toLowerCase())) {
       parsed.immediateAction = `Rotate ${safeInput.telemetry.playerName || 'current bowler'} now and shorten the next spell`;
     }
     parsed = applyRotationGuardrail(parsed, safeInput, telemetryBasis);
@@ -1339,26 +1522,49 @@ export async function runTacticalAgent(input: TacticalAgentInput): Promise<Tacti
     logStableContinueGuardrail(guardrailDecision, safeInput, 'llm_postprocess');
     if (guardrailDecision.applied) {
       parsed = buildContinueGuardrailOutput(safeInput, parsed.status);
+      tradeoffSource = 'fallback_template';
       fallbacksUsed = [...new Set([...fallbacksUsed, 'guardrail:stable_continue'])];
     }
     parsed.nextAction = truncateChars(parsed.nextAction || parsed.immediateAction, 70) || parsed.immediateAction;
     parsed.decision = truncateChars(parsed.decision || parsed.nextAction || parsed.immediateAction, 160) || parsed.immediateAction;
     parsed.decisionRationale = truncateChars(parsed.decisionRationale || parsed.rationale, 170);
     parsed.assessment = truncateChars(parsed.assessment || parsed.rationale, 160);
-    parsed.tradeoff = normalizeTradeoffSentence(
-      truncateChars(
-        parsed.tradeoff || 'Maintaining continuity supports the current phase plan, but cumulative workload can still elevate execution risk.',
+    const aiTradeoff = tradeoffSource === 'ai' ? sanitizeLine(parsed.tradeoff, '', 200) : '';
+    if (aiTradeoff) {
+      parsed.tradeoff = aiTradeoff;
+      parsed.tradeoffSource = 'ai';
+    } else {
+      parsed.tradeoff = truncateChars(
+        buildStructuredTradeoff(
+          teamMode,
+          decisionInputs,
+          String(safeInput.telemetry.playerName || safeInput.players.bowler || 'the current player')
+        ),
         200
-      ),
-      teamMode,
-      decisionInputs,
-      String(safeInput.telemetry.playerName || safeInput.players.bowler || 'the current player')
-    );
+      );
+      parsed.tradeoffSource = 'fallback_template';
+      tradeoffSource = 'fallback_template';
+    }
     parsed.why = dedupeTextList((parsed.why || [parsed.rationale]).map((entry) => truncateChars(entry, 90))).slice(0, 2);
-    parsed.ifIgnored = truncateChars(parsed.ifIgnored || parsed.suggestedAdjustments?.[0] || 'Risk may increase if unchanged.', 90);
+    parsed.ifIgnored = normalizeIfIgnoredSentence(
+      truncateChars(parsed.ifIgnored || parsed.suggestedAdjustments?.[0] || 'Risk may increase if unchanged.', 90),
+      teamMode,
+      `${parsed.decision || ''} ${parsed.nextAction || ''} ${parsed.immediateAction || ''}`,
+      Boolean(parsed.swap || parsed.substitutionAdvice)
+    );
     parsed.coachNote = truncateChars(parsed.coachNote || `${baselineDirective.text} ${telemetryBasis}`, 110);
     parsed.rationale = truncateChars(parsed.rationale, 90);
-    parsed = sanitizeTacticalOutput(parsed);
+    parsed = sanitizeTacticalOutput(parsed, teamMode);
+    if (shouldDebugTradeoffLogs) {
+      console.log('[tactical][tradeoff][final]', {
+        resolvedMatchPhase: decisionInputs.matchState.phase,
+        phaseLabel: decisionInputs.matchState.phaseLabel,
+        phaseSource: decisionInputs.matchState.phaseSource,
+        rawAiTradeoff: rawAiTradeoff || '(missing)',
+        finalTradeoff: String(parsed.tradeoff || '').trim() || '(missing)',
+        source: parsed.tradeoffSource || (tradeoffSource === 'ai' ? 'ai' : 'fallback_template'),
+      });
+    }
 
     return {
       output: parsed,
