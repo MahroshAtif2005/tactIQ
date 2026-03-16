@@ -3,6 +3,7 @@
 ## 👉 Live Demo : https://mango-sea-0c5e55e03.6.azurestaticapps.net/
 ## 👉 Demo Video : https://youtu.be/5dvwOPDOKBM
 
+📄 Research Abstract: [Extended Abstract](Extended%20abstract%20.pdf)
 
 ### AI Tactical Coach for Player and Match Decisions
 
@@ -817,4 +818,4 @@ The platform enables:
 
 All capabilities are powered by a **cloud-native, multi-agent architecture built on Microsoft Azure**.
 
-📄 Research Abstract: [Extended Abstract](Extended%20abstract%20.pdf)
+
