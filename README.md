@@ -817,4 +817,4 @@ The platform enables:
 
 All capabilities are powered by a **cloud-native, multi-agent architecture built on Microsoft Azure**.
 
-📄 Research Abstract: [Extended Abstract](Extended abstract .pdf)
+📄 Research Abstract: [Extended Abstract](Extended%20abstract%20.pdf)
