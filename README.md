@@ -1,6 +1,5 @@
 # tactIQ
 
-## 👉 Live Demo : https://mango-sea-0c5e55e03.6.azurestaticapps.net/
 ## 👉 Demo Video : https://youtu.be/5dvwOPDOKBM
 
 ### AI Tactical Coach for Player and Match Decisions
